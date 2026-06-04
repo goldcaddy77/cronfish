@@ -27,6 +27,7 @@ const CRON_DIR = join(CONSUMER_ROOT, "cron");
 
 interface CronfishConfig {
   bundle_prefix: string;
+  bun_path?: string;
 }
 
 function loadConfig(): CronfishConfig {
@@ -45,11 +46,25 @@ function loadConfig(): CronfishConfig {
       `.cronfish.json: bundle_prefix "${prefix}" — must match [a-zA-Z0-9_.-]+`,
     );
   }
-  return { bundle_prefix: prefix };
+  const bunPath = (parsed.bun_path ?? "").trim() || undefined;
+  if (bunPath !== undefined) {
+    if (!bunPath.startsWith("/")) {
+      throw new Error(
+        `.cronfish.json: bun_path "${bunPath}" — must be an absolute path`,
+      );
+    }
+    if (!existsSync(bunPath)) {
+      throw new Error(
+        `.cronfish.json: bun_path "${bunPath}" — file does not exist`,
+      );
+    }
+  }
+  return { bundle_prefix: prefix, bun_path: bunPath };
 }
 
 const CONFIG = loadConfig();
 const PREFIX = CONFIG.bundle_prefix;
+const BUN_PATH = CONFIG.bun_path;
 
 function safeDispatch(
   input: string | number | undefined,
@@ -168,6 +183,7 @@ function cmdSync(): void {
       const r = p.install(job, {
         bundlePrefix: PREFIX,
         consumerRoot: CONSUMER_ROOT,
+        bunPath: BUN_PATH,
       });
       console.log(
         r.changed
@@ -390,7 +406,8 @@ usage:
   cronfish run <slug>                 invoke runner directly (no launchd)
   cronfish --version
 
-config: <consumer>/.cronfish.json  →  { "bundle_prefix": "com.example.app" }
+config: <consumer>/.cronfish.json  →  { "bundle_prefix": "com.example.app",
+                                       "bun_path": "/opt/homebrew/bin/bun" }
 docs:   https://github.com/goldcaddy77/cronfish
 `,
   );

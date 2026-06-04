@@ -80,11 +80,19 @@ a real schedule. Pure on-demand scripts that aren't scheduling candidates belong
 ## Config — `.cronfish.json` (optional, at repo root)
 
 ```json
-{ "bundle_prefix": "com.example.myapp" }
+{
+  "bundle_prefix": "com.example.myapp",
+  "bun_path": "/opt/homebrew/bin/bun"
+}
 ```
 
-Becomes the launchd plist label prefix: cronfish appends `.<slug>` per job. Defaults to
-`com.cronfish.<basename(cwd)>` if absent.
+- **`bundle_prefix`** — launchd plist label prefix; cronfish appends `.<slug>` per job. Defaults to
+  `com.cronfish.<basename(cwd)>`.
+- **`bun_path`** — optional absolute path to the `bun` binary baked into every plist's PATH.
+  Use when you want to pin a specific install (multiple bun copies, version managers, non-standard
+  prefix). When unset, cronfish resolves bun in this order: `$BUN_INSTALL/bin` → `/opt/homebrew/bin`
+  → `~/.bun/bin` → `/usr/local/bin` → `which bun`. Homebrew and the official installer
+  (`~/.bun`) work out of the box; for asdf/mise/proto, set `bun_path` explicitly.
 
 ## CLI
 

@@ -77,13 +77,20 @@ function scheduleBlock(d: Dispatched): string {
   throw new Error(`schedule kind "${d.kind}" should not produce a plist`);
 }
 
-function findBunDir(): string | null {
+function findBunDir(bunPathOverride?: string): string | null {
   // Resolve `bun` once at sync time; bake its directory into the plist's PATH.
+  // Priority: explicit bun_path → $BUN_INSTALL/bin → common install dirs → PATH.
+  if (bunPathOverride) {
+    if (!existsSync(bunPathOverride)) return null;
+    return dirname(bunPathOverride);
+  }
+  const bunInstall = process.env.BUN_INSTALL;
   const candidates = [
-    join(homedir(), ".bun", "bin"),
+    bunInstall ? join(bunInstall, "bin") : null,
     "/opt/homebrew/bin",
+    join(homedir(), ".bun", "bin"),
     "/usr/local/bin",
-  ];
+  ].filter((d): d is string => !!d);
   for (const dir of candidates) {
     if (existsSync(join(dir, "bun"))) return dir;
   }
@@ -101,6 +108,7 @@ export interface LaunchdRender {
 export interface LaunchdConfig {
   bundlePrefix: string;
   consumerRoot: string;
+  bunPath?: string;
 }
 
 // launchd labels can't contain `/`, so nested slugs (`email/triage`) get their
@@ -129,10 +137,15 @@ export function render(job: JobMeta, cfg: LaunchdConfig): LaunchdRender {
   if (d.kind === "manual") {
     throw new Error(`render: ${job.slug} is manual — should not be installed`);
   }
-  const bunDir = findBunDir();
+  const bunDir = findBunDir(cfg.bunPath);
   if (!bunDir) {
+    if (cfg.bunPath) {
+      throw new Error(
+        `.cronfish.json bun_path "${cfg.bunPath}" not found on disk.`,
+      );
+    }
     throw new Error(
-      "bun not found in ~/.bun/bin, /opt/homebrew/bin, /usr/local/bin, or PATH. Install: https://bun.sh",
+      "bun not found in $BUN_INSTALL/bin, /opt/homebrew/bin, ~/.bun/bin, /usr/local/bin, or PATH. Install: https://bun.sh (or set bun_path in .cronfish.json)",
     );
   }
   const pathEnv = [
