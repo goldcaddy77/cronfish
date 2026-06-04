@@ -1,17 +1,6 @@
 #!/usr/bin/env bun
-// cronfish CLI.
-//   init                       — scaffold cron/ with one .md + one .ts example
-//   list                       — show every job + state
-//   sync                       — reconcile cron/ ↔ ~/Library/LaunchAgents/<prefix>.*
-//   enable <slug>              — flip enabled, then sync
-//   disable <slug>             — flip disabled, then sync
-//   delete <slug> [--yes]      — bootout plist, delete plist + job file
-//   status [slug]              — launchctl print + tail of latest log
-//   run <slug>                 — invoke runner directly (no launchd) for testing
-//
-// Job spec — see README. `schedule:` is the single scheduling key; accepted
-// shapes (cron / "every N units" / bare seconds / "Ns"/"Nm"/"Nh"/"Nd") are
-// resolved in src/schedule.ts.
+// cronfish CLI. Verbs are thin wrappers; discovery lives in jobs.ts, plist
+// I/O lives in platform/launchd.ts, schedule parsing in schedule.ts.
 
 import {
   existsSync,
@@ -22,19 +11,17 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
-import { basename, extname, join, resolve } from "node:path";
-import { homedir } from "node:os";
-import {
-  parseFrontmatter,
-  parseTsJobConfig,
-  setFrontmatterKey,
-} from "./frontmatter.ts";
-import { dispatchSchedule } from "./schedule.ts";
+import { basename, join } from "node:path";
+import { setFrontmatterKey } from "./frontmatter.ts";
+import { discoverJobs, findJobFile, loadJob, type JobMeta } from "./jobs.ts";
+import { dispatchSchedule, type Dispatched } from "./schedule.ts";
+import { platform } from "./platform/index.ts";
+import { loadState, rememberPrefix } from "./state.ts";
+
+const VERSION = "0.2.0";
 
 const CONSUMER_ROOT = process.env.CRONFISH_CONSUMER_ROOT || process.cwd();
 const CRON_DIR = join(CONSUMER_ROOT, "cron");
-const TEMPLATE = resolve(import.meta.dir, "..", "templates", "plist.template");
-const LAUNCH_AGENTS = join(homedir(), "Library", "LaunchAgents");
 
 // --- Consumer config ---
 
@@ -46,200 +33,48 @@ function loadConfig(): CronfishConfig {
   const path = join(CONSUMER_ROOT, ".cronfish.json");
   const defaultPrefix = `com.cronfish.${basename(CONSUMER_ROOT)}`;
   if (!existsSync(path)) return { bundle_prefix: defaultPrefix };
+  let parsed: Partial<CronfishConfig>;
   try {
-    const parsed = JSON.parse(
-      readFileSync(path, "utf-8"),
-    ) as Partial<CronfishConfig>;
-    return { bundle_prefix: parsed.bundle_prefix?.trim() || defaultPrefix };
+    parsed = JSON.parse(readFileSync(path, "utf-8")) as Partial<CronfishConfig>;
   } catch (e) {
     throw new Error(`.cronfish.json: ${(e as Error).message}`);
   }
+  const prefix = (parsed.bundle_prefix ?? "").trim() || defaultPrefix;
+  if (!/^[a-zA-Z0-9_.-]+$/.test(prefix)) {
+    throw new Error(
+      `.cronfish.json: bundle_prefix "${prefix}" — must match [a-zA-Z0-9_.-]+`,
+    );
+  }
+  return { bundle_prefix: prefix };
 }
 
 const CONFIG = loadConfig();
-const LABEL_PREFIX = `${CONFIG.bundle_prefix}.`;
+const PREFIX = CONFIG.bundle_prefix;
 
-function labelFor(slug: string): string {
-  return `${LABEL_PREFIX}${slug}`;
-}
-
-function plistDest(slug: string): string {
-  return join(LAUNCH_AGENTS, `${labelFor(slug)}.plist`);
-}
-
-// --- Job discovery ---
-
-interface JobMeta {
-  slug: string;
-  path: string;
-  kind: "md" | "ts";
-  enabled: boolean;
-  schedule?: string | number;
-  timeout?: number;
-  model?: string;
-  retries?: number;
-  concurrency?: string;
-}
-
-function loadJob(absPath: string): JobMeta {
-  const ext = extname(absPath) as ".md" | ".ts";
-  const slug = basename(absPath).replace(/\.(md|ts)$/, "");
-  const raw = readFileSync(absPath, "utf-8");
-  if (ext === ".md") {
-    const { frontmatter } = parseFrontmatter(raw);
-    return {
-      slug,
-      path: absPath,
-      kind: "md",
-      enabled: frontmatter.enabled !== false,
-      schedule: frontmatter.schedule as string | number | undefined,
-      timeout: frontmatter.timeout as number | undefined,
-      model: (frontmatter.model as string | undefined) ?? "haiku",
-      retries: frontmatter.retries as number | undefined,
-      concurrency: frontmatter.concurrency as string | undefined,
-    };
+function safeDispatch(
+  input: string | number | undefined,
+): Dispatched | { kind: "error"; msg: string } {
+  try {
+    return dispatchSchedule(input);
+  } catch (e) {
+    return { kind: "error", msg: (e as Error).message };
   }
-  const cfg = parseTsJobConfig(raw);
-  return {
-    slug,
-    path: absPath,
-    kind: "ts",
-    enabled: cfg.enabled !== false,
-    schedule: cfg.schedule,
-    timeout: cfg.timeout,
-    model: cfg.model,
-    retries: cfg.retries,
-    concurrency: cfg.concurrency,
-  };
-}
-
-function discoverJobs(): JobMeta[] {
-  if (!existsSync(CRON_DIR)) return [];
-  const entries = readdirSync(CRON_DIR)
-    .filter((f) => f.endsWith(".md") || f.endsWith(".ts"))
-    .map((f) => join(CRON_DIR, f));
-  const jobs: JobMeta[] = [];
-  for (const p of entries) {
-    try {
-      jobs.push(loadJob(p));
-    } catch (e) {
-      console.error(`[cronfish] failed to load ${p}: ${(e as Error).message}`);
-    }
-  }
-  return jobs.sort((a, b) => a.slug.localeCompare(b.slug));
-}
-
-function findJobFile(slug: string): string | null {
-  for (const ext of [".md", ".ts"]) {
-    const p = join(CRON_DIR, `${slug}${ext}`);
-    if (existsSync(p)) return p;
-  }
-  return null;
-}
-
-// --- Plist rendering ---
-
-function calendarBlock(cronExpr: string): string {
-  const parts = cronExpr.trim().split(/\s+/);
-  const [m, h, dom, mon, dow] = parts;
-  const fields: [string, string][] = [
-    ["Minute", m],
-    ["Hour", h],
-    ["Day", dom],
-    ["Month", mon],
-    ["Weekday", dow],
-  ];
-  const inner = fields
-    .filter(([, v]) => v !== "*")
-    .map(([k, v]) => {
-      if (!/^-?\d+$/.test(v)) {
-        throw new Error(
-          `schedule field ${k}="${v}" not supported — only single ints or "*"`,
-        );
-      }
-      return `        <key>${k}</key>\n        <integer>${parseInt(v, 10)}</integer>`;
-    })
-    .join("\n");
-  return `    <key>StartCalendarInterval</key>\n    <dict>\n${inner}\n    </dict>`;
-}
-
-function intervalBlock(seconds: number): string {
-  return `    <key>StartInterval</key>\n    <integer>${Math.floor(seconds)}</integer>`;
-}
-
-function renderPlist(job: JobMeta): string {
-  const d = dispatchSchedule(job.schedule);
-  const scheduleBlock =
-    d.kind === "cron" ? calendarBlock(d.expr) : intervalBlock(d.value);
-  const tmpl = readFileSync(TEMPLATE, "utf-8");
-  return tmpl
-    .replace(/__LABEL__/g, labelFor(job.slug))
-    .replace(/__CONSUMER_ROOT__/g, CONSUMER_ROOT)
-    .replace(/__HOME__/g, homedir())
-    .replace(/__JOB_PATH__/g, job.path)
-    .replace(/__SLUG__/g, job.slug)
-    .replace("__SCHEDULE_BLOCK__", scheduleBlock);
-}
-
-// --- launchctl helpers ---
-
-function sh(
-  cmd: string[],
-  opts: { check?: boolean } = {},
-): { code: number; out: string; err: string } {
-  const proc = Bun.spawnSync(cmd, { stdout: "pipe", stderr: "pipe" });
-  const out = new TextDecoder().decode(proc.stdout);
-  const err = new TextDecoder().decode(proc.stderr);
-  if (opts.check && proc.exitCode !== 0) {
-    throw new Error(
-      `${cmd.join(" ")} failed (${proc.exitCode}): ${err || out}`,
-    );
-  }
-  return { code: proc.exitCode ?? 0, out, err };
-}
-
-function gui(): string {
-  const uid = process.getuid?.() ?? 501;
-  return `gui/${uid}`;
-}
-
-function bootout(label: string): void {
-  const dest = plistDest(label.replace(LABEL_PREFIX, ""));
-  if (existsSync(dest)) {
-    sh(["launchctl", "bootout", gui(), dest]);
-  } else {
-    sh(["launchctl", "bootout", `${gui()}/${label}`]);
-  }
-}
-
-function bootstrap(dest: string): void {
-  sh(["launchctl", "bootstrap", gui(), dest], { check: true });
-}
-
-function isLoaded(label: string): boolean {
-  const { out } = sh(["launchctl", "print", `${gui()}/${label}`]);
-  return out.includes(label);
-}
-
-function ensureTmpDirs(slug: string): void {
-  mkdirSync(join(CONSUMER_ROOT, "tmp", "cron", slug), { recursive: true });
 }
 
 // --- Verbs ---
 
-async function cmdList(): Promise<void> {
-  const jobs = discoverJobs();
-  if (jobs.length === 0) {
-    console.log("(no jobs in cron/)");
+function cmdList(): void {
+  const { jobs, errors } = discoverJobs(CRON_DIR);
+  for (const e of errors) console.error(`[cronfish] ${e.path}: ${e.message}`);
+  if (jobs.length === 0 && errors.length === 0) {
+    console.log(
+      "(no jobs in cron/) — run `cronfish init` to scaffold examples.",
+    );
     return;
   }
-  mkdirSync(LAUNCH_AGENTS, { recursive: true });
-  const installed = new Set(
-    readdirSync(LAUNCH_AGENTS)
-      .filter((f) => f.startsWith(LABEL_PREFIX) && f.endsWith(".plist"))
-      .map((f) => f.replace(LABEL_PREFIX, "").replace(/\.plist$/, "")),
-  );
-  const header = [
+  const p = platform();
+  const installed = new Set(p.listInstalled(PREFIX));
+  const headers = [
     "slug",
     "kind",
     "schedule",
@@ -248,22 +83,20 @@ async function cmdList(): Promise<void> {
     "loaded",
     "retries",
     "concurrency",
-  ].join("\t");
-  console.log(header);
+  ];
+  console.log(headers.join("\t"));
   for (const j of jobs) {
-    let sched = "—";
-    if (j.schedule !== undefined && j.schedule !== 0 && j.schedule !== "") {
-      try {
-        const d = dispatchSchedule(j.schedule);
-        sched = d.kind === "cron" ? d.expr : `every ${d.value}s`;
-      } catch {
-        // Disabled jobs may carry sentinel/unparseable schedules (e.g. `every: 0`
-        // for "manual-only"). Only surface BAD when the job is enabled — those
-        // are the ones that would actually try to bootstrap and fail at sync.
-        sched = j.enabled ? `BAD(${j.schedule})` : "—";
-      }
+    const d = safeDispatch(j.schedule);
+    let sched: string;
+    if (d.kind === "error") {
+      sched = j.enabled ? `BAD(${d.msg})` : "—";
+    } else if (d.kind === "manual") {
+      sched = "manual";
+    } else if (d.kind === "cron") {
+      sched = d.expr;
+    } else {
+      sched = `every ${d.value}s`;
     }
-    const loaded = installed.has(j.slug) ? "yes" : "no";
     console.log(
       [
         j.slug,
@@ -271,7 +104,7 @@ async function cmdList(): Promise<void> {
         sched,
         j.model ?? "—",
         j.enabled ? "yes" : "no",
-        loaded,
+        installed.has(j.slug) ? "yes" : "no",
         String(j.retries ?? 0),
         j.concurrency ?? "—",
       ].join("\t"),
@@ -279,63 +112,130 @@ async function cmdList(): Promise<void> {
   }
 }
 
-async function cmdSync(): Promise<void> {
-  mkdirSync(LAUNCH_AGENTS, { recursive: true });
-  const jobs = discoverJobs();
-  const desired = new Map(
-    jobs.filter((j) => j.enabled).map((j) => [j.slug, j]),
-  );
-  const installed = readdirSync(LAUNCH_AGENTS)
-    .filter((f) => f.startsWith(LABEL_PREFIX) && f.endsWith(".plist"))
-    .map((f) => f.replace(LABEL_PREFIX, "").replace(/\.plist$/, ""));
+function shouldInstall(job: JobMeta): {
+  ok: boolean;
+  reason?: string;
+  dispatched?: Dispatched;
+} {
+  if (!job.enabled) return { ok: false, reason: "disabled" };
+  let d: Dispatched;
+  try {
+    d = dispatchSchedule(job.schedule);
+  } catch (e) {
+    return { ok: false, reason: (e as Error).message };
+  }
+  if (d.kind === "manual") return { ok: false, reason: "manual" };
+  return { ok: true, dispatched: d };
+}
 
-  for (const slug of installed) {
-    if (!desired.has(slug)) {
-      const label = labelFor(slug);
-      console.log(`[cronfish] bootout ${label}`);
-      bootout(label);
-      const dest = plistDest(slug);
-      if (existsSync(dest)) rmSync(dest);
+function cmdSync(): void {
+  const p = platform();
+  const { jobs, errors } = discoverJobs(CRON_DIR);
+  for (const e of errors) console.error(`[cronfish] ${e.path}: ${e.message}`);
+
+  const state = rememberPrefix(CONSUMER_ROOT, PREFIX);
+  const desired = new Map<string, JobMeta>();
+  for (const j of jobs) {
+    const decision = shouldInstall(j);
+    if (decision.ok) desired.set(j.slug, j);
+    else if (
+      decision.reason &&
+      decision.reason !== "disabled" &&
+      decision.reason !== "manual"
+    ) {
+      console.error(`[cronfish] ${j.slug}: ${decision.reason}`);
+    }
+  }
+
+  // Walk every historical prefix and bootout slugs no longer desired under
+  // the current prefix. This is the stale-prefix fix.
+  for (const prefix of state.seen_prefixes) {
+    for (const slug of p.listInstalled(prefix)) {
+      const stillDesired = prefix === PREFIX && desired.has(slug);
+      if (stillDesired) continue;
+      console.log(`[cronfish] bootout ${prefix}.${slug}`);
+      p.uninstall(prefix, slug);
     }
   }
 
   for (const [slug, job] of desired) {
-    ensureTmpDirs(slug);
-    const dest = plistDest(slug);
-    const next = renderPlist(job);
-    const prev = existsSync(dest) ? readFileSync(dest, "utf-8") : "";
-    if (prev === next && isLoaded(labelFor(slug))) {
-      console.log(`[cronfish] up-to-date ${slug}`);
-      continue;
+    try {
+      const r = p.install(job, {
+        bundlePrefix: PREFIX,
+        consumerRoot: CONSUMER_ROOT,
+      });
+      console.log(
+        r.changed
+          ? `[cronfish] bootstrap ${slug}`
+          : `[cronfish] up-to-date ${slug}`,
+      );
+    } catch (e) {
+      console.error(
+        `[cronfish] install ${slug} failed: ${(e as Error).message}`,
+      );
     }
-    if (existsSync(dest)) bootout(labelFor(slug));
-    writeFileSync(dest, next, "utf-8");
-    console.log(`[cronfish] bootstrap ${slug}`);
-    bootstrap(dest);
   }
   console.log("[cronfish] sync complete");
 }
 
-async function flipEnabled(slug: string, enabled: boolean): Promise<void> {
-  const path = findJobFile(slug);
+function flipEnabled(slug: string, enabled: boolean): void {
+  const path = findJobFile(CRON_DIR, slug);
   if (!path) throw new Error(`no job file for slug "${slug}"`);
+  const raw = readFileSync(path, "utf-8");
   if (path.endsWith(".md")) {
-    const raw = readFileSync(path, "utf-8");
     writeFileSync(path, setFrontmatterKey(raw, "enabled", enabled), "utf-8");
   } else {
-    const raw = readFileSync(path, "utf-8");
-    const re = /enabled\s*:\s*(true|false)/;
-    const next = re.test(raw)
-      ? raw.replace(re, `enabled: ${enabled}`)
-      : raw.replace(/(config\s*=\s*\{)/, `$1\n\tenabled: ${enabled},`);
-    writeFileSync(path, next, "utf-8");
+    writeFileSync(path, rewriteTsEnabled(raw, enabled), "utf-8");
   }
   console.log(`[cronfish] ${enabled ? "enabled" : "disabled"} ${slug}`);
-  await cmdSync();
+  cmdSync();
 }
 
-async function cmdDelete(slug: string, yes: boolean): Promise<void> {
-  const path = findJobFile(slug);
+function rewriteTsEnabled(source: string, enabled: boolean): string {
+  // Scoped rewrite: only the first top-level `enabled:` inside the
+  // `config = { ... }` block. Avoids matching strings/comments outside.
+  const open = source.search(/\bconfig\b\s*(?::\s*[^=]+)?=\s*\{/);
+  if (open < 0) {
+    throw new Error("TS job has no top-level `config = { ... }` block");
+  }
+  const startBody = source.indexOf("{", open) + 1;
+  let depth = 1;
+  let i = startBody;
+  let endBody = -1;
+  let inStr: string | null = null;
+  for (; i < source.length; i++) {
+    const c = source[i];
+    const prev = source[i - 1];
+    if (inStr) {
+      if (c === inStr && prev !== "\\") inStr = null;
+      continue;
+    }
+    if (c === '"' || c === "'" || c === "`") {
+      inStr = c;
+      continue;
+    }
+    if (c === "{") depth++;
+    else if (c === "}") {
+      depth--;
+      if (depth === 0) {
+        endBody = i;
+        break;
+      }
+    }
+  }
+  if (endBody < 0) throw new Error("TS job `config` block is unbalanced");
+  const head = source.slice(0, startBody);
+  const body = source.slice(startBody, endBody);
+  const tail = source.slice(endBody);
+  const re = /\benabled\s*:\s*(true|false)/;
+  const next = re.test(body)
+    ? body.replace(re, `enabled: ${enabled}`)
+    : `\n  enabled: ${enabled},${body}`;
+  return head + next + tail;
+}
+
+function cmdDelete(slug: string, yes: boolean): void {
+  const path = findJobFile(CRON_DIR, slug);
   if (!path) throw new Error(`no job file for slug "${slug}"`);
   if (!yes) {
     console.error(
@@ -343,28 +243,23 @@ async function cmdDelete(slug: string, yes: boolean): Promise<void> {
     );
     process.exit(2);
   }
-  const label = labelFor(slug);
-  const dest = plistDest(slug);
-  if (existsSync(dest)) {
-    console.log(`[cronfish] bootout ${label}`);
-    bootout(label);
-  }
-  if (isLoaded(label)) {
-    throw new Error(`${label} is still loaded after bootout — aborting delete`);
-  }
-  if (existsSync(dest)) rmSync(dest);
+  const p = platform();
+  p.uninstall(PREFIX, slug);
   rmSync(path);
   console.log(`[cronfish] deleted ${slug} (plist + job file)`);
 }
 
-async function cmdStatus(slug?: string): Promise<void> {
-  const jobs = discoverJobs();
+function cmdStatus(slug?: string): void {
+  const p = platform();
+  const { jobs } = discoverJobs(CRON_DIR);
   const targets = slug ? jobs.filter((j) => j.slug === slug) : jobs;
+  if (!slug) {
+    cmdList();
+    return;
+  }
   for (const j of targets) {
-    const label = labelFor(j.slug);
     console.log(`\n=== ${j.slug} (${j.kind}) ===`);
-    const { out, err } = sh(["launchctl", "print", `${gui()}/${label}`]);
-    console.log(out || err || "(not loaded)");
+    console.log(p.statusOf(PREFIX, j.slug));
     const logDir = join(CONSUMER_ROOT, "tmp", "cron", j.slug);
     if (existsSync(logDir)) {
       const logs = readdirSync(logDir)
@@ -373,25 +268,54 @@ async function cmdStatus(slug?: string): Promise<void> {
         .sort((a, b) => b.m - a.m);
       if (logs[0]) {
         console.log(`--- latest log: ${logs[0].f} ---`);
-        const txt = readFileSync(join(logDir, logs[0].f), "utf-8");
-        console.log(txt.slice(-2000));
+        console.log(
+          readFileSync(join(logDir, logs[0].f), "utf-8").slice(-2000),
+        );
       }
     }
   }
 }
 
 async function cmdRun(slug: string): Promise<void> {
-  const path = findJobFile(slug);
+  const path = findJobFile(CRON_DIR, slug);
   if (!path) throw new Error(`no job file for slug "${slug}"`);
-  const runner = resolve(import.meta.dir, "runner.sh");
-  const proc = Bun.spawn(["/bin/bash", runner, path], {
+  // Validate before spawning.
+  loadJob(path);
+  const runnerTs = new URL("./runner.ts", import.meta.url).pathname;
+  const proc = Bun.spawn(["bun", runnerTs, path], {
     stdout: "inherit",
     stderr: "inherit",
     cwd: CONSUMER_ROOT,
     env: { ...process.env, CRONFISH_CONSUMER_ROOT: CONSUMER_ROOT },
   });
-  const code = await proc.exited;
-  process.exit(code);
+  process.exit(await proc.exited);
+}
+
+function cmdNext(slug?: string, n = 5): void {
+  const { jobs } = discoverJobs(CRON_DIR);
+  const targets = slug ? jobs.filter((j) => j.slug === slug) : jobs;
+  for (const j of targets) {
+    try {
+      const d = dispatchSchedule(j.schedule);
+      if (d.kind === "manual") {
+        console.log(`${j.slug}\tmanual (no autoschedule)`);
+        continue;
+      }
+      if (d.kind === "seconds") {
+        const now = Date.now();
+        const fires = Array.from({ length: n }, (_, i) =>
+          new Date(now + (i + 1) * d.value * 1000).toISOString(),
+        );
+        console.log(`${j.slug}\tevery ${d.value}s\t→\t${fires.join(", ")}`);
+        continue;
+      }
+      console.log(
+        `${j.slug}\tcron "${d.expr}" (preview not implemented for cron)`,
+      );
+    } catch (e) {
+      console.error(`${j.slug}: ${(e as Error).message}`);
+    }
+  }
 }
 
 // --- cronfish init ---
@@ -426,38 +350,40 @@ export default async function run(): Promise<void> {
 }
 `;
 
-async function cmdInit(): Promise<void> {
+function cmdInit(): void {
   mkdirSync(CRON_DIR, { recursive: true });
-  const writes: [string, string][] = [
-    [join(CRON_DIR, "hello.md"), INIT_MD],
-    [join(CRON_DIR, "touch.ts"), INIT_TS],
-  ];
-  for (const [path, content] of writes) {
-    if (existsSync(path)) {
-      console.log(`[cronfish] init: ${path} exists — leaving alone`);
+  for (const [name, content] of [
+    ["hello.md", INIT_MD],
+    ["touch.ts", INIT_TS],
+  ] as const) {
+    const p = join(CRON_DIR, name);
+    if (existsSync(p)) {
+      console.log(`[cronfish] init: ${p} exists — leaving alone`);
       continue;
     }
-    writeFileSync(path, content, "utf-8");
-    console.log(`[cronfish] init: wrote ${path}`);
+    writeFileSync(p, content, "utf-8");
+    console.log(`[cronfish] init: wrote ${p}`);
   }
   console.log(
-    `\nNext: edit cron/hello.md or cron/touch.ts, flip enabled: true, then run \`cronfish sync\`.`,
+    "\nNext: edit cron/hello.md or cron/touch.ts, flip `enabled: true`, run `cronfish sync`.",
   );
 }
 
 function usage(): void {
-  console.error(
-    `cronfish — drop a file, schedule it.
+  console.log(
+    `cronfish ${VERSION} — drop a file, schedule it.
 
 usage:
   cronfish init                       scaffold cron/hello.md + cron/touch.ts
   cronfish list                       show every job + state
+  cronfish next [slug] [N]            preview the next N fire times (default 5)
   cronfish sync                       reconcile cron/ ↔ launchd
   cronfish enable <slug>              flip enabled, then sync
   cronfish disable <slug>             flip disabled, then sync
   cronfish delete <slug> --yes        bootout + remove plist + job file
-  cronfish status [slug]              launchctl print + tail of latest log
+  cronfish status [slug]              all jobs (no arg) or one slug's launchctl + log tail
   cronfish run <slug>                 invoke runner directly (no launchd)
+  cronfish --version
 
 config: <consumer>/.cronfish.json  →  { "bundle_prefix": "com.example.app" }
 docs:   https://github.com/goldcaddy77/cronfish
@@ -468,41 +394,51 @@ docs:   https://github.com/goldcaddy77/cronfish
 async function main(): Promise<void> {
   const [verb, ...rest] = process.argv.slice(2);
   switch (verb) {
-    case "init":
-      await cmdInit();
-      break;
-    case "list":
-      await cmdList();
-      break;
-    case "sync":
-      await cmdSync();
-      break;
-    case "enable":
-      if (!rest[0]) throw new Error("usage: cronfish enable <slug>");
-      await flipEnabled(rest[0], true);
-      break;
-    case "disable":
-      if (!rest[0]) throw new Error("usage: cronfish disable <slug>");
-      await flipEnabled(rest[0], false);
-      break;
-    case "delete":
-      if (!rest[0]) throw new Error("usage: cronfish delete <slug> [--yes]");
-      await cmdDelete(rest[0], rest.includes("--yes"));
-      break;
-    case "status":
-      await cmdStatus(rest[0]);
-      break;
-    case "run":
-      if (!rest[0]) throw new Error("usage: cronfish run <slug>");
-      await cmdRun(rest[0]);
-      break;
+    case undefined:
     case "--help":
     case "-h":
     case "help":
-    case undefined:
       usage();
-      process.exit(verb ? 0 : 2);
-      break;
+      return;
+    case "--version":
+    case "-v":
+      console.log(VERSION);
+      return;
+    case "init":
+      cmdInit();
+      return;
+    case "list":
+      cmdList();
+      return;
+    case "next": {
+      const slug = rest[0] && /^\d+$/.test(rest[0]) ? undefined : rest[0];
+      const nStr = slug ? rest[1] : rest[0];
+      const n = nStr && /^\d+$/.test(nStr) ? parseInt(nStr, 10) : 5;
+      cmdNext(slug, n);
+      return;
+    }
+    case "sync":
+      cmdSync();
+      return;
+    case "enable":
+      if (!rest[0]) throw new Error("usage: cronfish enable <slug>");
+      flipEnabled(rest[0], true);
+      return;
+    case "disable":
+      if (!rest[0]) throw new Error("usage: cronfish disable <slug>");
+      flipEnabled(rest[0], false);
+      return;
+    case "delete":
+      if (!rest[0]) throw new Error("usage: cronfish delete <slug> [--yes]");
+      cmdDelete(rest[0], rest.includes("--yes"));
+      return;
+    case "status":
+      cmdStatus(rest[0]);
+      return;
+    case "run":
+      if (!rest[0]) throw new Error("usage: cronfish run <slug>");
+      await cmdRun(rest[0]);
+      return;
     default:
       console.error(`[cronfish] unknown verb: ${verb}`);
       usage();

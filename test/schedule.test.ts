@@ -25,32 +25,41 @@ describe("dispatchSchedule", () => {
     expect(dispatchSchedule("1d")).toEqual({ kind: "seconds", value: 86400 });
   });
 
-  test("human form: every N minutes → seconds", () => {
+  test("human form → seconds", () => {
     expect(dispatchSchedule("every 5 minutes")).toEqual({
       kind: "seconds",
       value: 300,
     });
-  });
-
-  test("human form: every hour → seconds", () => {
     expect(dispatchSchedule("every hour")).toEqual({
       kind: "seconds",
       value: 3600,
     });
-  });
-
-  test("human form: every second → seconds(1)", () => {
     expect(dispatchSchedule("every second")).toEqual({
       kind: "seconds",
       value: 1,
     });
-  });
-
-  test("human form: every N seconds → seconds(N)", () => {
     expect(dispatchSchedule("every 30 seconds")).toEqual({
       kind: "seconds",
       value: 30,
     });
+  });
+
+  test("manual is a first-class kind", () => {
+    expect(dispatchSchedule("manual")).toEqual({ kind: "manual" });
+    expect(dispatchSchedule("MANUAL")).toEqual({ kind: "manual" });
+  });
+
+  test("cron range validation rejects out-of-range fields", () => {
+    expect(() => dispatchSchedule("99 99 99 99 99")).toThrow(/out of range/);
+    expect(() => dispatchSchedule("60 0 * * *")).toThrow(/minute/);
+    expect(() => dispatchSchedule("0 24 * * *")).toThrow(/hour/);
+    expect(() => dispatchSchedule("0 0 32 * *")).toThrow(/day-of-month/);
+    expect(() => dispatchSchedule("0 0 * 13 *")).toThrow(/month/);
+    expect(() => dispatchSchedule("0 0 * * 8")).toThrow(/day-of-week/);
+  });
+
+  test("cron rejects negatives", () => {
+    expect(() => dispatchSchedule("-1 0 * * *")).toThrow();
   });
 
   test("garbage throws", () => {
@@ -58,5 +67,17 @@ describe("dispatchSchedule", () => {
     expect(() => dispatchSchedule("every blue moon")).toThrow();
     expect(() => dispatchSchedule(undefined)).toThrow();
     expect(() => dispatchSchedule(0)).toThrow();
+    expect(() => dispatchSchedule(-5)).toThrow();
+    expect(() => dispatchSchedule("")).toThrow();
+  });
+
+  test("error messages name the bad input", () => {
+    try {
+      dispatchSchedule("60 0 * * *");
+      throw new Error("should have thrown");
+    } catch (e) {
+      expect((e as Error).message).toContain("minute");
+      expect((e as Error).message).toContain("60");
+    }
   });
 });

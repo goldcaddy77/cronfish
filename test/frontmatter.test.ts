@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  FrontmatterError,
   parseFrontmatter,
   parseTsJobConfig,
   setFrontmatterKey,
@@ -27,49 +28,32 @@ body here`;
     expect(body.trim()).toBe("body here");
   });
 
-  test("migrates every: to schedule:", () => {
-    const raw = `---
-every: 600
-model: sonnet
----
-
-body`;
-    const { frontmatter } = parseFrontmatter(raw);
-    expect(frontmatter.schedule).toBe(600);
-    expect(frontmatter.every).toBeUndefined();
+  test("rejects `every:` key explicitly", () => {
+    const raw = `---\nevery: 600\n---\nbody`;
+    expect(() => parseFrontmatter(raw)).toThrow(FrontmatterError);
+    expect(() => parseFrontmatter(raw)).toThrow(/rename to "schedule"/);
   });
 
-  test("schedule: wins over every:", () => {
-    const raw = `---
-schedule: "5m"
-every: 60
----
-`;
-    const { frontmatter } = parseFrontmatter(raw);
-    expect(frontmatter.schedule).toBe("5m");
+  test("inline comments stripped from unquoted values only", () => {
+    const { frontmatter } = parseFrontmatter(
+      `---\nschedule: 60 # every minute\nmodel: "haiku # not a comment"\n---\n`,
+    );
+    expect(frontmatter.schedule).toBe(60);
+    expect(frontmatter.model).toBe("haiku # not a comment");
   });
 
   test("returns raw body when no frontmatter", () => {
-    const raw = "just body, no frontmatter";
-    const { frontmatter, body } = parseFrontmatter(raw);
+    const { frontmatter, body } = parseFrontmatter("just body");
     expect(Object.keys(frontmatter)).toHaveLength(0);
-    expect(body).toBe(raw);
+    expect(body).toBe("just body");
+  });
+
+  test("missing colon throws with line number", () => {
+    expect(() => parseFrontmatter(`---\nno colon here\n---\n`)).toThrow(/line/);
   });
 });
 
 describe("parseTsJobConfig", () => {
-  test("parses every and aliases to schedule", () => {
-    const src = `export const config = {
-      every: 600,
-      enabled: true,
-      timeout: 540,
-    };`;
-    const cfg = parseTsJobConfig(src);
-    expect(cfg.schedule).toBe(600);
-    expect(cfg.enabled).toBe(true);
-    expect(cfg.timeout).toBe(540);
-  });
-
   test("parses schedule string", () => {
     const src = `export const config = {
       schedule: "every 5 minutes",
@@ -83,25 +67,44 @@ describe("parseTsJobConfig", () => {
     expect(cfg.retries).toBe(3);
     expect(cfg.concurrency).toBe("queue");
   });
+
+  test("rejects `every:` key", () => {
+    const src = `export const config = { every: 600 };`;
+    expect(() => parseTsJobConfig(src)).toThrow(/rename to "schedule"/);
+  });
+
+  test("handles nested objects without breaking on first inner brace", () => {
+    const src = `export const config = {
+      env: { FOO: "bar", BAZ: "qux" },
+      schedule: "5m",
+      enabled: true,
+    };`;
+    const cfg = parseTsJobConfig(src);
+    expect(cfg.schedule).toBe("5m");
+    expect(cfg.enabled).toBe(true);
+  });
+
+  test("rejects bad enabled value", () => {
+    const src = `export const config = { enabled: "yes" };`;
+    expect(() => parseTsJobConfig(src)).toThrow();
+  });
+
+  test("rejects bad concurrency value", () => {
+    const src = `export const config = { concurrency: "all" };`;
+    expect(() => parseTsJobConfig(src)).toThrow();
+  });
 });
 
 describe("setFrontmatterKey", () => {
   test("updates existing key", () => {
-    const raw = `---
-schedule: "5m"
-enabled: true
----
-body`;
+    const raw = `---\nschedule: "5m"\nenabled: true\n---\nbody`;
     const next = setFrontmatterKey(raw, "enabled", false);
     expect(next).toContain("enabled: false");
     expect(next).not.toContain("enabled: true");
   });
 
   test("appends missing key", () => {
-    const raw = `---
-schedule: "5m"
----
-body`;
+    const raw = `---\nschedule: "5m"\n---\nbody`;
     const next = setFrontmatterKey(raw, "enabled", false);
     expect(next).toContain("enabled: false");
   });

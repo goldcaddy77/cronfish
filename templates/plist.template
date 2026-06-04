@@ -7,8 +7,9 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>/bin/bash</string>
-        <string>__CONSUMER_ROOT__/node_modules/cronfish/src/runner.sh</string>
+        <string>/usr/bin/env</string>
+        <string>bun</string>
+        <string>__RUNNER_TS__</string>
         <string>__JOB_PATH__</string>
     </array>
 
@@ -33,7 +34,7 @@ __SCHEDULE_BLOCK__
         <key>CRONFISH_CONSUMER_ROOT</key>
         <string>__CONSUMER_ROOT__</string>
         <key>PATH</key>
-        <string>__HOME__/.bun/bin:__HOME__/.asdf/installs/nodejs/22.13.1/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <string>__PATH__</string>
     </dict>
 </dict>
 </plist>

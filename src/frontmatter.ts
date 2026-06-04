@@ -1,59 +1,86 @@
-// Minimal YAML-subset frontmatter parser for cronfish job files.
-// Supports the scalar keys we use: schedule, model, enabled, timeout,
-// retries, concurrency. Values are string | number | boolean. No nesting,
-// no arrays.
+// Strict YAML-subset frontmatter parser for cronfish job files.
 //
-// `every:` is accepted as a silent alias for `schedule:` for one version
-// to ease migration; new jobs should use `schedule:` only.
+// Supported scalar types: string, integer, boolean. No floats, no arrays,
+// no nesting, no nulls. Every key is validated against an expected type;
+// unexpected types throw with file + key + expected + got.
+//
+// `every:` is no longer accepted — use `schedule:`.
 
 export type Scalar = string | number | boolean;
 
-export interface Parsed {
+export interface ParsedFrontmatter {
   frontmatter: Record<string, Scalar>;
   body: string;
-  raw: string;
 }
 
 const FM_RE = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/;
 
-export function parseFrontmatter(raw: string): Parsed {
+export class FrontmatterError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "FrontmatterError";
+  }
+}
+
+function parseScalar(val: string): Scalar {
+  if (val === "true") return true;
+  if (val === "false") return false;
+  if (/^-?\d+$/.test(val)) return parseInt(val, 10);
+  return val;
+}
+
+function stripInlineComment(val: string): string {
+  // Strip ` #...` (space-then-hash) only when the value is unquoted.
+  // Quoted values keep `#` literally.
+  if (val.startsWith('"') || val.startsWith("'")) return val;
+  const idx = val.search(/\s#/);
+  return idx >= 0 ? val.slice(0, idx).trim() : val;
+}
+
+function unquote(val: string): string {
+  if (
+    (val.startsWith('"') && val.endsWith('"')) ||
+    (val.startsWith("'") && val.endsWith("'"))
+  ) {
+    return val.slice(1, -1);
+  }
+  return val;
+}
+
+export function parseFrontmatter(raw: string): ParsedFrontmatter {
   const m = raw.match(FM_RE);
-  if (!m) return { frontmatter: {}, body: raw, raw };
+  if (!m) return { frontmatter: {}, body: raw };
   const fm: Record<string, Scalar> = {};
-  for (const line of m[1].split(/\r?\n/)) {
+  const lines = m[1].split(/\r?\n/);
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
     const trimmed = line.trim();
     if (!trimmed || trimmed.startsWith("#")) continue;
     const idx = trimmed.indexOf(":");
-    if (idx < 0) continue;
+    if (idx < 0) {
+      throw new FrontmatterError(
+        `line ${i + 1}: missing ":" — frontmatter is "key: value" only`,
+      );
+    }
     const key = trimmed.slice(0, idx).trim();
-    let val = trimmed.slice(idx + 1).trim();
-    const hashIdx = val.search(/\s#/);
-    if (hashIdx >= 0) val = val.slice(0, hashIdx).trim();
-    if (
-      (val.startsWith('"') && val.endsWith('"')) ||
-      (val.startsWith("'") && val.endsWith("'"))
-    ) {
-      val = val.slice(1, -1);
+    if (!key) throw new FrontmatterError(`line ${i + 1}: empty key`);
+    const rawVal = trimmed.slice(idx + 1).trim();
+    const cleaned = unquote(stripInlineComment(rawVal));
+    if (key === "every") {
+      throw new FrontmatterError(
+        `key "every" is no longer supported — rename to "schedule"`,
+      );
     }
-    let parsed: Scalar;
-    if (val === "true") parsed = true;
-    else if (val === "false") parsed = false;
-    else if (/^-?\d+$/.test(val)) parsed = parseInt(val, 10);
-    else parsed = val;
-    // Silent migration: `every:` aliases to `schedule:` if schedule wasn't set.
-    if (key === "every" && fm.schedule === undefined) {
-      fm.schedule = parsed;
-    } else {
-      fm[key] = parsed;
-    }
+    fm[key] = parseScalar(cleaned);
   }
-  return { frontmatter: fm, body: m[2], raw };
+  return { frontmatter: fm, body: m[2] };
 }
 
-// Parse the scheduling-relevant keys out of a TS job's `config` block by
-// reading the source text. Avoids `await import()` so we don't (a) execute
-// the module's side effects in the runner process or (b) get stuck with a
-// stale module cache after enable/disable rewrites the file.
+// --- TS job config parser ---
+//
+// Reads `config = { ... }` from a TS source by hand-scanning brace depth so
+// nested objects (e.g. `env: { FOO: "bar" }`) don't trip the matcher.
+
 export interface TsJobConfigShape {
   schedule?: string | number;
   enabled?: boolean;
@@ -63,42 +90,125 @@ export interface TsJobConfigShape {
   model?: string;
 }
 
-export function parseTsJobConfig(source: string): TsJobConfigShape {
-  const block = source.match(/\bconfig\b\s*(?::\s*[^=]+)?=\s*\{([\s\S]*?)\}/);
-  if (!block) return {};
-  const body = block[1];
-  const cfg: TsJobConfigShape = {};
-  const pick = (key: string): string | undefined => {
-    const re = new RegExp(`\\b${key}\\s*:\\s*([^,\\n}]+)`, "m");
-    const m = body.match(re);
-    return m
-      ? m[1]
-          .trim()
-          .replace(/[,;]+$/, "")
-          .trim()
-      : undefined;
-  };
-  const sched = pick("schedule") ?? pick("every");
-  if (sched !== undefined) {
-    const unquoted = sched.replace(/^['"]|['"]$/g, "");
-    cfg.schedule = /^-?\d+$/.test(unquoted) ? parseInt(unquoted, 10) : unquoted;
+function extractConfigBlock(source: string): string | null {
+  const re = /\bconfig\b\s*(?::\s*[^=]+)?=\s*\{/g;
+  const m = re.exec(source);
+  if (!m) return null;
+  const start = m.index + m[0].length;
+  let depth = 1;
+  let inStr: string | null = null;
+  for (let i = start; i < source.length; i++) {
+    const c = source[i];
+    const prev = source[i - 1];
+    if (inStr) {
+      if (c === inStr && prev !== "\\") inStr = null;
+      continue;
+    }
+    if (c === '"' || c === "'" || c === "`") {
+      inStr = c;
+      continue;
+    }
+    if (c === "{") depth++;
+    else if (c === "}") {
+      depth--;
+      if (depth === 0) return source.slice(start, i);
+    }
   }
-  const enabled = pick("enabled");
+  return null;
+}
+
+function pickFromConfig(body: string, key: string): string | undefined {
+  // Match `key:` only at the top level (depth 0) of the config block.
+  let depth = 0;
+  let inStr: string | null = null;
+  const re = new RegExp(`\\b${key}\\b`, "g");
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(body))) {
+    let d = 0;
+    let s: string | null = null;
+    for (let i = 0; i < m.index; i++) {
+      const c = body[i];
+      const prev = body[i - 1];
+      if (s) {
+        if (c === s && prev !== "\\") s = null;
+        continue;
+      }
+      if (c === '"' || c === "'" || c === "`") {
+        s = c;
+        continue;
+      }
+      if (c === "{") d++;
+      else if (c === "}") d--;
+    }
+    if (d !== 0 || s !== null) continue;
+    // After the key, expect ":"
+    const after = body.slice(m.index + key.length).match(/^\s*:\s*([^,\n}]+)/);
+    if (!after) continue;
+    return after[1]
+      .trim()
+      .replace(/[,;]+$/, "")
+      .trim();
+  }
+  return undefined;
+  void depth;
+  void inStr;
+}
+
+export function parseTsJobConfig(source: string): TsJobConfigShape {
+  const body = extractConfigBlock(source);
+  if (!body) return {};
+  const cfg: TsJobConfigShape = {};
+
+  const sched = pickFromConfig(body, "schedule");
+  if (pickFromConfig(body, "every") !== undefined) {
+    throw new FrontmatterError(
+      `key "every" is no longer supported — rename to "schedule"`,
+    );
+  }
+  if (sched !== undefined) {
+    const u = sched.replace(/^['"`]|['"`]$/g, "");
+    cfg.schedule = /^-?\d+$/.test(u) ? parseInt(u, 10) : u;
+  }
+  const enabled = pickFromConfig(body, "enabled");
   if (enabled === "true") cfg.enabled = true;
   else if (enabled === "false") cfg.enabled = false;
-  const timeout = pick("timeout");
-  if (timeout !== undefined && /^-?\d+$/.test(timeout))
-    cfg.timeout = parseInt(timeout, 10);
-  const retries = pick("retries");
-  if (retries !== undefined && /^\d+$/.test(retries))
-    cfg.retries = parseInt(retries, 10);
-  const concurrency = pick("concurrency");
-  if (concurrency !== undefined) {
-    const c = concurrency.replace(/^['"]|['"]$/g, "");
-    if (c === "skip" || c === "queue") cfg.concurrency = c;
+  else if (enabled !== undefined) {
+    throw new FrontmatterError(
+      `enabled must be true or false, got: ${enabled}`,
+    );
   }
-  const model = pick("model");
-  if (model !== undefined) cfg.model = model.replace(/^['"]|['"]$/g, "");
+  const timeout = pickFromConfig(body, "timeout");
+  if (timeout !== undefined) {
+    if (!/^\d+$/.test(timeout)) {
+      throw new FrontmatterError(
+        `timeout must be a positive integer, got: ${timeout}`,
+      );
+    }
+    cfg.timeout = parseInt(timeout, 10);
+  }
+  const retries = pickFromConfig(body, "retries");
+  if (retries !== undefined) {
+    if (!/^\d+$/.test(retries)) {
+      throw new FrontmatterError(
+        `retries must be a non-negative integer, got: ${retries}`,
+      );
+    }
+    cfg.retries = parseInt(retries, 10);
+  }
+  const concurrency = pickFromConfig(body, "concurrency");
+  if (concurrency !== undefined) {
+    const c = concurrency.replace(/^['"`]|['"`]$/g, "");
+    if (c !== "skip" && c !== "queue") {
+      throw new FrontmatterError(
+        `concurrency must be "skip" or "queue", got: ${c}`,
+      );
+    }
+    cfg.concurrency = c;
+  }
+  const model = pickFromConfig(body, "model");
+  if (model !== undefined) {
+    cfg.model = model.replace(/^['"`]|['"`]$/g, "");
+  }
   return cfg;
 }
 
