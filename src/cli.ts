@@ -252,12 +252,15 @@ async function cmdList(): Promise<void> {
   console.log(header);
   for (const j of jobs) {
     let sched = "—";
-    if (j.schedule !== undefined) {
+    if (j.schedule !== undefined && j.schedule !== 0 && j.schedule !== "") {
       try {
         const d = dispatchSchedule(j.schedule);
         sched = d.kind === "cron" ? d.expr : `every ${d.value}s`;
       } catch {
-        sched = `BAD(${j.schedule})`;
+        // Disabled jobs may carry sentinel/unparseable schedules (e.g. `every: 0`
+        // for "manual-only"). Only surface BAD when the job is enabled — those
+        // are the ones that would actually try to bootstrap and fail at sync.
+        sched = j.enabled ? `BAD(${j.schedule})` : "—";
       }
     }
     const loaded = installed.has(j.slug) ? "yes" : "no";
