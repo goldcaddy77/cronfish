@@ -74,7 +74,8 @@ export default async function run(): Promise<void> {
 | `"manual"`                | no autoschedule; run only via `cronfish run`  |
 
 `manual` jobs are discovered, validated, and listed, but no plist is installed and no calendar
-fires them. Useful for one-off / on-demand scripts you still want to live in `cron/`.
+fires them. Use it for scheduling candidates — jobs you're staging in `cron/` before flipping on
+a real schedule. Pure on-demand scripts that aren't scheduling candidates belong outside `cron/`.
 
 ## Config — `.cronfish.json` (optional, at repo root)
 
