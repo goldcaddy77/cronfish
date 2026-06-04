@@ -147,6 +147,7 @@ function pickFromConfig(body: string, key: string): string | undefined {
     return after[1]
       .trim()
       .replace(/[,;]+$/, "")
+      .replace(/\s+as\s+(?:const|[A-Za-z_$][\w$.]*)\s*$/, "")
       .trim();
   }
   return undefined;

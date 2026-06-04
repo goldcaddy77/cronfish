@@ -4,8 +4,8 @@
 // Every field validates: missing → undefined (defaults applied elsewhere),
 // wrong type → throw with file + key + expected + got.
 
-import { existsSync, readFileSync, readdirSync } from "node:fs";
-import { basename, extname, join } from "node:path";
+import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { basename, extname, join, relative } from "node:path";
 import {
   parseFrontmatter,
   parseTsJobConfig,
@@ -118,7 +118,16 @@ function slugOf(path: string): string {
   return basename(path).replace(/\.(md|ts)$/, "");
 }
 
-function fromMarkdown(path: string): JobMeta {
+// Convert an absolute job-file path to its slug, given the cron/ root.
+// Slug = path relative to cron/, with the extension stripped.
+// Always uses forward slashes (even on Windows-style paths, which we don't
+// support yet — but the convention is portable).
+export function slugFromPath(cronDir: string, absPath: string): string {
+  const rel = relative(cronDir, absPath).split("\\").join("/");
+  return rel.replace(/\.(md|ts)$/, "");
+}
+
+function fromMarkdown(path: string, slug: string): JobMeta {
   const raw = readFileSync(path, "utf-8");
   let frontmatter: Record<string, Scalar>;
   try {
@@ -129,7 +138,7 @@ function fromMarkdown(path: string): JobMeta {
     throw e;
   }
   return {
-    slug: slugOf(path),
+    slug,
     path,
     kind: "md",
     enabled: asBool(path, "enabled", frontmatter.enabled, true),
@@ -141,7 +150,7 @@ function fromMarkdown(path: string): JobMeta {
   };
 }
 
-function fromTypescript(path: string): JobMeta {
+function fromTypescript(path: string, slug: string): JobMeta {
   const source = readFileSync(path, "utf-8");
   let cfg: TsJobConfigShape;
   try {
@@ -152,7 +161,7 @@ function fromTypescript(path: string): JobMeta {
     throw e;
   }
   return {
-    slug: slugOf(path),
+    slug,
     path,
     kind: "ts",
     enabled: cfg.enabled ?? true,
@@ -164,11 +173,45 @@ function fromTypescript(path: string): JobMeta {
   };
 }
 
-export function loadJob(absPath: string): JobMeta {
+export function loadJob(absPath: string, slug?: string): JobMeta {
   const ext = extname(absPath);
-  if (ext === ".md") return fromMarkdown(absPath);
-  if (ext === ".ts") return fromTypescript(absPath);
+  const s = slug ?? slugOf(absPath);
+  if (ext === ".md") return fromMarkdown(absPath, s);
+  if (ext === ".ts") return fromTypescript(absPath, s);
   throw new JobValidationError(absPath, `unsupported extension ${ext}`);
+}
+
+// Recursively collect every `.md`/`.ts` file under cronDir. The single magic
+// filename `README.md` is ignored at any depth so authors can document a
+// folder of crons without the README getting parsed as a job.
+function walkJobFiles(cronDir: string): string[] {
+  const out: string[] = [];
+  const visit = (dir: string): void => {
+    let entries: string[];
+    try {
+      entries = readdirSync(dir);
+    } catch {
+      return;
+    }
+    for (const name of entries) {
+      const full = join(dir, name);
+      let st;
+      try {
+        st = statSync(full);
+      } catch {
+        continue;
+      }
+      if (st.isDirectory()) {
+        visit(full);
+        continue;
+      }
+      if (!st.isFile()) continue;
+      if (name === "README.md") continue;
+      if (name.endsWith(".md") || name.endsWith(".ts")) out.push(full);
+    }
+  };
+  visit(cronDir);
+  return out;
 }
 
 export function discoverJobs(cronDir: string): {
@@ -176,14 +219,12 @@ export function discoverJobs(cronDir: string): {
   errors: { path: string; message: string }[];
 } {
   if (!existsSync(cronDir)) return { jobs: [], errors: [] };
-  const entries = readdirSync(cronDir)
-    .filter((f) => f.endsWith(".md") || f.endsWith(".ts"))
-    .map((f) => join(cronDir, f));
+  const entries = walkJobFiles(cronDir);
   const jobs: JobMeta[] = [];
   const errors: { path: string; message: string }[] = [];
   for (const p of entries) {
     try {
-      jobs.push(loadJob(p));
+      jobs.push(loadJob(p, slugFromPath(cronDir, p)));
     } catch (e) {
       errors.push({ path: p, message: (e as Error).message });
     }

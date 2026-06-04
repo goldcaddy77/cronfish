@@ -93,6 +93,17 @@ describe("parseTsJobConfig", () => {
     const src = `export const config = { concurrency: "all" };`;
     expect(() => parseTsJobConfig(src)).toThrow();
   });
+
+  test("strips trailing TS type assertions (as const, as Foo)", () => {
+    const src = `export const config = {
+      schedule: "5m",
+      concurrency: "skip" as const,
+      model: "haiku" as ModelAlias,
+    };`;
+    const cfg = parseTsJobConfig(src);
+    expect(cfg.concurrency).toBe("skip");
+    expect(cfg.model).toBe("haiku");
+  });
 });
 
 describe("setFrontmatterKey", () => {

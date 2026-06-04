@@ -16,6 +16,16 @@ bunx cronfish list            # see what's scheduled and what's loaded
 
 That's it. No code change to register a job — just drop a file in `cron/`.
 
+## Where jobs live
+
+`cron/` is a tree, not a flat directory. Any `.md` or `.ts` file at any depth is a job. The slug
+is the path relative to `cron/` with the extension stripped — `cron/email/triage.ts` →
+`email/triage`. Use folders to group related crons (`cron/email/`, `cron/linkedin/`).
+
+**One magic filename: `README.md`.** A file named exactly `README.md` is ignored at any depth, so
+you can document a folder of crons without the README getting parsed as a job. No other reserved
+names.
+
 ## Job spec
 
 ### Markdown — `cron/<slug>.md`
@@ -53,7 +63,7 @@ export default async function run(): Promise<void> {
 }
 ```
 
-## `schedule:` — one key, four shapes
+## `schedule:` — one key, five shapes
 
 | Input                     | Meaning                                       |
 | ------------------------- | --------------------------------------------- |
@@ -61,8 +71,10 @@ export default async function run(): Promise<void> {
 | `"every 5 minutes"`       | human (`every minute`, `every N hours`, etc.) |
 | `60`                      | bare number → seconds                         |
 | `"60s"` / `"5m"` / `"1d"` | compact unit suffix                           |
+| `"manual"`                | no autoschedule; run only via `cronfish run`  |
 
-The `every:` key (used by older harnesses) is silently aliased to `schedule:` for one version.
+`manual` jobs are discovered, validated, and listed, but no plist is installed and no calendar
+fires them. Useful for one-off / on-demand scripts you still want to live in `cron/`.
 
 ## Config — `.cronfish.json` (optional, at repo root)
 
@@ -78,12 +90,14 @@ Becomes the launchd plist label prefix: cronfish appends `.<slug>` per job. Defa
 ```
 cronfish init                       scaffold cron/hello.md + cron/touch.ts
 cronfish list                       every job + state
+cronfish next [slug] [N]            preview the next N fire times (default 5)
 cronfish sync                       reconcile cron/ ↔ launchd (idempotent)
 cronfish enable <slug>              flip enabled, then sync
 cronfish disable <slug>             flip disabled, then sync
 cronfish delete <slug> --yes        bootout + remove plist + job file
 cronfish status [slug]              launchctl print + tail of latest log
 cronfish run <slug>                 invoke runner directly (no launchd) — for testing
+cronfish --version
 ```
 
 ## Files cronfish writes
@@ -102,13 +116,28 @@ cron/<slug>.{md,ts}                                # job files (you write these)
 - `concurrency: skip` — if a prior run is still in flight, exit 0 immediately.
 - `concurrency: queue` — poll every 2s for the lock, up to the job's `timeout`.
 
-## Platform
+## How cronfish finds bun
 
-macOS only (launchd) for v0.1. Linux (systemd) and Windows (Task Scheduler) are on the backlog.
+Plists invoke `/usr/bin/env bun <runner.ts>`. At `cronfish sync` time, cronfish resolves your
+current `bun` binary and bakes its directory into the plist's `PATH` along with the standard
+candidates (`~/.bun/bin`, `/opt/homebrew/bin`, `/usr/local/bin`, `/usr/bin`, `/bin`). Bun
+auto-loads `.env` from the consumer root (set via plist `WorkingDirectory`), so no shell wrapper
+is needed.
+
+- After `bun upgrade` (in place) or a `brew upgrade bun` (same dir) — no re-sync needed.
+- After moving bun to a different directory — re-run `cronfish sync` so the plist PATH picks up
+  the new location.
+- asdf-managed bun is **not** in the default allowlist; install bun via the official installer
+  (`curl -fsSL https://bun.sh/install | bash` → `~/.bun/bin`) or Homebrew.
+
+## Requirements
+
+- macOS (launchd). Linux (systemd) and Windows (Task Scheduler) are on the backlog.
+- Bun ≥ 1.0.
 
 ## Status
 
-v0.1 — private, used in production by the author. API may break before v1. File issues if you
+v0.2 — private, used in production by the author. API may break before v1. File issues if you
 hit something rough.
 
 ## License

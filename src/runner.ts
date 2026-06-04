@@ -18,7 +18,7 @@ import {
   writeSync,
 } from "node:fs";
 import { extname, join, resolve } from "node:path";
-import { loadJob, type JobMeta } from "./jobs.ts";
+import { loadJob, slugFromPath, type JobMeta } from "./jobs.ts";
 import { resolveModel, localCommand } from "./models.ts";
 
 const DEFAULT_TIMEOUT_S = 300;
@@ -269,7 +269,9 @@ async function main(): Promise<void> {
     process.exit(2);
   }
 
-  const job = loadJob(abs);
+  const cronDir = join(consumerRoot(), "cron");
+  const slug = existsSync(cronDir) ? slugFromPath(cronDir, abs) : undefined;
+  const job = loadJob(abs, slug);
   const timeoutS = job.timeout ?? DEFAULT_TIMEOUT_S;
   const retries = job.retries ?? 0;
 

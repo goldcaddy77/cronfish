@@ -1,10 +1,13 @@
 {
   "name": "cronfish",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Drop a file. Cronfish does the rest. Markdown is a valid cron job.",
   "type": "module",
   "bin": {
     "cronfish": "./src/cli.ts"
+  },
+  "engines": {
+    "bun": ">=1.0"
   },
   "scripts": {
     "test": "bun test"

@@ -103,8 +103,21 @@ export interface LaunchdConfig {
   consumerRoot: string;
 }
 
+// launchd labels can't contain `/`, so nested slugs (`email/triage`) get their
+// separators flattened to `.` on the wire (`<prefix>.email.triage`). The
+// reverse mapping isn't unique when a filename contains a literal `.`, so we
+// only ever go slug → label; comparisons against the installed set happen in
+// label space (see labelSuffixOf).
+function slugToLabelComponent(slug: string): string {
+  return slug.split("/").join(".");
+}
+
 function labelFor(prefix: string, slug: string): string {
-  return `${prefix}.${slug}`;
+  return `${prefix}.${slugToLabelComponent(slug)}`;
+}
+
+export function labelSuffixOf(slug: string): string {
+  return slugToLabelComponent(slug);
 }
 
 function plistPathFor(label: string): string {

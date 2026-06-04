@@ -1,0 +1,209 @@
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+const RUNNER = new URL("../src/runner.ts", import.meta.url).pathname;
+
+interface SpawnResult {
+  code: number;
+  out: string;
+  err: string;
+  durationMs: number;
+}
+
+function spawnRunner(root: string, jobPath: string): SpawnResult {
+  const t0 = Date.now();
+  const proc = Bun.spawnSync(["bun", RUNNER, jobPath], {
+    stdout: "pipe",
+    stderr: "pipe",
+    cwd: root,
+    env: { ...process.env, CRONFISH_CONSUMER_ROOT: root },
+  });
+  return {
+    code: proc.exitCode ?? 0,
+    out: new TextDecoder().decode(proc.stdout),
+    err: new TextDecoder().decode(proc.stderr),
+    durationMs: Date.now() - t0,
+  };
+}
+
+function writeJob(root: string, name: string, body: string): string {
+  const cron = join(root, "cron");
+  mkdirSync(cron, { recursive: true });
+  const path = join(cron, name);
+  writeFileSync(path, body, "utf-8");
+  return path;
+}
+
+function latestLog(root: string, slug: string): string {
+  const dir = join(root, "tmp", "cron", slug);
+  if (!existsSync(dir)) return "";
+  const files = readdirSync(dir)
+    .filter((f) => f.endsWith(".log"))
+    .sort();
+  if (files.length === 0) return "";
+  return readFileSync(join(dir, files[files.length - 1]!), "utf-8");
+}
+
+function lockPath(root: string, slug: string): string {
+  return join(root, "tmp", "cron", slug, "runner.pid");
+}
+
+describe("runner", () => {
+  let root: string;
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "cronfish-runner-"));
+  });
+  afterEach(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  test("retries failing job and logs each attempt", () => {
+    const counter = join(root, "counter.txt");
+    const job = writeJob(
+      root,
+      "fail.ts",
+      `export const config = {
+  schedule: "manual",
+  enabled: true,
+  retries: 1,
+  timeout: 30,
+};
+export default async function run() {
+  const fs = await import("node:fs");
+  fs.appendFileSync(${JSON.stringify(counter)}, "x");
+  process.exit(1);
+}
+`,
+    );
+    const r = spawnRunner(root, job);
+    expect(r.code).toBe(1);
+    const runs = readFileSync(counter, "utf-8").length;
+    expect(runs).toBe(2); // initial + 1 retry
+    const log = latestLog(root, "fail");
+    expect(log).toContain("retry 1/1");
+    expect(log).toContain("exit=1");
+  }, 20_000);
+
+  test("concurrency=skip with live lock exits 0 without running", () => {
+    const sentinel = join(root, "ran.txt");
+    const job = writeJob(
+      root,
+      "skip.ts",
+      `export const config = {
+  schedule: "manual",
+  enabled: true,
+  concurrency: "skip",
+  timeout: 5,
+};
+export default async function run() {
+  const fs = await import("node:fs");
+  fs.writeFileSync(${JSON.stringify(sentinel)}, "ran");
+}
+`,
+    );
+    // Pre-create lock pointing at this test process (definitely alive).
+    const lp = lockPath(root, "skip");
+    mkdirSync(join(root, "tmp", "cron", "skip"), { recursive: true });
+    writeFileSync(lp, String(process.pid), "utf-8");
+    const r = spawnRunner(root, job);
+    expect(r.code).toBe(0);
+    expect(r.out + r.err).toContain("concurrency=skip");
+    expect(existsSync(sentinel)).toBe(false);
+    // Pre-existing lock left in place — runner did not claim it.
+    expect(readFileSync(lp, "utf-8")).toBe(String(process.pid));
+  });
+
+  test("stale PID lock is claimed and job runs", () => {
+    const sentinel = join(root, "ran.txt");
+    const job = writeJob(
+      root,
+      "stale.ts",
+      `export const config = {
+  schedule: "manual",
+  enabled: true,
+  concurrency: "skip",
+  timeout: 5,
+};
+export default async function run() {
+  const fs = await import("node:fs");
+  fs.writeFileSync(${JSON.stringify(sentinel)}, "ran");
+}
+`,
+    );
+    // Find a definitively dead PID by spawning sleep 0 and reading its pid.
+    const dead = Bun.spawnSync(["true"]);
+    const deadPid = dead.pid;
+    mkdirSync(join(root, "tmp", "cron", "stale"), { recursive: true });
+    writeFileSync(lockPath(root, "stale"), String(deadPid), "utf-8");
+    const r = spawnRunner(root, job);
+    expect(r.code).toBe(0);
+    expect(existsSync(sentinel)).toBe(true);
+    // Runner released its own lock on exit.
+    expect(existsSync(lockPath(root, "stale"))).toBe(false);
+  });
+
+  test("SIGTERM releases the lock", async () => {
+    const job = writeJob(
+      root,
+      "long.ts",
+      `export const config = {
+  schedule: "manual",
+  enabled: true,
+  concurrency: "skip",
+  timeout: 60,
+};
+export default async function run() {
+  await new Promise(r => setTimeout(r, 30_000));
+}
+`,
+    );
+    const proc = Bun.spawn(["bun", RUNNER, job], {
+      stdout: "ignore",
+      stderr: "ignore",
+      cwd: root,
+      env: { ...process.env, CRONFISH_CONSUMER_ROOT: root },
+    });
+    // Wait for lock to appear.
+    const lp = lockPath(root, "long");
+    const deadline = Date.now() + 5000;
+    while (!existsSync(lp) && Date.now() < deadline) {
+      await Bun.sleep(50);
+    }
+    expect(existsSync(lp)).toBe(true);
+    proc.kill("SIGTERM");
+    await proc.exited;
+    expect(existsSync(lp)).toBe(false);
+  }, 15_000);
+
+  test("timeout kills the child and reports 124", () => {
+    const job = writeJob(
+      root,
+      "slow.ts",
+      `export const config = {
+  schedule: "manual",
+  enabled: true,
+  timeout: 1,
+};
+export default async function run() {
+  await new Promise(r => setTimeout(r, 10_000));
+}
+`,
+    );
+    const r = spawnRunner(root, job);
+    expect(r.code).toBe(124);
+    // Should complete well under the 10s sleep.
+    expect(r.durationMs).toBeLessThan(8_000);
+    const log = latestLog(root, "slow");
+    expect(log).toContain("timeout after 1s");
+  }, 15_000);
+});

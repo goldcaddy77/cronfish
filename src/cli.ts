@@ -74,6 +74,8 @@ function cmdList(): void {
   }
   const p = platform();
   const installed = new Set(p.listInstalled(PREFIX));
+  const isInstalled = (slug: string): boolean =>
+    installed.has(p.labelSuffixOf(slug));
   const headers = [
     "slug",
     "kind",
@@ -104,7 +106,7 @@ function cmdList(): void {
         sched,
         j.model ?? "—",
         j.enabled ? "yes" : "no",
-        installed.has(j.slug) ? "yes" : "no",
+        isInstalled(j.slug) ? "yes" : "no",
         String(j.retries ?? 0),
         j.concurrency ?? "—",
       ].join("\t"),
@@ -135,10 +137,13 @@ function cmdSync(): void {
 
   const state = rememberPrefix(CONSUMER_ROOT, PREFIX);
   const desired = new Map<string, JobMeta>();
+  const desiredLabels = new Set<string>();
   for (const j of jobs) {
     const decision = shouldInstall(j);
-    if (decision.ok) desired.set(j.slug, j);
-    else if (
+    if (decision.ok) {
+      desired.set(j.slug, j);
+      desiredLabels.add(p.labelSuffixOf(j.slug));
+    } else if (
       decision.reason &&
       decision.reason !== "disabled" &&
       decision.reason !== "manual"
@@ -147,14 +152,14 @@ function cmdSync(): void {
     }
   }
 
-  // Walk every historical prefix and bootout slugs no longer desired under
-  // the current prefix. This is the stale-prefix fix.
+  // Walk every historical prefix and bootout label-suffixes no longer desired
+  // under the current prefix. This is the stale-prefix fix.
   for (const prefix of state.seen_prefixes) {
-    for (const slug of p.listInstalled(prefix)) {
-      const stillDesired = prefix === PREFIX && desired.has(slug);
+    for (const labelSuffix of p.listInstalled(prefix)) {
+      const stillDesired = prefix === PREFIX && desiredLabels.has(labelSuffix);
       if (stillDesired) continue;
-      console.log(`[cronfish] bootout ${prefix}.${slug}`);
-      p.uninstall(prefix, slug);
+      console.log(`[cronfish] bootout ${prefix}.${labelSuffix}`);
+      p.uninstall(prefix, labelSuffix);
     }
   }
 
