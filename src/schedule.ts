@@ -5,11 +5,13 @@
 //
 // Accepted inputs:
 //   "M H DOM MON DOW"  → cron       (each field "*" or single integer)
-//   "every ..."        → friendly → cron or seconds
+//   "every ..."        → friendly → seconds
 //   bare number 60     → seconds    (60)
 //   "60s" "5m" "2h" "1d" → seconds
 //
-// Anything else throws a clear error naming the offending input.
+// Note: launchd `StartCalendarInterval` only accepts single ints per field,
+// so we never emit `*/N` cron expressions from the human form — those become
+// seconds intervals instead.
 
 import { parseFriendly } from "./parsers/friendly.ts";
 
@@ -39,26 +41,22 @@ export function dispatchSchedule(
   const s = input.trim();
   if (!s) throw new Error("schedule: empty");
 
-  // Shape: "Ns" "Nm" "Nh" "Nd"
   const compact = s.match(/^(\d+)([smhd])$/);
   if (compact) {
     const n = parseInt(compact[1], 10);
     return { kind: "seconds", value: n * UNIT_SECONDS[compact[2]] };
   }
 
-  // Shape: bare integer string
   if (/^\d+$/.test(s)) {
     return { kind: "seconds", value: parseInt(s, 10) };
   }
 
-  // Shape: "every ..."
   if (/^every\b/i.test(s)) {
     const f = parseFriendly(s);
     if (!f) throw new Error(`schedule: unrecognized human form "${input}"`);
     return f;
   }
 
-  // Shape: 5-field cron
   const parts = s.split(/\s+/);
   if (
     parts.length === 5 &&

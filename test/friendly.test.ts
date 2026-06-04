@@ -8,37 +8,37 @@ describe("parseFriendly", () => {
       value: 1,
     });
     expect(parseFriendly("every minute")).toEqual({
-      kind: "cron",
-      expr: "* * * * *",
+      kind: "seconds",
+      value: 60,
     });
     expect(parseFriendly("every hour")).toEqual({
-      kind: "cron",
-      expr: "0 * * * *",
+      kind: "seconds",
+      value: 3600,
     });
   });
 
   test("every N minutes", () => {
     expect(parseFriendly("every 5 minutes")).toEqual({
-      kind: "cron",
-      expr: "*/5 * * * *",
+      kind: "seconds",
+      value: 300,
     });
     expect(parseFriendly("every 1 minute")).toEqual({
-      kind: "cron",
-      expr: "*/1 * * * *",
+      kind: "seconds",
+      value: 60,
     });
   });
 
   test("every N hours", () => {
     expect(parseFriendly("every 2 hours")).toEqual({
-      kind: "cron",
-      expr: "0 */2 * * *",
+      kind: "seconds",
+      value: 7200,
     });
   });
 
   test("every N days", () => {
     expect(parseFriendly("every 3 days")).toEqual({
-      kind: "cron",
-      expr: "0 0 */3 * *",
+      kind: "seconds",
+      value: 259200,
     });
   });
 
@@ -60,8 +60,8 @@ describe("parseFriendly", () => {
 
   test("case insensitive", () => {
     expect(parseFriendly("Every 5 Minutes")).toEqual({
-      kind: "cron",
-      expr: "*/5 * * * *",
+      kind: "seconds",
+      value: 300,
     });
   });
 });

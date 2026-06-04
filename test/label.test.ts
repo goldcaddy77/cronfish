@@ -56,7 +56,7 @@ describe("bundle prefix", () => {
     const r = runCli(root, ["list"]);
     expect(r.code).toBe(0);
     expect(r.out).toContain("demo");
-    expect(r.out).toContain("*/5 * * * *");
+    expect(r.out).toContain("every 300s");
   });
 
   test("malformed .cronfish.json surfaces error", () => {

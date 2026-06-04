@@ -25,17 +25,17 @@ describe("dispatchSchedule", () => {
     expect(dispatchSchedule("1d")).toEqual({ kind: "seconds", value: 86400 });
   });
 
-  test("human form: every N minutes → cron", () => {
+  test("human form: every N minutes → seconds", () => {
     expect(dispatchSchedule("every 5 minutes")).toEqual({
-      kind: "cron",
-      expr: "*/5 * * * *",
+      kind: "seconds",
+      value: 300,
     });
   });
 
-  test("human form: every hour → cron", () => {
+  test("human form: every hour → seconds", () => {
     expect(dispatchSchedule("every hour")).toEqual({
-      kind: "cron",
-      expr: "0 * * * *",
+      kind: "seconds",
+      value: 3600,
     });
   });
 
