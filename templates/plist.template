@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>__LABEL__</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>__CONSUMER_ROOT__/node_modules/cronfish/src/runner.sh</string>
+        <string>__JOB_PATH__</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__CONSUMER_ROOT__</string>
+
+__SCHEDULE_BLOCK__
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>__CONSUMER_ROOT__/tmp/cron/__SLUG__/launchd.out</string>
+
+    <key>StandardErrorPath</key>
+    <string>__CONSUMER_ROOT__/tmp/cron/__SLUG__/launchd.err</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>__HOME__</string>
+        <key>CRONFISH_CONSUMER_ROOT</key>
+        <string>__CONSUMER_ROOT__</string>
+        <key>PATH</key>
+        <string>__HOME__/.bun/bin:__HOME__/.asdf/installs/nodejs/22.13.1/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+</dict>
+</plist>

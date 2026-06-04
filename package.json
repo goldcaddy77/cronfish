@@ -1,0 +1,20 @@
+{
+  "name": "cronfish",
+  "version": "0.1.0",
+  "description": "Drop a file. Cronfish does the rest. Markdown is a valid cron job.",
+  "type": "module",
+  "bin": {
+    "cronfish": "./src/cli.ts"
+  },
+  "scripts": {
+    "test": "bun test"
+  },
+  "files": [
+    "src",
+    "templates",
+    "README.md",
+    "LICENSE"
+  ],
+  "license": "MIT",
+  "author": "Dan Caddigan"
+}
