@@ -476,6 +476,71 @@ async function cmdUi(rest: string[]): Promise<void> {
   await new Promise(() => {});
 }
 
+function parseUiInstallArgs(rest: string[]): { port: number } {
+  let port = 4747;
+  for (let i = 0; i < rest.length; i++) {
+    const arg = rest[i];
+    if (arg === "--port") {
+      const next = rest[++i];
+      if (!next || !/^\d+$/.test(next)) {
+        throw new Error("usage: cronfish ui install [--port N]");
+      }
+      port = parseInt(next, 10);
+    } else if (arg.startsWith("--port=")) {
+      const v = arg.slice("--port=".length);
+      if (!/^\d+$/.test(v)) {
+        throw new Error("usage: cronfish ui install [--port N]");
+      }
+      port = parseInt(v, 10);
+    } else {
+      throw new Error(`cronfish ui install: unknown flag "${arg}"`);
+    }
+  }
+  return { port };
+}
+
+function cmdUiInstall(rest: string[]): void {
+  const { port } = parseUiInstallArgs(rest);
+  const r = platform().installUi({
+    bundlePrefix: PREFIX,
+    consumerRoot: CONSUMER_ROOT,
+    port,
+    bunPath: BUN_PATH,
+  });
+  if (r.changed) {
+    console.log(`[cronfish] ui installed: ${r.label}`);
+    console.log(`           plist: ${r.plistPath}`);
+    console.log(`           log:   ${r.logPath}`);
+    console.log(`           url:   ${r.url}`);
+  } else {
+    console.log(`[cronfish] ui already up-to-date: ${r.url}`);
+  }
+}
+
+function cmdUiUninstall(): void {
+  const r = platform().uninstallUi(PREFIX);
+  if (r.existed) {
+    console.log(`[cronfish] ui uninstalled: ${r.label}`);
+  } else {
+    console.log(`[cronfish] ui not installed (${r.label})`);
+  }
+}
+
+function cmdUiStatus(): void {
+  const s = platform().uiStatus(PREFIX);
+  if (!s.installed && !s.loaded) {
+    console.log("[cronfish] ui not installed");
+    console.log("           run: cronfish ui install");
+    return;
+  }
+  console.log(
+    `[cronfish] ui ${s.loaded ? "running" : "installed (not loaded)"}`,
+  );
+  console.log(`           label: ${s.label}`);
+  console.log(`           plist: ${s.plistPath}`);
+  if (s.pid !== null) console.log(`           pid:   ${s.pid}`);
+}
+
 function cmdNext(slug?: string, n = 5): void {
   const { jobs } = discoverJobs(CRON_DIR);
   const targets = slug ? jobs.filter((j) => j.slug === slug) : jobs;
@@ -605,6 +670,9 @@ usage:
   cronfish status [slug]              all jobs (no arg) or one slug's launchctl + log tail
   cronfish run <slug>                 invoke runner directly (no launchd)
   cronfish ui [--port N] [--no-open]  local web dashboard (default 127.0.0.1:4747)
+  cronfish ui install [--port N]      install dashboard as a launchd daemon (auto-restart, runs at login)
+  cronfish ui uninstall               bootout + remove dashboard daemon
+  cronfish ui status                  show dashboard daemon state
   cronfish --version
 
 config: <consumer>/.cronfish.json  →  { "bundle_prefix": "com.example.app",
@@ -662,9 +730,23 @@ async function main(): Promise<void> {
       if (!rest[0]) throw new Error("usage: cronfish run <slug>");
       await cmdRun(rest[0]);
       return;
-    case "ui":
+    case "ui": {
+      const sub = rest[0];
+      if (sub === "install") {
+        cmdUiInstall(rest.slice(1));
+        return;
+      }
+      if (sub === "uninstall") {
+        cmdUiUninstall();
+        return;
+      }
+      if (sub === "status") {
+        cmdUiStatus();
+        return;
+      }
       await cmdUi(rest);
       return;
+    }
     default:
       console.error(`[cronfish] unknown verb: ${verb}`);
       usage();

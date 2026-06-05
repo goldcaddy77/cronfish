@@ -233,3 +233,156 @@ export function statusOf(prefix: string, slug: string): string {
 export function getLabel(prefix: string, slug: string): string {
   return labelFor(prefix, slug);
 }
+
+// --- UI daemon (cronfish ui install/uninstall/status) ---
+
+const CLI_TS = resolve(import.meta.dir, "..", "cli.ts");
+
+function uiLabelFor(prefix: string): string {
+  return `${prefix}.ui`;
+}
+
+export interface UiDaemonConfig {
+  bundlePrefix: string;
+  consumerRoot: string;
+  port: number;
+  bunPath?: string;
+}
+
+function renderUi(cfg: UiDaemonConfig): LaunchdRender {
+  const bunDir = findBunDir(cfg.bunPath);
+  if (!bunDir) {
+    if (cfg.bunPath) {
+      throw new Error(
+        `.cronfish.json bun_path "${cfg.bunPath}" not found on disk.`,
+      );
+    }
+    throw new Error(
+      "bun not found in $BUN_INSTALL/bin, /opt/homebrew/bin, ~/.bun/bin, /usr/local/bin, or PATH. Install: https://bun.sh (or set bun_path in .cronfish.json)",
+    );
+  }
+  const pathEnv = [
+    bunDir,
+    ...DEFAULT_PATH_DIRS.filter((d) => d !== bunDir),
+  ].join(":");
+  const label = uiLabelFor(cfg.bundlePrefix);
+  const logPath = join(cfg.consumerRoot, ".cronfish", "logs", "ui.log");
+  const contents = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>${label}</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/env</string>
+        <string>bun</string>
+        <string>${CLI_TS}</string>
+        <string>ui</string>
+        <string>--port</string>
+        <string>${cfg.port}</string>
+        <string>--no-open</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>${cfg.consumerRoot}</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>${logPath}</string>
+
+    <key>StandardErrorPath</key>
+    <string>${logPath}</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>${homedir()}</string>
+        <key>CRONFISH_CONSUMER_ROOT</key>
+        <string>${cfg.consumerRoot}</string>
+        <key>PATH</key>
+        <string>${pathEnv}</string>
+    </dict>
+</dict>
+</plist>
+`;
+  return { label, plistPath: plistPathFor(label), contents };
+}
+
+export interface UiInstallResult {
+  changed: boolean;
+  label: string;
+  plistPath: string;
+  logPath: string;
+  url: string;
+}
+
+export function installUi(cfg: UiDaemonConfig): UiInstallResult {
+  mkdirSync(LAUNCH_AGENTS, { recursive: true });
+  mkdirSync(join(cfg.consumerRoot, ".cronfish", "logs"), { recursive: true });
+  const r = renderUi(cfg);
+  const logPath = join(cfg.consumerRoot, ".cronfish", "logs", "ui.log");
+  const url = `http://127.0.0.1:${cfg.port}`;
+  const prev = existsSync(r.plistPath)
+    ? readFileSync(r.plistPath, "utf-8")
+    : "";
+  if (prev === r.contents && isLoaded(r.label)) {
+    return {
+      changed: false,
+      label: r.label,
+      plistPath: r.plistPath,
+      logPath,
+      url,
+    };
+  }
+  if (existsSync(r.plistPath)) bootout(r.label);
+  writeFileSync(r.plistPath, r.contents, "utf-8");
+  bootstrap(r.plistPath);
+  return {
+    changed: true,
+    label: r.label,
+    plistPath: r.plistPath,
+    logPath,
+    url,
+  };
+}
+
+export function uninstallUi(prefix: string): {
+  existed: boolean;
+  label: string;
+} {
+  const label = uiLabelFor(prefix);
+  const dest = plistPathFor(label);
+  const existed = existsSync(dest) || isLoaded(label);
+  if (existsSync(dest)) bootout(label);
+  if (existsSync(dest)) rmSync(dest);
+  return { existed, label };
+}
+
+export interface UiStatusInfo {
+  installed: boolean;
+  loaded: boolean;
+  label: string;
+  plistPath: string;
+  pid: number | null;
+}
+
+export function uiStatus(prefix: string): UiStatusInfo {
+  const label = uiLabelFor(prefix);
+  const plistPath = plistPathFor(label);
+  const installed = existsSync(plistPath);
+  const { code, out } = sh(["launchctl", "print", `${gui()}/${label}`]);
+  const loaded = code === 0 && out.includes(label);
+  let pid: number | null = null;
+  if (loaded) {
+    const m = out.match(/\bpid\s*=\s*(\d+)/);
+    if (m) pid = parseInt(m[1], 10);
+  }
+  return { installed, loaded, label, plistPath, pid };
+}

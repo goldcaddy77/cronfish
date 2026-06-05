@@ -159,8 +159,24 @@ cronfish disable <slug>             flip disabled, then sync
 cronfish delete <slug> --yes        bootout + remove plist + job file
 cronfish status [slug]              launchctl print + tail of latest log
 cronfish run <slug>                 invoke runner directly (no launchd) — for testing
+cronfish ui [--port N] [--no-open]  local web dashboard (default 127.0.0.1:4747)
+cronfish ui install [--port N]      install dashboard as a launchd daemon (auto-restart, runs at login)
+cronfish ui uninstall               bootout + remove dashboard daemon
+cronfish ui status                  show dashboard daemon state
 cronfish --version
 ```
+
+## Always-on dashboard
+
+`cronfish ui` runs the dashboard in the foreground. To keep it up across reboots and crashes, install it as a launchd daemon:
+
+```
+cronfish ui install            # one-time, default port 4747
+cronfish ui status             # label + plist + pid
+cronfish ui uninstall          # bootout + remove
+```
+
+`install` writes `~/Library/LaunchAgents/<prefix>.ui.plist` with `KeepAlive` + `RunAtLoad`, logs to `<consumer>/.cronfish/logs/ui.log`, and dispatches it via `launchctl bootstrap`. The dashboard binds 127.0.0.1 only — no auth, not exposed.
 
 ## Files cronfish writes
 
