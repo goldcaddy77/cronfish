@@ -2,6 +2,12 @@
 // Tiny shim: import a cronfish TS job by absolute path, validate its shape,
 // then await its default export. Stdout/stderr go to the parent runner's log
 // file via FD redirection.
+//
+// If the default export returns a non-null/non-undefined value, the shim
+// emits a `__CRONFISH_RESULT_V1__::<json>` sentinel line so the runner can
+// persist it to the ledger. Void return = no sentinel (back-compat).
+
+import { SENTINEL_PREFIX } from "./result.ts";
 
 interface TsJobModule {
   config: Record<string, unknown>;
@@ -20,7 +26,16 @@ async function main(): Promise<void> {
       `${jobPath}: must export \`config\` and a default async function`,
     );
   }
-  await mod.default();
+  const ret = await mod.default();
+  if (ret !== null && ret !== undefined) {
+    try {
+      console.log(SENTINEL_PREFIX + JSON.stringify(ret));
+    } catch (e) {
+      console.error(
+        `ts-shim: failed to serialize result: ${(e as Error).message}`,
+      );
+    }
+  }
 }
 
 main().catch((e) => {
