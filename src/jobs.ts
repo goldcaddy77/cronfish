@@ -8,13 +8,14 @@ import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { basename, extname, join, relative } from "node:path";
 import {
   parseFrontmatter,
+  parseShellFrontmatter,
   parseTsJobConfig,
   FrontmatterError,
   type Scalar,
   type TsJobConfigShape,
 } from "./frontmatter.ts";
 
-export type JobKind = "md" | "ts";
+export type JobKind = "md" | "ts" | "sh";
 export type Concurrency = "skip" | "queue";
 
 export interface JobMeta {
@@ -114,17 +115,17 @@ function asBool(
   return val;
 }
 
+// Slug = path relative to cron/, with the trailing `.<ext>` rewritten to
+// `-<ext>` so the kind is encoded in the slug itself. This makes collisions
+// impossible (`foo.md` and `foo.sh` coexist as `foo-md` and `foo-sh`) and
+// keeps the launchd label readable. Always forward slashes.
 function slugOf(path: string): string {
-  return basename(path).replace(/\.(md|ts)$/, "");
+  return basename(path).replace(/\.(md|ts|sh)$/, "-$1");
 }
 
-// Convert an absolute job-file path to its slug, given the cron/ root.
-// Slug = path relative to cron/, with the extension stripped.
-// Always uses forward slashes (even on Windows-style paths, which we don't
-// support yet — but the convention is portable).
 export function slugFromPath(cronDir: string, absPath: string): string {
   const rel = relative(cronDir, absPath).split("\\").join("/");
-  return rel.replace(/\.(md|ts)$/, "");
+  return rel.replace(/\.(md|ts|sh)$/, "-$1");
 }
 
 function fromMarkdown(path: string, slug: string): JobMeta {
@@ -173,15 +174,44 @@ function fromTypescript(path: string, slug: string): JobMeta {
   };
 }
 
+function fromShell(path: string, slug: string): JobMeta {
+  const raw = readFileSync(path, "utf-8");
+  let frontmatter: Record<string, Scalar>;
+  try {
+    frontmatter = parseShellFrontmatter(raw);
+  } catch (e) {
+    if (e instanceof FrontmatterError)
+      throw new JobValidationError(path, e.message);
+    throw e;
+  }
+  if (Object.keys(frontmatter).length === 0) {
+    throw new JobValidationError(
+      path,
+      `shell job needs a "# ---" frontmatter block at the top (with at least "schedule:")`,
+    );
+  }
+  return {
+    slug,
+    path,
+    kind: "sh",
+    enabled: asBool(path, "enabled", frontmatter.enabled, true),
+    schedule: asScheduleInput(path, frontmatter.schedule),
+    timeout: asPositiveInt(path, "timeout", frontmatter.timeout, { min: 1 }),
+    retries: asPositiveInt(path, "retries", frontmatter.retries, { min: 0 }),
+    concurrency: asConcurrency(path, frontmatter.concurrency),
+  };
+}
+
 export function loadJob(absPath: string, slug?: string): JobMeta {
   const ext = extname(absPath);
   const s = slug ?? slugOf(absPath);
   if (ext === ".md") return fromMarkdown(absPath, s);
   if (ext === ".ts") return fromTypescript(absPath, s);
+  if (ext === ".sh") return fromShell(absPath, s);
   throw new JobValidationError(absPath, `unsupported extension ${ext}`);
 }
 
-// Recursively collect every `.md`/`.ts` file under cronDir. The single magic
+// Recursively collect every `.md`/`.ts`/`.sh` file under cronDir. The single magic
 // filename `README.md` is ignored at any depth so authors can document a
 // folder of crons without the README getting parsed as a job.
 function walkJobFiles(cronDir: string): string[] {
@@ -207,7 +237,12 @@ function walkJobFiles(cronDir: string): string[] {
       }
       if (!st.isFile()) continue;
       if (name === "README.md") continue;
-      if (name.endsWith(".md") || name.endsWith(".ts")) out.push(full);
+      if (
+        name.endsWith(".md") ||
+        name.endsWith(".ts") ||
+        name.endsWith(".sh")
+      )
+        out.push(full);
     }
   };
   visit(cronDir);
@@ -233,10 +268,12 @@ export function discoverJobs(cronDir: string): {
   return { jobs, errors };
 }
 
+// Inverse of slugFromPath: a slug ends in `-md`, `-ts`, or `-sh`. Split the
+// suffix to reconstruct the filename. Returns null for malformed slugs or
+// missing files.
 export function findJobFile(cronDir: string, slug: string): string | null {
-  for (const ext of [".md", ".ts"]) {
-    const p = join(cronDir, `${slug}${ext}`);
-    if (existsSync(p)) return p;
-  }
-  return null;
+  const m = slug.match(/^(.*)-(md|ts|sh)$/);
+  if (!m) return null;
+  const p = join(cronDir, `${m[1]}.${m[2]}`);
+  return existsSync(p) ? p : null;
 }

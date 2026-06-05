@@ -233,6 +233,19 @@ async function execTypescript(
   );
 }
 
+async function execShell(
+  job: JobMeta,
+  fd: number,
+  timeoutS: number,
+): Promise<number> {
+  appendLog(fd, `[runner] kind=sh file=${job.path} timeout=${timeoutS}s`);
+  return runSpawn(
+    { cmd: ["/bin/bash", job.path], cwd: consumerRoot() },
+    fd,
+    timeoutS,
+  );
+}
+
 async function execOnce(
   job: JobMeta,
   fd: number,
@@ -240,6 +253,7 @@ async function execOnce(
 ): Promise<number> {
   try {
     if (job.kind === "md") return await execMarkdown(job, fd, timeoutS);
+    if (job.kind === "sh") return await execShell(job, fd, timeoutS);
     return await execTypescript(job, fd, timeoutS);
   } catch (e) {
     appendLog(
@@ -264,7 +278,7 @@ async function main(): Promise<void> {
     process.exit(2);
   }
   const ext = extname(abs);
-  if (ext !== ".md" && ext !== ".ts") {
+  if (ext !== ".md" && ext !== ".ts" && ext !== ".sh") {
     console.error(`runner: unsupported extension ${ext}`);
     process.exit(2);
   }

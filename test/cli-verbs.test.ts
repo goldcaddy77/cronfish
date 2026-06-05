@@ -140,16 +140,16 @@ describe("cli verbs (faked launchctl)", () => {
 
     const r = runCli(ctx, ["sync"]);
     expect(r.code).toBe(0);
-    expect(r.out).toContain("bootstrap hello");
-    expect(r.out).toContain("bootstrap touch");
+    expect(r.out).toContain("bootstrap hello-md");
+    expect(r.out).toContain("bootstrap touch-ts");
 
     const plists = listPlists(ctx).sort();
     expect(plists).toEqual([
-      "com.test.cronfish.hello.plist",
-      "com.test.cronfish.touch.plist",
+      "com.test.cronfish.hello-md.plist",
+      "com.test.cronfish.touch-ts.plist",
     ]);
     // No plist for the manual job.
-    expect(plists).not.toContain("com.test.cronfish.manual.plist");
+    expect(plists).not.toContain("com.test.cronfish.manual-md.plist");
   });
 
   test("sync is idempotent", () => {
@@ -157,24 +157,24 @@ describe("cli verbs (faked launchctl)", () => {
     runCli(ctx, ["sync"]);
     const r = runCli(ctx, ["sync"]);
     expect(r.code).toBe(0);
-    expect(r.out).toContain("up-to-date hello");
-    expect(r.out).not.toContain("bootstrap hello");
+    expect(r.out).toContain("up-to-date hello-md");
+    expect(r.out).not.toContain("bootstrap hello-md");
   });
 
   test("sync after bundle_prefix change boots out old plists", () => {
     writeJob(ctx, "hello.md", MD_ENABLED);
     runCli(ctx, ["sync"]);
-    expect(listPlists(ctx)).toContain("com.test.cronfish.hello.plist");
+    expect(listPlists(ctx)).toContain("com.test.cronfish.hello-md.plist");
 
     setPrefix(ctx, "com.test.changed");
     const r = runCli(ctx, ["sync"]);
     expect(r.code).toBe(0);
-    expect(r.out).toContain("bootout com.test.cronfish.hello");
-    expect(r.out).toContain("bootstrap hello");
+    expect(r.out).toContain("bootout com.test.cronfish.hello-md");
+    expect(r.out).toContain("bootstrap hello-md");
 
     const plists = listPlists(ctx);
-    expect(plists).toContain("com.test.changed.hello.plist");
-    expect(plists).not.toContain("com.test.cronfish.hello.plist");
+    expect(plists).toContain("com.test.changed.hello-md.plist");
+    expect(plists).not.toContain("com.test.cronfish.hello-md.plist");
   });
 
   test("enable flips md frontmatter and re-syncs", () => {
@@ -186,10 +186,10 @@ describe("cli verbs (faked launchctl)", () => {
     runCli(ctx, ["sync"]);
     expect(listPlists(ctx)).toHaveLength(0);
 
-    const r = runCli(ctx, ["enable", "hello"]);
+    const r = runCli(ctx, ["enable", "hello-md"]);
     expect(r.code).toBe(0);
     expect(readFileSync(path, "utf-8")).toContain("enabled: true");
-    expect(listPlists(ctx)).toContain("com.test.cronfish.hello.plist");
+    expect(listPlists(ctx)).toContain("com.test.cronfish.hello-md.plist");
   });
 
   test("disable flips ts config without corrupting nested 'enabled' strings", () => {
@@ -205,32 +205,32 @@ export default async function run() {
 `;
     const path = writeJob(ctx, "trap.ts", tricky);
     runCli(ctx, ["sync"]);
-    expect(listPlists(ctx)).toContain("com.test.cronfish.trap.plist");
+    expect(listPlists(ctx)).toContain("com.test.cronfish.trap-ts.plist");
 
-    const r = runCli(ctx, ["disable", "trap"]);
+    const r = runCli(ctx, ["disable", "trap-ts"]);
     expect(r.code).toBe(0);
     const after = readFileSync(path, "utf-8");
     expect(after).toContain("enabled: false");
     // The string literal stayed intact.
     expect(after).toContain('"this job is enabled when needed"');
     expect(after).toContain('"enabled: false (in a string)"');
-    expect(listPlists(ctx)).not.toContain("com.test.cronfish.trap.plist");
+    expect(listPlists(ctx)).not.toContain("com.test.cronfish.trap-ts.plist");
   });
 
   test("delete --yes removes plist and job file", () => {
     const path = writeJob(ctx, "hello.md", MD_ENABLED);
     runCli(ctx, ["sync"]);
-    expect(listPlists(ctx)).toContain("com.test.cronfish.hello.plist");
+    expect(listPlists(ctx)).toContain("com.test.cronfish.hello-md.plist");
 
-    const r = runCli(ctx, ["delete", "hello", "--yes"]);
+    const r = runCli(ctx, ["delete", "hello-md", "--yes"]);
     expect(r.code).toBe(0);
     expect(existsSync(path)).toBe(false);
-    expect(listPlists(ctx)).not.toContain("com.test.cronfish.hello.plist");
+    expect(listPlists(ctx)).not.toContain("com.test.cronfish.hello-md.plist");
   });
 
   test("delete without --yes refuses", () => {
     const path = writeJob(ctx, "hello.md", MD_ENABLED);
-    const r = runCli(ctx, ["delete", "hello"]);
+    const r = runCli(ctx, ["delete", "hello-md"]);
     expect(r.code).not.toBe(0);
     expect(existsSync(path)).toBe(true);
   });
@@ -246,25 +246,27 @@ export default async function run() {}
 
     const sync = runCli(ctx, ["sync"]);
     expect(sync.code).toBe(0);
-    expect(sync.out).toContain("bootstrap email/triage");
-    expect(listPlists(ctx)).toContain("com.test.cronfish.email.triage.plist");
+    expect(sync.out).toContain("bootstrap email/triage-ts");
+    expect(listPlists(ctx)).toContain("com.test.cronfish.email.triage-ts.plist");
 
     const list = runCli(ctx, ["list"]);
-    expect(list.out).toContain("email/triage");
+    expect(list.out).toContain("email/triage-ts");
     // loaded column should report yes (faked launchctl print returns 0).
-    const row = list.out.split("\n").find((l) => l.startsWith("email/triage"));
+    const row = list.out
+      .split("\n")
+      .find((l) => l.startsWith("email/triage-ts"));
     expect(row).toBeDefined();
     expect(row!.split("\t")).toContain("yes");
 
     // Idempotent.
     const sync2 = runCli(ctx, ["sync"]);
-    expect(sync2.out).toContain("up-to-date email/triage");
+    expect(sync2.out).toContain("up-to-date email/triage-ts");
 
     // Disable and re-sync removes the plist.
-    const dis = runCli(ctx, ["disable", "email/triage"]);
+    const dis = runCli(ctx, ["disable", "email/triage-ts"]);
     expect(dis.code).toBe(0);
     expect(listPlists(ctx)).not.toContain(
-      "com.test.cronfish.email.triage.plist",
+      "com.test.cronfish.email.triage-ts.plist",
     );
   });
 
@@ -276,9 +278,38 @@ export default async function run() {}
 
     const list = runCli(ctx, ["list"]);
     expect(list.code).toBe(0);
-    expect(list.out).toContain("group/real");
+    expect(list.out).toContain("group/real-md");
     expect(list.out).not.toMatch(/^README\b/m);
     expect(list.out).not.toMatch(/group\/README/);
+  });
+
+  test("enable/disable flips .sh frontmatter and preserves shebang + body", () => {
+    const body = `#!/bin/bash
+# ---
+# schedule: "every 5 minutes"
+# enabled: false
+# timeout: 30
+# ---
+echo "hello from bash"
+`;
+    const path = writeJob(ctx, "bash-job.sh", body);
+    runCli(ctx, ["sync"]);
+    expect(listPlists(ctx)).toHaveLength(0);
+
+    const enableR = runCli(ctx, ["enable", "bash-job-sh"]);
+    expect(enableR.code).toBe(0);
+    const enabled = readFileSync(path, "utf-8");
+    expect(enabled.startsWith("#!/bin/bash\n")).toBe(true);
+    expect(enabled).toContain("# enabled: true");
+    expect(enabled).toContain('echo "hello from bash"');
+    expect(listPlists(ctx)).toContain("com.test.cronfish.bash-job-sh.plist");
+
+    const disableR = runCli(ctx, ["disable", "bash-job-sh"]);
+    expect(disableR.code).toBe(0);
+    const disabled = readFileSync(path, "utf-8");
+    expect(disabled).toContain("# enabled: false");
+    expect(disabled.startsWith("#!/bin/bash\n")).toBe(true);
+    expect(listPlists(ctx)).toHaveLength(0);
   });
 
   test("manual jobs render as manual in list and skip plist install", () => {

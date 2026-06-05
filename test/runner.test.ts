@@ -89,7 +89,7 @@ export default async function run() {
     expect(r.code).toBe(1);
     const runs = readFileSync(counter, "utf-8").length;
     expect(runs).toBe(2); // initial + 1 retry
-    const log = latestLog(root, "fail");
+    const log = latestLog(root, "fail-ts");
     expect(log).toContain("retry 1/1");
     expect(log).toContain("exit=1");
   }, 20_000);
@@ -112,8 +112,8 @@ export default async function run() {
 `,
     );
     // Pre-create lock pointing at this test process (definitely alive).
-    const lp = lockPath(root, "skip");
-    mkdirSync(join(root, "tmp", "cron", "skip"), { recursive: true });
+    const lp = lockPath(root, "skip-ts");
+    mkdirSync(join(root, "tmp", "cron", "skip-ts"), { recursive: true });
     writeFileSync(lp, String(process.pid), "utf-8");
     const r = spawnRunner(root, job);
     expect(r.code).toBe(0);
@@ -143,13 +143,13 @@ export default async function run() {
     // Find a definitively dead PID by spawning sleep 0 and reading its pid.
     const dead = Bun.spawnSync(["true"]);
     const deadPid = dead.pid;
-    mkdirSync(join(root, "tmp", "cron", "stale"), { recursive: true });
-    writeFileSync(lockPath(root, "stale"), String(deadPid), "utf-8");
+    mkdirSync(join(root, "tmp", "cron", "stale-ts"), { recursive: true });
+    writeFileSync(lockPath(root, "stale-ts"), String(deadPid), "utf-8");
     const r = spawnRunner(root, job);
     expect(r.code).toBe(0);
     expect(existsSync(sentinel)).toBe(true);
     // Runner released its own lock on exit.
-    expect(existsSync(lockPath(root, "stale"))).toBe(false);
+    expect(existsSync(lockPath(root, "stale-ts"))).toBe(false);
   });
 
   test("SIGTERM releases the lock", async () => {
@@ -174,7 +174,7 @@ export default async function run() {
       env: { ...process.env, CRONFISH_CONSUMER_ROOT: root },
     });
     // Wait for lock to appear.
-    const lp = lockPath(root, "long");
+    const lp = lockPath(root, "long-ts");
     const deadline = Date.now() + 5000;
     while (!existsSync(lp) && Date.now() < deadline) {
       await Bun.sleep(50);
@@ -183,6 +183,30 @@ export default async function run() {
     proc.kill("SIGTERM");
     await proc.exited;
     expect(existsSync(lp)).toBe(false);
+  }, 15_000);
+
+  test("runs a .sh job and captures stdout to the log", () => {
+    const sentinel = join(root, "ran.txt");
+    const job = writeJob(
+      root,
+      "hello.sh",
+      `#!/bin/bash
+# ---
+# schedule: manual
+# enabled: true
+# timeout: 10
+# ---
+echo hello-from-sh
+touch ${JSON.stringify(sentinel)}
+`,
+    );
+    const r = spawnRunner(root, job);
+    expect(r.code).toBe(0);
+    expect(existsSync(sentinel)).toBe(true);
+    const log = latestLog(root, "hello-sh");
+    expect(log).toContain("kind=sh");
+    expect(log).toContain("hello-from-sh");
+    expect(log).toContain("exit=0");
   }, 15_000);
 
   test("timeout kills the child and reports 124", () => {
@@ -203,7 +227,7 @@ export default async function run() {
     expect(r.code).toBe(124);
     // Should complete well under the 10s sleep.
     expect(r.durationMs).toBeLessThan(8_000);
-    const log = latestLog(root, "slow");
+    const log = latestLog(root, "slow-ts");
     expect(log).toContain("timeout after 1s");
   }, 15_000);
 });

@@ -76,6 +76,59 @@ export function parseFrontmatter(raw: string): ParsedFrontmatter {
   return { frontmatter: fm, body: m[2] };
 }
 
+// --- Shell job frontmatter parser ---
+//
+// Shell scripts use a comment-block frontmatter delimited by `# ---` lines.
+// Each inner line is `# key: value`. The leading `# ` is stripped and the
+// inner block is fed through parseFrontmatter so the same scalar rules apply.
+//
+//   #!/bin/bash
+//   # ---
+//   # schedule: every 5 minutes
+//   # timeout: 30
+//   # ---
+//   echo hello
+
+// The fence block itself — does NOT consume the leading shebang/blank lines.
+const SH_FM_BLOCK_RE = /# ---\r?\n([\s\S]*?)\r?\n# ---\r?\n?/;
+
+// Where is the start of "the top" — after a shebang if present, else 0.
+function topOffset(raw: string): number {
+  if (!raw.startsWith("#!")) return 0;
+  const nl = raw.indexOf("\n");
+  return nl < 0 ? raw.length : nl + 1;
+}
+
+// Find the fence block only if it lives at the top of the file (immediately
+// after the shebang, modulo blank lines). Returns the match index/length and
+// the inner content, or null.
+function findShellFmBlock(
+  raw: string,
+): { start: number; end: number; inner: string } | null {
+  const top = topOffset(raw);
+  const rest = raw.slice(top);
+  const lead = rest.match(/^(?:\s*\n)*/);
+  const leadLen = lead ? lead[0].length : 0;
+  const m = rest.slice(leadLen).match(SH_FM_BLOCK_RE);
+  if (!m || m.index !== 0) return null;
+  return {
+    start: top + leadLen,
+    end: top + leadLen + m[0].length,
+    inner: m[1],
+  };
+}
+
+export function parseShellFrontmatter(raw: string): Record<string, Scalar> {
+  const block = findShellFmBlock(raw);
+  if (!block) return {};
+  const inner = block.inner
+    .split(/\r?\n/)
+    .map((line) => line.replace(/^\s*#\s?/, ""))
+    .join("\n");
+  const fake = `---\n${inner}\n---\n`;
+  return parseFrontmatter(fake).frontmatter;
+}
+
 // --- TS job config parser ---
 //
 // Reads `config = { ... }` from a TS source by hand-scanning brace depth so
@@ -211,6 +264,45 @@ export function parseTsJobConfig(source: string): TsJobConfigShape {
     cfg.model = model.replace(/^['"`]|['"`]$/g, "");
   }
   return cfg;
+}
+
+// Update or insert a key in a shell job's comment-block frontmatter. If no
+// block exists, one is inserted after the shebang (or at the top if no
+// shebang). Mirrors setFrontmatterKey but operates on `# key: value` lines
+// inside `# ---` / `# ---` fences.
+export function setShellFrontmatterKey(
+  raw: string,
+  key: string,
+  value: Scalar,
+): string {
+  const rendered =
+    typeof value === "string"
+      ? value
+      : value === true
+        ? "true"
+        : value === false
+          ? "false"
+          : String(value);
+  const block = findShellFmBlock(raw);
+  if (!block) {
+    const inserted = `# ---\n# ${key}: ${rendered}\n# ---\n`;
+    const top = topOffset(raw);
+    return `${raw.slice(0, top)}${inserted}${raw.slice(top)}`;
+  }
+  const innerLines = block.inner.split(/\r?\n/);
+  let found = false;
+  const next = innerLines.map((line) => {
+    const stripped = line.replace(/^\s*#\s?/, "");
+    const idx = stripped.indexOf(":");
+    if (idx < 0) return line;
+    const k = stripped.slice(0, idx).trim();
+    if (k !== key) return line;
+    found = true;
+    return `# ${k}: ${rendered}`;
+  });
+  if (!found) next.push(`# ${key}: ${rendered}`);
+  const replacement = `# ---\n${next.join("\n")}\n# ---\n`;
+  return `${raw.slice(0, block.start)}${replacement}${raw.slice(block.end)}`;
 }
 
 export function setFrontmatterKey(

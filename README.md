@@ -2,25 +2,34 @@
 
 **Drop a file. Cronfish does the rest. Markdown is a valid cron job.**
 
-The simplest scheduler for personal automation on macOS. Drop a `.md` (agentic Claude prompt) or
-`.ts` (Bun program) in `cron/`, run `cronfish sync`, and launchd takes it from there.
+The simplest scheduler for personal automation on macOS. Drop a `.md` (agentic Claude prompt),
+`.ts` (Bun program), or `.sh` (bash script) in `cron/`, run `cronfish sync`, and launchd takes
+it from there.
 
 ## 60-second quickstart
 
 ```bash
-bun add cronfish              # or `bun add file:../cronfish` for local dev
-bunx cronfish init            # creates cron/hello.md + cron/touch.ts (disabled)
-bunx cronfish enable hello    # flip on, sync to launchd
-bunx cronfish list            # see what's scheduled and what's loaded
+bun add cronfish                 # or `bun add file:../cronfish` for local dev
+bunx cronfish init               # creates cron/hello.md, touch.ts, ping.sh (disabled)
+bunx cronfish enable hello-md    # flip on, sync to launchd
+bunx cronfish list               # see what's scheduled and what's loaded
 ```
 
 That's it. No code change to register a job — just drop a file in `cron/`.
 
 ## Where jobs live
 
-`cron/` is a tree, not a flat directory. Any `.md` or `.ts` file at any depth is a job. The slug
-is the path relative to `cron/` with the extension stripped — `cron/email/triage.ts` →
-`email/triage`. Use folders to group related crons (`cron/email/`, `cron/linkedin/`).
+`cron/` is a tree, not a flat directory. Any `.md`, `.ts`, or `.sh` file at any depth is a job.
+
+**The slug encodes the kind.** The path relative to `cron/` has its trailing `.<ext>` rewritten
+to `-<ext>`, so:
+
+- `cron/email/triage.ts` → slug `email/triage-ts`
+- `cron/hello.md` → slug `hello-md`
+- `cron/obsidian-keepalive.sh` → slug `obsidian-keepalive-sh`
+
+This means `foo.md` and `foo.sh` can coexist without colliding. Use folders to group related
+crons (`cron/email/`, `cron/linkedin/`).
 
 **One magic filename: `README.md`.** A file named exactly `README.md` is ignored at any depth, so
 you can document a folder of crons without the README getting parsed as a job. No other reserved
@@ -63,6 +72,26 @@ export default async function run(): Promise<void> {
 }
 ```
 
+### Bash — `cron/<slug>.sh`
+
+```sh
+#!/bin/bash
+# ---
+# schedule: every 5 minutes
+# enabled: true
+# timeout: 30
+# concurrency: skip
+# ---
+
+echo "hello from bash"
+```
+
+Config lives in a `# ---` / `# ---` comment block at the top of the file (after the shebang, if
+present). Each inner line is `# key: value` — same scalar rules as Markdown frontmatter. Cronfish
+invokes the file as `/bin/bash <path>` with `cwd = consumer repo root`; stdout/stderr go to the
+per-run log. **A `.sh` file with no frontmatter block fails at discovery** — cronfish prints the
+error in `list`/`sync` so you know to add one.
+
 ## `schedule:` — one key, five shapes
 
 | Input                     | Meaning                                       |
@@ -97,7 +126,7 @@ a real schedule. Pure on-demand scripts that aren't scheduling candidates belong
 ## CLI
 
 ```
-cronfish init                       scaffold cron/hello.md + cron/touch.ts
+cronfish init                       scaffold cron/hello.md + cron/touch.ts + cron/ping.sh
 cronfish list                       every job + state
 cronfish next [slug] [N]            preview the next N fire times (default 5)
 cronfish sync                       reconcile cron/ ↔ launchd (idempotent)
@@ -112,7 +141,7 @@ cronfish --version
 ## Files cronfish writes
 
 ```
-cron/<slug>.{md,ts}                                # job files (you write these)
+cron/<slug>.{md,ts,sh}                              # job files (you write these)
 ~/Library/LaunchAgents/<prefix>.<slug>.plist        # launchd registration
 <consumer>/tmp/cron/<slug>/<ISO>.log                # per-run log
 <consumer>/tmp/cron/<slug>/runner.pid               # concurrency lock

@@ -12,7 +12,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { basename, join } from "node:path";
-import { setFrontmatterKey } from "./frontmatter.ts";
+import { setFrontmatterKey, setShellFrontmatterKey } from "./frontmatter.ts";
 import { discoverJobs, findJobFile, loadJob, type JobMeta } from "./jobs.ts";
 import { dispatchSchedule, type Dispatched } from "./schedule.ts";
 import { platform } from "./platform/index.ts";
@@ -205,6 +205,12 @@ function flipEnabled(slug: string, enabled: boolean): void {
   const raw = readFileSync(path, "utf-8");
   if (path.endsWith(".md")) {
     writeFileSync(path, setFrontmatterKey(raw, "enabled", enabled), "utf-8");
+  } else if (path.endsWith(".sh")) {
+    writeFileSync(
+      path,
+      setShellFrontmatterKey(raw, "enabled", enabled),
+      "utf-8",
+    );
   } else {
     writeFileSync(path, rewriteTsEnabled(raw, enabled), "utf-8");
   }
@@ -353,7 +359,7 @@ This file is wired off (\`enabled: false\`) — flip it on with \`cronfish enabl
 `;
 
 const INIT_TS = `// cronfish demo job — programmable side. Disabled by default.
-// Flip on with \`cronfish enable touch\`.
+// Flip on with \`cronfish enable touch-ts\`.
 export const config = {
   schedule: "every 5 minutes",
   enabled: false,
@@ -371,11 +377,24 @@ export default async function run(): Promise<void> {
 }
 `;
 
+const INIT_SH = `#!/bin/bash
+# cronfish demo job — bash side. Disabled by default.
+# Flip on with \`cronfish enable ping-sh\`.
+# ---
+# schedule: "every 5 minutes"
+# enabled: false
+# timeout: 30
+# ---
+set -euo pipefail
+echo "[ping] hello from bash at $(date -u +%FT%TZ)"
+`;
+
 function cmdInit(): void {
   mkdirSync(CRON_DIR, { recursive: true });
   for (const [name, content] of [
     ["hello.md", INIT_MD],
     ["touch.ts", INIT_TS],
+    ["ping.sh", INIT_SH],
   ] as const) {
     const p = join(CRON_DIR, name);
     if (existsSync(p)) {
@@ -386,7 +405,7 @@ function cmdInit(): void {
     console.log(`[cronfish] init: wrote ${p}`);
   }
   console.log(
-    "\nNext: edit cron/hello.md or cron/touch.ts, flip `enabled: true`, run `cronfish sync`.",
+    "\nNext: edit cron/hello.md, cron/touch.ts, or cron/ping.sh, flip `enabled: true`, run `cronfish sync`.",
   );
 }
 
@@ -395,7 +414,7 @@ function usage(): void {
     `cronfish ${VERSION} — drop a file, schedule it.
 
 usage:
-  cronfish init                       scaffold cron/hello.md + cron/touch.ts
+  cronfish init                       scaffold cron/hello.md + cron/touch.ts + cron/ping.sh
   cronfish list                       show every job + state
   cronfish next [slug] [N]            preview the next N fire times (default 5)
   cronfish sync                       reconcile cron/ ↔ launchd
