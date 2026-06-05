@@ -2,6 +2,7 @@ import { Link, Route, Switch } from "wouter";
 import { Separator } from "@/components/ui/separator";
 import { JobsPage } from "./pages/Jobs";
 import { InvocationsPage } from "./pages/Invocations";
+import { AllInvocationsPage } from "./pages/AllInvocations";
 import { LogViewerPage } from "./pages/LogViewer";
 
 export default function App(): React.ReactElement {
@@ -19,6 +20,13 @@ export default function App(): React.ReactElement {
             cronfish
           </Link>
           <div className="flex items-center gap-4 text-xs text-muted-foreground">
+            <Link to="/" className="hover:text-foreground">
+              jobs
+            </Link>
+            <Link to="/runs" className="hover:text-foreground">
+              all runs
+            </Link>
+            <Separator orientation="vertical" className="h-4" />
             <a
               href="https://github.com/goldcaddy77/cronfish"
               target="_blank"
@@ -36,6 +44,7 @@ export default function App(): React.ReactElement {
       <main className="mx-auto w-full max-w-6xl flex-1 min-h-0 px-6 py-6">
         <Switch>
           <Route path="/" component={JobsPage} />
+          <Route path="/runs" component={AllInvocationsPage} />
           <Route path="/jobs/:slug">
             {(params) => (
               <InvocationsPage

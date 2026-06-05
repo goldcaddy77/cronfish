@@ -66,6 +66,10 @@ interface InvocationRow {
   exit_code: number | null;
   trigger: string;
   log_path: string;
+  result_summary: string | null;
+  result_ok: number | null;
+  result_json: string | null;
+  result_truncated: number;
 }
 
 const MIME: Record<string, string> = {
@@ -328,6 +332,35 @@ function listInvocations(
   }
 }
 
+function listAllInvocations(consumerRoot: string, limit: number): unknown {
+  const db = openDb(consumerRoot);
+  try {
+    const rows = db
+      .query<
+        InvocationRow & { slug: string; duration_ms: number | null },
+        [number]
+      >(
+        `
+        SELECT i.*, j.slug AS slug,
+          CASE
+            WHEN i.finished_at IS NULL THEN NULL
+            ELSE CAST(
+              (julianday(i.finished_at) - julianday(i.started_at)) * 86400000 AS INTEGER
+            )
+          END AS duration_ms
+        FROM cron_invocations i
+        JOIN cron_jobs j ON j.id = i.job_id
+        ORDER BY i.started_at DESC
+        LIMIT ?
+      `,
+      )
+      .all(limit);
+    return rows;
+  } finally {
+    db.close();
+  }
+}
+
 function getInvocation(consumerRoot: string, id: number): unknown {
   const db = openDb(consumerRoot);
   try {
@@ -386,6 +419,15 @@ export async function startUiServer(opts: UiServerOptions): Promise<string> {
           return badRequest("limit must be 1..1000");
         }
         return json(listInvocations(opts.consumerRoot, slug, limit));
+      }
+
+      if (pathname === "/api/invocations" && req.method === "GET") {
+        const limitParam = url.searchParams.get("limit");
+        const limit = limitParam ? parseInt(limitParam, 10) : 100;
+        if (Number.isNaN(limit) || limit <= 0 || limit > 1000) {
+          return badRequest("limit must be 1..1000");
+        }
+        return json(listAllInvocations(opts.consumerRoot, limit));
       }
 
       const invDetail = pathname.match(/^\/api\/invocations\/(\d+)$/);

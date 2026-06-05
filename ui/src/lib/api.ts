@@ -41,6 +41,10 @@ export interface Invocation {
   log_path: string;
   duration_ms: number | null;
   slug?: string;
+  result_summary: string | null;
+  result_ok: 0 | 1 | null;
+  result_json: string | null;
+  result_truncated: 0 | 1;
 }
 
 async function fetchJson<T>(path: string): Promise<T> {
