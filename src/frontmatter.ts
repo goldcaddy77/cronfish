@@ -141,6 +141,7 @@ export interface TsJobConfigShape {
   retries?: number;
   concurrency?: "skip" | "queue";
   model?: string;
+  description?: string;
 }
 
 function extractConfigBlock(source: string): string | null {
@@ -262,6 +263,10 @@ export function parseTsJobConfig(source: string): TsJobConfigShape {
   const model = pickFromConfig(body, "model");
   if (model !== undefined) {
     cfg.model = model.replace(/^['"`]|['"`]$/g, "");
+  }
+  const description = pickFromConfig(body, "description");
+  if (description !== undefined) {
+    cfg.description = description.replace(/^['"`]|['"`]$/g, "");
   }
   return cfg;
 }

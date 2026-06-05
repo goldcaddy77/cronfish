@@ -17,6 +17,8 @@ import { discoverJobs, findJobFile, loadJob, type JobMeta } from "./jobs.ts";
 import { dispatchSchedule, type Dispatched } from "./schedule.ts";
 import { platform } from "./platform/index.ts";
 import { loadState, rememberPrefix } from "./state.ts";
+import { markDeleted, openDb, upsertJob } from "./db.ts";
+import { startUiServer } from "./ui/server.ts";
 
 const VERSION = "0.2.0";
 
@@ -196,6 +198,29 @@ function cmdSync(): void {
       );
     }
   }
+
+  // Ledger sync — record every discovered job (even disabled/manual) and
+  // soft-delete anything no longer on disk. Failure-safe: a broken DB warns
+  // once and does not abort the sync.
+  try {
+    const db = openDb(CONSUMER_ROOT);
+    const presentSlugs: string[] = [];
+    for (const j of jobs) {
+      try {
+        upsertJob(db, j);
+        presentSlugs.push(j.slug);
+      } catch (e) {
+        console.error(
+          `[cronfish] ledger upsert ${j.slug} failed: ${(e as Error).message}`,
+        );
+      }
+    }
+    markDeleted(db, presentSlugs);
+    db.close();
+  } catch (e) {
+    console.error(`[cronfish] ledger sync skipped: ${(e as Error).message}`);
+  }
+
   console.log("[cronfish] sync complete");
 }
 
@@ -287,7 +312,7 @@ function cmdStatus(slug?: string): void {
   for (const j of targets) {
     console.log(`\n=== ${j.slug} (${j.kind}) ===`);
     console.log(p.statusOf(PREFIX, j.slug));
-    const logDir = join(CONSUMER_ROOT, "tmp", "cron", j.slug);
+    const logDir = join(CONSUMER_ROOT, ".cronfish", "logs", j.slug);
     if (existsSync(logDir)) {
       const logs = readdirSync(logDir)
         .filter((f) => f.endsWith(".log"))
@@ -313,9 +338,61 @@ async function cmdRun(slug: string): Promise<void> {
     stdout: "inherit",
     stderr: "inherit",
     cwd: CONSUMER_ROOT,
-    env: { ...process.env, CRONFISH_CONSUMER_ROOT: CONSUMER_ROOT },
+    env: {
+      ...process.env,
+      CRONFISH_CONSUMER_ROOT: CONSUMER_ROOT,
+      CRONFISH_TRIGGER: "manual",
+    },
   });
   process.exit(await proc.exited);
+}
+
+interface UiOptions {
+  port: number;
+  open: boolean;
+}
+
+function parseUiArgs(rest: string[]): UiOptions {
+  let port = 4747;
+  let open = true;
+  for (let i = 0; i < rest.length; i++) {
+    const arg = rest[i];
+    if (arg === "--no-open") open = false;
+    else if (arg === "--port") {
+      const next = rest[++i];
+      if (!next || !/^\d+$/.test(next)) {
+        throw new Error("usage: cronfish ui [--port N] [--no-open]");
+      }
+      port = parseInt(next, 10);
+    } else if (arg.startsWith("--port=")) {
+      const v = arg.slice("--port=".length);
+      if (!/^\d+$/.test(v)) {
+        throw new Error("usage: cronfish ui [--port N] [--no-open]");
+      }
+      port = parseInt(v, 10);
+    } else {
+      throw new Error(`cronfish ui: unknown flag "${arg}"`);
+    }
+  }
+  return { port, open };
+}
+
+async function cmdUi(rest: string[]): Promise<void> {
+  const opts = parseUiArgs(rest);
+  const url = await startUiServer({
+    consumerRoot: CONSUMER_ROOT,
+    port: opts.port,
+  });
+  console.log(`[cronfish] ui at ${url}`);
+  if (opts.open) {
+    try {
+      Bun.spawn(["open", url], { stdout: "ignore", stderr: "ignore" });
+    } catch {
+      // ignore — `open` is macOS-only, dev may be on Linux
+    }
+  }
+  // Keep the process alive — server has its own lifecycle.
+  await new Promise(() => {});
 }
 
 function cmdNext(slug?: string, n = 5): void {
@@ -348,6 +425,7 @@ function cmdNext(slug?: string, n = 5): void {
 // --- cronfish init ---
 
 const INIT_MD = `---
+description: "Demo markdown cron — prints the time"
 schedule: "every 5 minutes"
 model: haiku
 enabled: false
@@ -361,6 +439,7 @@ This file is wired off (\`enabled: false\`) — flip it on with \`cronfish enabl
 const INIT_TS = `// cronfish demo job — programmable side. Disabled by default.
 // Flip on with \`cronfish enable touch-ts\`.
 export const config = {
+  description: "Demo TS cron — appends a timestamp to tmp/touched.txt",
   schedule: "every 5 minutes",
   enabled: false,
   timeout: 60,
@@ -381,6 +460,7 @@ const INIT_SH = `#!/bin/bash
 # cronfish demo job — bash side. Disabled by default.
 # Flip on with \`cronfish enable ping-sh\`.
 # ---
+# description: "Demo bash cron — pings hello to the log"
 # schedule: "every 5 minutes"
 # enabled: false
 # timeout: 30
@@ -388,6 +468,25 @@ const INIT_SH = `#!/bin/bash
 set -euo pipefail
 echo "[ping] hello from bash at $(date -u +%FT%TZ)"
 `;
+
+const GITIGNORE_BLOCK = "# cronfish\n.cronfish/\n";
+
+function ensureGitignoreBlock(): void {
+  const path = join(CONSUMER_ROOT, ".gitignore");
+  let existing = "";
+  if (existsSync(path)) {
+    existing = readFileSync(path, "utf-8");
+    if (/^\.cronfish\/?\s*$/m.test(existing)) {
+      console.log(`[cronfish] init: .gitignore already ignores .cronfish/`);
+      return;
+    }
+  }
+  const sep = existing.length === 0 || existing.endsWith("\n") ? "" : "\n";
+  const next =
+    existing + sep + (existing.length === 0 ? "" : "\n") + GITIGNORE_BLOCK;
+  writeFileSync(path, next, "utf-8");
+  console.log(`[cronfish] init: added .cronfish/ to ${path}`);
+}
 
 function cmdInit(): void {
   mkdirSync(CRON_DIR, { recursive: true });
@@ -404,6 +503,7 @@ function cmdInit(): void {
     writeFileSync(p, content, "utf-8");
     console.log(`[cronfish] init: wrote ${p}`);
   }
+  ensureGitignoreBlock();
   console.log(
     "\nNext: edit cron/hello.md, cron/touch.ts, or cron/ping.sh, flip `enabled: true`, run `cronfish sync`.",
   );
@@ -423,6 +523,7 @@ usage:
   cronfish delete <slug> --yes        bootout + remove plist + job file
   cronfish status [slug]              all jobs (no arg) or one slug's launchctl + log tail
   cronfish run <slug>                 invoke runner directly (no launchd)
+  cronfish ui [--port N] [--no-open]  local web dashboard (default 127.0.0.1:4747)
   cronfish --version
 
 config: <consumer>/.cronfish.json  →  { "bundle_prefix": "com.example.app",
@@ -479,6 +580,9 @@ async function main(): Promise<void> {
     case "run":
       if (!rest[0]) throw new Error("usage: cronfish run <slug>");
       await cmdRun(rest[0]);
+      return;
+    case "ui":
+      await cmdUi(rest);
       return;
     default:
       console.error(`[cronfish] unknown verb: ${verb}`);

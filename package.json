@@ -10,11 +10,13 @@
     "bun": ">=1.0"
   },
   "scripts": {
-    "test": "bun test"
+    "test": "bun test",
+    "build:ui": "cd ui && bun install && bun run build"
   },
   "files": [
     "src",
     "templates",
+    "ui/dist",
     "README.md",
     "LICENSE"
   ],

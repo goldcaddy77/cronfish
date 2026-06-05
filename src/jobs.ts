@@ -28,6 +28,7 @@ export interface JobMeta {
   model?: string;
   retries?: number;
   concurrency?: Concurrency;
+  description?: string;
 }
 
 export class JobValidationError extends Error {
@@ -148,6 +149,7 @@ function fromMarkdown(path: string, slug: string): JobMeta {
     model: asString(path, "model", frontmatter.model) ?? "haiku",
     retries: asPositiveInt(path, "retries", frontmatter.retries, { min: 0 }),
     concurrency: asConcurrency(path, frontmatter.concurrency),
+    description: asString(path, "description", frontmatter.description),
   };
 }
 
@@ -171,6 +173,7 @@ function fromTypescript(path: string, slug: string): JobMeta {
     model: cfg.model,
     retries: cfg.retries,
     concurrency: cfg.concurrency,
+    description: cfg.description,
   };
 }
 
@@ -199,6 +202,7 @@ function fromShell(path: string, slug: string): JobMeta {
     timeout: asPositiveInt(path, "timeout", frontmatter.timeout, { min: 1 }),
     retries: asPositiveInt(path, "retries", frontmatter.retries, { min: 0 }),
     concurrency: asConcurrency(path, frontmatter.concurrency),
+    description: asString(path, "description", frontmatter.description),
   };
 }
 
@@ -237,11 +241,7 @@ function walkJobFiles(cronDir: string): string[] {
       }
       if (!st.isFile()) continue;
       if (name === "README.md") continue;
-      if (
-        name.endsWith(".md") ||
-        name.endsWith(".ts") ||
-        name.endsWith(".sh")
-      )
+      if (name.endsWith(".md") || name.endsWith(".ts") || name.endsWith(".sh"))
         out.push(full);
     }
   };

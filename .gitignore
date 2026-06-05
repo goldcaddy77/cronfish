@@ -2,3 +2,8 @@ node_modules/
 tmp/
 *.log
 .DS_Store
+
+# UI dev artifacts (we commit ui/dist intentionally)
+ui/node_modules/
+ui/.vite/
+ui/dist/.vite/

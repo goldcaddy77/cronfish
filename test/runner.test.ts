@@ -45,7 +45,7 @@ function writeJob(root: string, name: string, body: string): string {
 }
 
 function latestLog(root: string, slug: string): string {
-  const dir = join(root, "tmp", "cron", slug);
+  const dir = join(root, ".cronfish", "logs", slug);
   if (!existsSync(dir)) return "";
   const files = readdirSync(dir)
     .filter((f) => f.endsWith(".log"))
@@ -55,7 +55,7 @@ function latestLog(root: string, slug: string): string {
 }
 
 function lockPath(root: string, slug: string): string {
-  return join(root, "tmp", "cron", slug, "runner.pid");
+  return join(root, ".cronfish", "locks", slug, "runner.pid");
 }
 
 describe("runner", () => {
@@ -113,7 +113,7 @@ export default async function run() {
     );
     // Pre-create lock pointing at this test process (definitely alive).
     const lp = lockPath(root, "skip-ts");
-    mkdirSync(join(root, "tmp", "cron", "skip-ts"), { recursive: true });
+    mkdirSync(join(root, ".cronfish", "locks", "skip-ts"), { recursive: true });
     writeFileSync(lp, String(process.pid), "utf-8");
     const r = spawnRunner(root, job);
     expect(r.code).toBe(0);
@@ -143,7 +143,9 @@ export default async function run() {
     // Find a definitively dead PID by spawning sleep 0 and reading its pid.
     const dead = Bun.spawnSync(["true"]);
     const deadPid = dead.pid;
-    mkdirSync(join(root, "tmp", "cron", "stale-ts"), { recursive: true });
+    mkdirSync(join(root, ".cronfish", "locks", "stale-ts"), {
+      recursive: true,
+    });
     writeFileSync(lockPath(root, "stale-ts"), String(deadPid), "utf-8");
     const r = spawnRunner(root, job);
     expect(r.code).toBe(0);
