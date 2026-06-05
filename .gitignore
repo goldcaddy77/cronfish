@@ -2,6 +2,7 @@ node_modules/
 tmp/
 *.log
 .DS_Store
+.cronfish/
 
 # UI dev artifacts (we commit ui/dist intentionally)
 ui/node_modules/
