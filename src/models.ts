@@ -1,8 +1,13 @@
 // Model resolution + provider dispatch for cronfish MD jobs.
 //
-// Anthropic models are run via the `claude` CLI in headless mode.
-// Local models are stubbed — the dispatch seam exists; real wiring waits
-// on the user picking a runtime.
+// Anthropic models run via the `claude` CLI in headless mode against
+// api.anthropic.com.
+//
+// Local models also run via the `claude` CLI, but with ANTHROPIC_BASE_URL
+// pointed at a local Anthropic-compatible endpoint (Ollama 0.14+ speaks
+// Messages natively; LiteLLM proxies it for everything else). The model
+// ID after the `local:` prefix is passed verbatim to `--model` and as
+// the three slot overrides so sub-agents route locally too.
 
 export type Provider = "anthropic" | "local";
 
@@ -26,12 +31,24 @@ export function resolveModel(input: string | undefined): Resolved {
   return { provider: "anthropic", id: raw };
 }
 
-// Stub: route to a local model. Returns the command to spawn + stdin payload.
-export function localCommand(
-  modelId: string,
-  _prompt: string,
-): { cmd: string[]; stdin: string } {
-  throw new Error(
-    `local:${modelId} not wired — edit src/models.ts in cronfish to add a runtime`,
-  );
+// Env block to inject when spawning `claude` for a local model.
+// Overridable via CRONFISH_LOCAL_BASE_URL / CRONFISH_LOCAL_AUTH_TOKEN
+// so the same binary can target Ollama, LiteLLM, LM Studio, or a remote
+// box on the LAN without touching cronfish.
+export function localClaudeEnv(modelId: string): Record<string, string> {
+  const baseUrl =
+    process.env.CRONFISH_LOCAL_BASE_URL ?? "http://localhost:11434";
+  const authToken = process.env.CRONFISH_LOCAL_AUTH_TOKEN ?? "ollama";
+  return {
+    ANTHROPIC_BASE_URL: baseUrl,
+    ANTHROPIC_AUTH_TOKEN: authToken,
+    ANTHROPIC_API_KEY: authToken,
+    ANTHROPIC_MODEL: modelId,
+    ANTHROPIC_SMALL_FAST_MODEL: modelId,
+    ANTHROPIC_DEFAULT_HAIKU_MODEL: modelId,
+    ANTHROPIC_DEFAULT_SONNET_MODEL: modelId,
+    ANTHROPIC_DEFAULT_OPUS_MODEL: modelId,
+    CLAUDE_CODE_SUBAGENT_MODEL: modelId,
+    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
+  };
 }

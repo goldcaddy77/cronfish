@@ -31,7 +31,7 @@ import {
   type InvocationTrigger,
 } from "./db.ts";
 import { loadJob, slugFromPath, type JobMeta } from "./jobs.ts";
-import { resolveModel, localCommand } from "./models.ts";
+import { resolveModel, localClaudeEnv } from "./models.ts";
 
 const DEFAULT_TIMEOUT_S = 300;
 const LOCK_POLL_MS = 2_000;
@@ -131,6 +131,7 @@ interface SpawnSpec {
   cwd: string;
   stdin?: "ignore" | "pipe";
   stdinPayload?: string;
+  env?: Record<string, string>;
 }
 
 interface SpawnResult {
@@ -148,6 +149,9 @@ async function runSpawn(
     stdout: fd,
     stderr: fd,
     stdin: spec.stdin ?? "ignore",
+    env: spec.env
+      ? { ...(process.env as Record<string, string>), ...spec.env }
+      : undefined,
     // @ts-expect-error — Bun supports detached on spawn options
     detached: true,
   });
@@ -211,29 +215,22 @@ async function execMarkdown(
     fd,
     `[runner] kind=md model=${model.provider}:${model.id} timeout=${timeoutS}s`,
   );
-  if (model.provider === "anthropic") {
-    return runSpawn(
-      {
-        cmd: [
-          CLAUDE_BIN,
-          "--dangerously-skip-permissions",
-          "--model",
-          model.id,
-          "-p",
-          prompt,
-        ],
-        cwd: consumerRoot(),
-      },
+  const cmd = [
+    CLAUDE_BIN,
+    "--dangerously-skip-permissions",
+    "--model",
+    model.id,
+    "-p",
+    prompt,
+  ];
+  const env = model.provider === "local" ? localClaudeEnv(model.id) : undefined;
+  if (env) {
+    appendLog(
       fd,
-      timeoutS,
+      `[runner] local base_url=${env.ANTHROPIC_BASE_URL} model=${model.id}`,
     );
   }
-  const { cmd, stdin } = localCommand(model.id, prompt);
-  return runSpawn(
-    { cmd, cwd: consumerRoot(), stdin: "pipe", stdinPayload: stdin },
-    fd,
-    timeoutS,
-  );
+  return runSpawn({ cmd, cwd: consumerRoot(), env }, fd, timeoutS);
 }
 
 async function execTypescript(

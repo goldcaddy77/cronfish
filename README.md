@@ -92,6 +92,30 @@ invokes the file as `/bin/bash <path>` with `cwd = consumer repo root`; stdout/s
 per-run log. **A `.sh` file with no frontmatter block fails at discovery** — cronfish prints the
 error in `list`/`sync` so you know to add one.
 
+## `model:` — claude alias, raw ID, or local
+
+For Anthropic-hosted models, use the aliases `haiku` / `sonnet` / `opus` (resolve to the latest
+pinned IDs), or pass a raw ID like `claude-sonnet-4-6` verbatim.
+
+For a **local model**, prefix with `local:` — e.g. `local:qwen2.5-coder:32b`. Cronfish still
+spawns the same `claude` CLI, but with `ANTHROPIC_BASE_URL` pointed at a local
+Anthropic-Messages-compatible endpoint. Ollama 0.14+ speaks this format natively, so the default
+target is `http://localhost:11434` with auth token `ollama`. The model ID is passed as
+`--model` **and** as the three slot overrides (`ANTHROPIC_DEFAULT_{HAIKU,SONNET,OPUS}_MODEL`)
+plus `CLAUDE_CODE_SUBAGENT_MODEL`, so any sub-agents Claude spawns also route locally.
+
+Override the endpoint for LiteLLM, LM Studio, or a LAN box:
+
+```bash
+export CRONFISH_LOCAL_BASE_URL="http://192.168.1.50:4000"
+export CRONFISH_LOCAL_AUTH_TOKEN="sk-litellm-key"
+```
+
+Caveats: small local models (≤7B) often can't follow Claude Code's tool-heavy system prompt and
+will hallucinate tool calls. Use 14B+ for any agentic loop; 32B is the practical floor for
+multi-step work. Local providers serve one request at a time — set `concurrency: queue` on
+overlapping jobs.
+
 ## `schedule:` — one key, five shapes
 
 | Input                     | Meaning                                       |
