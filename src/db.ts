@@ -81,6 +81,23 @@ const MIGRATIONS: Migration[] = [
       db.exec("ALTER TABLE cron_jobs ADD COLUMN description TEXT");
     }
   },
+  // v3 — structured per-run results
+  (db) => {
+    const cols = db.query("PRAGMA table_info(cron_invocations)").all() as {
+      name: string;
+    }[];
+    const have = new Set(cols.map((c) => c.name));
+    if (!have.has("result_summary"))
+      db.exec("ALTER TABLE cron_invocations ADD COLUMN result_summary TEXT");
+    if (!have.has("result_ok"))
+      db.exec("ALTER TABLE cron_invocations ADD COLUMN result_ok INTEGER");
+    if (!have.has("result_json"))
+      db.exec("ALTER TABLE cron_invocations ADD COLUMN result_json TEXT");
+    if (!have.has("result_truncated"))
+      db.exec(
+        "ALTER TABLE cron_invocations ADD COLUMN result_truncated INTEGER NOT NULL DEFAULT 0",
+      );
+  },
 ];
 
 export function migrate(db: Database): void {
@@ -185,20 +202,43 @@ export function startInvocation(
   return Number(res.lastInsertRowid);
 }
 
+export interface InvocationResultRow {
+  summary: string | null;
+  ok: boolean | null;
+  json: string | null;
+  truncated: boolean;
+}
+
 export function finishInvocation(
   db: Database,
   invocationId: number,
   status: InvocationStatus,
   exitCode: number | null,
+  result?: InvocationResultRow,
 ): void {
   db.prepare(
     `UPDATE cron_invocations
-     SET finished_at = $now, status = $status, exit_code = $exit_code
+     SET finished_at = $now,
+         status = $status,
+         exit_code = $exit_code,
+         result_summary = $result_summary,
+         result_ok = $result_ok,
+         result_json = $result_json,
+         result_truncated = $result_truncated
      WHERE id = $id`,
   ).run({
     $id: invocationId,
     $now: nowIso(),
     $status: status,
     $exit_code: exitCode,
+    $result_summary: result?.summary ?? null,
+    $result_ok:
+      result?.ok === undefined || result?.ok === null
+        ? null
+        : result.ok
+          ? 1
+          : 0,
+    $result_json: result?.json ?? null,
+    $result_truncated: result?.truncated ? 1 : 0,
   });
 }

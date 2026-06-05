@@ -17,7 +17,8 @@ import { discoverJobs, findJobFile, loadJob, type JobMeta } from "./jobs.ts";
 import { dispatchSchedule, type Dispatched } from "./schedule.ts";
 import { platform } from "./platform/index.ts";
 import { loadState, rememberPrefix } from "./state.ts";
-import { markDeleted, openDb, upsertJob } from "./db.ts";
+import { dbPath, markDeleted, openDb, upsertJob } from "./db.ts";
+import { Database } from "bun:sqlite";
 import { startUiServer } from "./ui/server.ts";
 
 const VERSION = "0.2.0";
@@ -80,6 +81,73 @@ function safeDispatch(
 
 // --- Verbs ---
 
+interface LastResult {
+  summary: string | null;
+  finished_at: string | null;
+}
+
+function loadLastResults(slugs: string[]): Map<string, LastResult> {
+  const out = new Map<string, LastResult>();
+  if (slugs.length === 0) return out;
+  const path = dbPath(CONSUMER_ROOT);
+  if (!existsSync(path)) return out;
+  let db: Database;
+  try {
+    db = new Database(path, { readonly: true });
+  } catch {
+    return out;
+  }
+  try {
+    const rows = db
+      .query<
+        {
+          slug: string;
+          result_summary: string | null;
+          finished_at: string | null;
+        },
+        []
+      >(
+        `SELECT j.slug AS slug, i.result_summary AS result_summary, i.finished_at AS finished_at
+         FROM cron_invocations i
+         JOIN cron_jobs j ON j.id = i.job_id
+         WHERE i.id IN (
+           SELECT MAX(id) FROM cron_invocations GROUP BY job_id
+         )`,
+      )
+      .all();
+    for (const r of rows) {
+      out.set(r.slug, {
+        summary: r.result_summary,
+        finished_at: r.finished_at,
+      });
+    }
+  } catch {
+    // table may not have new columns yet; ignore
+  } finally {
+    db.close();
+  }
+  return out;
+}
+
+function relativeTime(iso: string | null): string {
+  if (!iso) return "—";
+  const t = Date.parse(iso);
+  if (Number.isNaN(t)) return "—";
+  const dSec = Math.max(0, Math.round((Date.now() - t) / 1000));
+  if (dSec < 60) return `${dSec}s ago`;
+  const dMin = Math.round(dSec / 60);
+  if (dMin < 60) return `${dMin}m ago`;
+  const dHr = Math.round(dMin / 60);
+  if (dHr < 48) return `${dHr}h ago`;
+  const dDay = Math.round(dHr / 24);
+  return `${dDay}d ago`;
+}
+
+function truncate(s: string, max: number): string {
+  if (s.length <= max) return s;
+  return s.slice(0, Math.max(1, max - 1)) + "…";
+}
+
 function cmdList(): void {
   const { jobs, errors } = discoverJobs(CRON_DIR);
   for (const e of errors) console.error(`[cronfish] ${e.path}: ${e.message}`);
@@ -93,6 +161,10 @@ function cmdList(): void {
   const installed = new Set(p.listInstalled(PREFIX));
   const isInstalled = (slug: string): boolean =>
     installed.has(p.labelSuffixOf(slug));
+  const lastResults = loadLastResults(jobs.map((j) => j.slug));
+  const cols = Math.max(80, Number(process.stdout.columns) || 120);
+  // Reserve 80 chars for the leading columns, give the rest to "last result".
+  const resultBudget = Math.max(20, cols - 80);
   const headers = [
     "slug",
     "kind",
@@ -102,6 +174,7 @@ function cmdList(): void {
     "loaded",
     "retries",
     "concurrency",
+    "last result",
   ];
   console.log(headers.join("\t"));
   for (const j of jobs) {
@@ -116,6 +189,13 @@ function cmdList(): void {
     } else {
       sched = `every ${d.value}s`;
     }
+    const lr = lastResults.get(j.slug);
+    let resultCell = "—";
+    if (lr) {
+      const when = relativeTime(lr.finished_at);
+      const summary = lr.summary ?? "(no summary)";
+      resultCell = truncate(`${summary} (${when})`, resultBudget);
+    }
     console.log(
       [
         j.slug,
@@ -126,6 +206,7 @@ function cmdList(): void {
         isInstalled(j.slug) ? "yes" : "no",
         String(j.retries ?? 0),
         j.concurrency ?? "—",
+        resultCell,
       ].join("\t"),
     );
   }

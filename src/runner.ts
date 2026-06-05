@@ -27,13 +27,20 @@ import {
   openDb,
   startInvocation,
   upsertJob,
+  type InvocationResultRow,
   type InvocationStatus,
   type InvocationTrigger,
 } from "./db.ts";
 import { loadJob, slugFromPath, type JobMeta } from "./jobs.ts";
 import { resolveModel, localClaudeEnv } from "./models.ts";
+import { parseLastResult } from "./result.ts";
 
 const DEFAULT_TIMEOUT_S = 300;
+
+const MD_RESULT_FOOTER = `---
+When finished, print exactly one line, then nothing after it:
+__CRONFISH_RESULT_V1__::{"summary":"...","ok":true|false,"metrics":{...}}
+Set ok to false if the work did not complete (errors, blocked, skipped). Summary ≤140 chars. No markdown, no code fences.`;
 const LOCK_POLL_MS = 2_000;
 const KILL_GRACE_MS = 5_000;
 
@@ -210,7 +217,7 @@ async function execMarkdown(
   const { parseFrontmatter } = await import("./frontmatter.ts");
   const { body } = parseFrontmatter(raw);
   const model = resolveModel(job.model);
-  const prompt = body.trim();
+  const prompt = body.trim() + "\n\n" + MD_RESULT_FOOTER;
   appendLog(
     fd,
     `[runner] kind=md model=${model.provider}:${model.id} timeout=${timeoutS}s`,
@@ -312,12 +319,33 @@ function tryFinishInvocation(
   invocationId: number | null,
   status: InvocationStatus,
   exitCode: number | null,
+  result?: InvocationResultRow,
 ): void {
   if (!db || invocationId === null) return;
   try {
-    finishInvocation(db, invocationId, status, exitCode);
+    finishInvocation(db, invocationId, status, exitCode, result);
   } catch (e) {
     warn(`finishInvocation failed: ${(e as Error).message}`);
+  }
+}
+
+async function tryParseResult(
+  logPath: string,
+  exitCode: number,
+): Promise<InvocationResultRow> {
+  try {
+    const { result, truncated } = await parseLastResult(logPath);
+    if (!result) return { summary: null, ok: null, json: null, truncated };
+    const ok = result.ok ?? exitCode === 0;
+    return {
+      summary: result.summary,
+      ok,
+      json: JSON.stringify(result),
+      truncated,
+    };
+  } catch (e) {
+    warn(`parseLastResult failed: ${(e as Error).message}`);
+    return { summary: null, ok: null, json: null, truncated: false };
   }
 }
 
@@ -443,7 +471,8 @@ async function main(): Promise<void> {
         : lastResult.code === 0
           ? "ok"
           : "fail";
-    tryFinishInvocation(db, invocationId, status, lastResult.code);
+    const resultRow = await tryParseResult(logFile, lastResult.code);
+    tryFinishInvocation(db, invocationId, status, lastResult.code, resultRow);
     try {
       db?.close();
     } catch {}
