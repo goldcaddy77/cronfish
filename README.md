@@ -176,7 +176,13 @@ cronfish ui status             # label + plist + pid
 cronfish ui uninstall          # bootout + remove
 ```
 
-`install` writes `~/Library/LaunchAgents/<prefix>.ui.plist` with `KeepAlive` + `RunAtLoad`, logs to `<consumer>/.cronfish/logs/ui.log`, and dispatches it via `launchctl bootstrap`. The dashboard binds 127.0.0.1 only — no auth, not exposed.
+`install` writes `~/Library/LaunchAgents/<prefix>.ui.plist` with `KeepAlive` + `RunAtLoad`, logs to `<consumer>/.cronfish/logs/ui.log`, and dispatches it via `launchctl bootstrap`. Default bind is `127.0.0.1` (no auth, not exposed). To reach the dashboard from another machine on your LAN, install with `--host 0.0.0.0`:
+
+```
+cronfish ui install --host 0.0.0.0
+```
+
+`ui status` then prints the LAN URL.
 
 ## Files cronfish writes
 

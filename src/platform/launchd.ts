@@ -10,7 +10,7 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, networkInterfaces } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { dispatchSchedule, type Dispatched } from "../schedule.ts";
 import type { JobMeta } from "../jobs.ts";
@@ -246,7 +246,27 @@ export interface UiDaemonConfig {
   bundlePrefix: string;
   consumerRoot: string;
   port: number;
+  host: string;
   bunPath?: string;
+}
+
+function lanIpv4(): string | null {
+  const ifs = networkInterfaces();
+  for (const addrs of Object.values(ifs)) {
+    if (!addrs) continue;
+    for (const a of addrs) {
+      if (a.family === "IPv4" && !a.internal) return a.address;
+    }
+  }
+  return null;
+}
+
+function urlFor(host: string, port: number): string {
+  if (host === "0.0.0.0" || host === "::") {
+    const ip = lanIpv4();
+    return ip ? `http://${ip}:${port}` : `http://127.0.0.1:${port}`;
+  }
+  return `http://${host}:${port}`;
 }
 
 function renderUi(cfg: UiDaemonConfig): LaunchdRender {
@@ -282,6 +302,8 @@ function renderUi(cfg: UiDaemonConfig): LaunchdRender {
         <string>ui</string>
         <string>--port</string>
         <string>${cfg.port}</string>
+        <string>--host</string>
+        <string>${cfg.host}</string>
         <string>--no-open</string>
     </array>
 
@@ -328,7 +350,7 @@ export function installUi(cfg: UiDaemonConfig): UiInstallResult {
   mkdirSync(join(cfg.consumerRoot, ".cronfish", "logs"), { recursive: true });
   const r = renderUi(cfg);
   const logPath = join(cfg.consumerRoot, ".cronfish", "logs", "ui.log");
-  const url = `http://127.0.0.1:${cfg.port}`;
+  const url = urlFor(cfg.host, cfg.port);
   const prev = existsSync(r.plistPath)
     ? readFileSync(r.plistPath, "utf-8")
     : "";
@@ -371,6 +393,21 @@ export interface UiStatusInfo {
   label: string;
   plistPath: string;
   pid: number | null;
+  url: string | null;
+}
+
+function parsePlistHostPort(
+  plistPath: string,
+): { host: string; port: number } | null {
+  if (!existsSync(plistPath)) return null;
+  const xml = readFileSync(plistPath, "utf-8");
+  const args = [...xml.matchAll(/<string>([^<]*)<\/string>/g)].map((m) => m[1]);
+  const portIdx = args.indexOf("--port");
+  const hostIdx = args.indexOf("--host");
+  const portStr = portIdx >= 0 ? args[portIdx + 1] : null;
+  const host = hostIdx >= 0 ? args[hostIdx + 1] : "127.0.0.1";
+  if (!portStr || !/^\d+$/.test(portStr)) return null;
+  return { host, port: parseInt(portStr, 10) };
 }
 
 export function uiStatus(prefix: string): UiStatusInfo {
@@ -384,5 +421,7 @@ export function uiStatus(prefix: string): UiStatusInfo {
     const m = out.match(/\bpid\s*=\s*(\d+)/);
     if (m) pid = parseInt(m[1], 10);
   }
-  return { installed, loaded, label, plistPath, pid };
+  const hp = parsePlistHostPort(plistPath);
+  const url = hp ? urlFor(hp.host, hp.port) : null;
+  return { installed, loaded, label, plistPath, pid, url };
 }

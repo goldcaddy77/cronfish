@@ -430,32 +430,39 @@ async function cmdRun(slug: string): Promise<void> {
 
 interface UiOptions {
   port: number;
+  host: string;
   open: boolean;
 }
 
+const UI_USAGE = "usage: cronfish ui [--port N] [--host ADDR] [--no-open]";
+
 function parseUiArgs(rest: string[]): UiOptions {
   let port = 4747;
+  let host = "127.0.0.1";
   let open = true;
   for (let i = 0; i < rest.length; i++) {
     const arg = rest[i];
     if (arg === "--no-open") open = false;
     else if (arg === "--port") {
       const next = rest[++i];
-      if (!next || !/^\d+$/.test(next)) {
-        throw new Error("usage: cronfish ui [--port N] [--no-open]");
-      }
+      if (!next || !/^\d+$/.test(next)) throw new Error(UI_USAGE);
       port = parseInt(next, 10);
     } else if (arg.startsWith("--port=")) {
       const v = arg.slice("--port=".length);
-      if (!/^\d+$/.test(v)) {
-        throw new Error("usage: cronfish ui [--port N] [--no-open]");
-      }
+      if (!/^\d+$/.test(v)) throw new Error(UI_USAGE);
       port = parseInt(v, 10);
+    } else if (arg === "--host") {
+      const next = rest[++i];
+      if (!next) throw new Error(UI_USAGE);
+      host = next;
+    } else if (arg.startsWith("--host=")) {
+      host = arg.slice("--host=".length);
+      if (!host) throw new Error(UI_USAGE);
     } else {
       throw new Error(`cronfish ui: unknown flag "${arg}"`);
     }
   }
-  return { port, open };
+  return { port, host, open };
 }
 
 async function cmdUi(rest: string[]): Promise<void> {
@@ -463,6 +470,7 @@ async function cmdUi(rest: string[]): Promise<void> {
   const url = await startUiServer({
     consumerRoot: CONSUMER_ROOT,
     port: opts.port,
+    hostname: opts.host,
   });
   console.log(`[cronfish] ui at ${url}`);
   if (opts.open) {
@@ -476,35 +484,42 @@ async function cmdUi(rest: string[]): Promise<void> {
   await new Promise(() => {});
 }
 
-function parseUiInstallArgs(rest: string[]): { port: number } {
+const UI_INSTALL_USAGE = "usage: cronfish ui install [--port N] [--host ADDR]";
+
+function parseUiInstallArgs(rest: string[]): { port: number; host: string } {
   let port = 4747;
+  let host = "127.0.0.1";
   for (let i = 0; i < rest.length; i++) {
     const arg = rest[i];
     if (arg === "--port") {
       const next = rest[++i];
-      if (!next || !/^\d+$/.test(next)) {
-        throw new Error("usage: cronfish ui install [--port N]");
-      }
+      if (!next || !/^\d+$/.test(next)) throw new Error(UI_INSTALL_USAGE);
       port = parseInt(next, 10);
     } else if (arg.startsWith("--port=")) {
       const v = arg.slice("--port=".length);
-      if (!/^\d+$/.test(v)) {
-        throw new Error("usage: cronfish ui install [--port N]");
-      }
+      if (!/^\d+$/.test(v)) throw new Error(UI_INSTALL_USAGE);
       port = parseInt(v, 10);
+    } else if (arg === "--host") {
+      const next = rest[++i];
+      if (!next) throw new Error(UI_INSTALL_USAGE);
+      host = next;
+    } else if (arg.startsWith("--host=")) {
+      host = arg.slice("--host=".length);
+      if (!host) throw new Error(UI_INSTALL_USAGE);
     } else {
       throw new Error(`cronfish ui install: unknown flag "${arg}"`);
     }
   }
-  return { port };
+  return { port, host };
 }
 
 function cmdUiInstall(rest: string[]): void {
-  const { port } = parseUiInstallArgs(rest);
+  const { port, host } = parseUiInstallArgs(rest);
   const r = platform().installUi({
     bundlePrefix: PREFIX,
     consumerRoot: CONSUMER_ROOT,
     port,
+    host,
     bunPath: BUN_PATH,
   });
   if (r.changed) {
@@ -539,6 +554,7 @@ function cmdUiStatus(): void {
   console.log(`           label: ${s.label}`);
   console.log(`           plist: ${s.plistPath}`);
   if (s.pid !== null) console.log(`           pid:   ${s.pid}`);
+  if (s.url) console.log(`           url:   ${s.url}`);
 }
 
 function cmdNext(slug?: string, n = 5): void {
@@ -669,8 +685,8 @@ usage:
   cronfish delete <slug> --yes        bootout + remove plist + job file
   cronfish status [slug]              all jobs (no arg) or one slug's launchctl + log tail
   cronfish run <slug>                 invoke runner directly (no launchd)
-  cronfish ui [--port N] [--no-open]  local web dashboard (default 127.0.0.1:4747)
-  cronfish ui install [--port N]      install dashboard as a launchd daemon (auto-restart, runs at login)
+  cronfish ui [--port N] [--host ADDR] [--no-open]  local web dashboard (default 127.0.0.1:4747)
+  cronfish ui install [--port N] [--host ADDR]      install dashboard as a launchd daemon (auto-restart, runs at login)
   cronfish ui uninstall               bootout + remove dashboard daemon
   cronfish ui status                  show dashboard daemon state
   cronfish --version
