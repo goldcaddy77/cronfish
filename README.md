@@ -135,7 +135,13 @@ a real schedule. Pure on-demand scripts that aren't scheduling candidates belong
 ```json
 {
   "bundle_prefix": "com.example.myapp",
-  "bun_path": "/opt/homebrew/bin/bun"
+  "bun_path": "/opt/homebrew/bin/bun",
+  "ui": { "public_url": "https://mini.tail-xxx.ts.net:4747" },
+  "alerts": {
+    "default": "slack",
+    "slack": { "webhook_url_env": "CRONFISH_SLACK_WEBHOOK" },
+    "shell": { "command": "/Users/you/bin/cronfish-pushover.sh" }
+  }
 }
 ```
 
@@ -146,11 +152,14 @@ a real schedule. Pure on-demand scripts that aren't scheduling candidates belong
   prefix). When unset, cronfish resolves bun in this order: `$BUN_INSTALL/bin` → `/opt/homebrew/bin`
   → `~/.bun/bin` → `/usr/local/bin` → `which bun`. Homebrew and the official installer
   (`~/.bun`) work out of the box; for asdf/mise/proto, set `bun_path` explicitly.
+- **`ui.public_url`** — base URL used to build links in alert payloads (e.g. `<base>/runs/<id>`).
+  Explicit only; no Tailscale auto-detect.
+- **`alerts`** — see [Alerts](#alerts) below.
 
 ## CLI
 
 ```
-cronfish init                       scaffold cron/hello.md + cron/touch.ts + cron/ping.sh
+cronfish init                       scaffold cron/hello.md + cron/touch.ts + cron/ping.sh + cron/watchdog.sh
 cronfish list                       every job + state
 cronfish next [slug] [N]            preview the next N fire times (default 5)
 cronfish sync                       reconcile cron/ ↔ launchd (idempotent)
@@ -159,11 +168,42 @@ cronfish disable <slug>             flip disabled, then sync
 cronfish delete <slug> --yes        bootout + remove plist + job file
 cronfish status [slug]              launchctl print + tail of latest log
 cronfish run <slug>                 invoke runner directly (no launchd) — for testing
+cronfish watchdog                   detect missed schedules → fire alerts
+cronfish alerts test [adapter]      send a test alert via the named (or default) adapter
 cronfish ui [--port N] [--no-open]  local web dashboard (default 127.0.0.1:4747)
 cronfish ui install [--port N]      install dashboard as a launchd daemon (auto-restart, runs at login)
 cronfish ui uninstall               bootout + remove dashboard daemon
 cronfish ui status                  show dashboard daemon state
 cronfish --version
+```
+
+## Alerts
+
+Every failed (`fail` / `timeout` / `crashed`) scheduled run pings the configured adapter, and the first `ok` after a failure pings once as `recovered`. Missed schedules are caught by `cronfish watchdog` (scaffolded as `cron/watchdog.sh`, scheduled `every 5 minutes`, disabled by default — flip on after configuring `alerts`).
+
+Adapters ship with cronfish:
+
+- **`slack`** — POSTs Block Kit to an incoming webhook. Reads the URL from the env var named in `alerts.slack.webhook_url_env` (default `CRONFISH_SLACK_WEBHOOK`).
+- **`shell`** — runs an arbitrary command from `alerts.shell.command` with the payload as env vars (`CRONFISH_ALERT_SLUG`, `…_STATUS`, `…_EXIT_CODE`, `…_DURATION_MS`, `…_STARTED_AT`, `…_UI_URL`, `…_LOG_TAIL`) plus the JSON payload on stdin. Use this for Pushover/ntfy/osascript.
+
+Per-job opt-in via frontmatter:
+
+```yaml
+schedule: "every 5 minutes"
+on_failure:
+  notify: slack
+missed_after: 30m   # optional override of the watchdog's grace window
+```
+
+When `on_failure` is absent, cronfish falls back to `alerts.default` from `.cronfish.json`. If neither is set, no alert fires (silent skip — the run is still recorded in the ledger with `alert_status='skipped'`).
+
+Failures inside the adapter never block the run: `alert_status='error'` and `alert_error` capture the reason; stderr gets one line. Manual `cronfish run <slug>` invocations do **not** fire alerts — that's the debugging path.
+
+Sanity check:
+
+```
+export CRONFISH_SLACK_WEBHOOK=https://hooks.slack.com/services/...
+cronfish alerts test slack
 ```
 
 ## Always-on dashboard

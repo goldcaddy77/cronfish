@@ -18,6 +18,11 @@ import {
 export type JobKind = "md" | "ts" | "sh";
 export type Concurrency = "skip" | "queue";
 
+export interface OnFailure {
+  notify?: string;
+  channel?: string;
+}
+
 export interface JobMeta {
   slug: string;
   path: string;
@@ -29,6 +34,8 @@ export interface JobMeta {
   retries?: number;
   concurrency?: Concurrency;
   description?: string;
+  missed_after?: string;
+  on_failure?: OnFailure;
 }
 
 export class JobValidationError extends Error {
@@ -129,11 +136,51 @@ export function slugFromPath(cronDir: string, absPath: string): string {
   return rel.replace(/\.(md|ts|sh)$/, "-$1");
 }
 
+function asOnFailure(
+  path: string,
+  nested: Record<string, Scalar> | undefined,
+): OnFailure | undefined {
+  if (!nested) return undefined;
+  const out: OnFailure = {};
+  const notify = nested.notify;
+  if (notify !== undefined) {
+    if (typeof notify !== "string") {
+      throw new JobValidationError(
+        path,
+        `on_failure.notify must be a string, got ${typeof notify}: ${notify}`,
+      );
+    }
+    out.notify = notify;
+  }
+  const channel = nested.channel;
+  if (channel !== undefined) {
+    if (typeof channel !== "string") {
+      throw new JobValidationError(
+        path,
+        `on_failure.channel must be a string, got ${typeof channel}: ${channel}`,
+      );
+    }
+    out.channel = channel;
+  }
+  for (const k of Object.keys(nested)) {
+    if (k !== "notify" && k !== "channel") {
+      throw new JobValidationError(
+        path,
+        `on_failure.${k}: unknown key (allowed: notify, channel)`,
+      );
+    }
+  }
+  return out;
+}
+
 function fromMarkdown(path: string, slug: string): JobMeta {
   const raw = readFileSync(path, "utf-8");
   let frontmatter: Record<string, Scalar>;
+  let nested: Record<string, Record<string, Scalar>>;
   try {
-    frontmatter = parseFrontmatter(raw).frontmatter;
+    const parsed = parseFrontmatter(raw);
+    frontmatter = parsed.frontmatter;
+    nested = parsed.nested;
   } catch (e) {
     if (e instanceof FrontmatterError)
       throw new JobValidationError(path, e.message);
@@ -150,6 +197,8 @@ function fromMarkdown(path: string, slug: string): JobMeta {
     retries: asPositiveInt(path, "retries", frontmatter.retries, { min: 0 }),
     concurrency: asConcurrency(path, frontmatter.concurrency),
     description: asString(path, "description", frontmatter.description),
+    missed_after: asString(path, "missed_after", frontmatter.missed_after),
+    on_failure: asOnFailure(path, nested.on_failure),
   };
 }
 
@@ -174,20 +223,25 @@ function fromTypescript(path: string, slug: string): JobMeta {
     retries: cfg.retries,
     concurrency: cfg.concurrency,
     description: cfg.description,
+    missed_after: cfg.missed_after,
+    on_failure: asOnFailure(path, cfg.on_failure),
   };
 }
 
 function fromShell(path: string, slug: string): JobMeta {
   const raw = readFileSync(path, "utf-8");
   let frontmatter: Record<string, Scalar>;
+  let nested: Record<string, Record<string, Scalar>>;
   try {
-    frontmatter = parseShellFrontmatter(raw);
+    const parsed = parseShellFrontmatter(raw);
+    frontmatter = parsed.frontmatter;
+    nested = parsed.nested;
   } catch (e) {
     if (e instanceof FrontmatterError)
       throw new JobValidationError(path, e.message);
     throw e;
   }
-  if (Object.keys(frontmatter).length === 0) {
+  if (Object.keys(frontmatter).length === 0 && Object.keys(nested).length === 0) {
     throw new JobValidationError(
       path,
       `shell job needs a "# ---" frontmatter block at the top (with at least "schedule:")`,
@@ -203,6 +257,8 @@ function fromShell(path: string, slug: string): JobMeta {
     retries: asPositiveInt(path, "retries", frontmatter.retries, { min: 0 }),
     concurrency: asConcurrency(path, frontmatter.concurrency),
     description: asString(path, "description", frontmatter.description),
+    missed_after: asString(path, "missed_after", frontmatter.missed_after),
+    on_failure: asOnFailure(path, nested.on_failure),
   };
 }
 

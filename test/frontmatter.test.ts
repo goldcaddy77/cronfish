@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
   FrontmatterError,
   parseFrontmatter,
+  parseShellFrontmatter,
   parseTsJobConfig,
   setFrontmatterKey,
 } from "../src/frontmatter.ts";
@@ -103,6 +104,54 @@ describe("parseTsJobConfig", () => {
     const cfg = parseTsJobConfig(src);
     expect(cfg.concurrency).toBe("skip");
     expect(cfg.model).toBe("haiku");
+  });
+});
+
+describe("nested on_failure", () => {
+  test("parses on_failure block in YAML frontmatter", () => {
+    const raw = `---
+schedule: "every 5 minutes"
+on_failure:
+  notify: slack
+  channel: "#cron-alerts"
+---
+body`;
+    const { frontmatter, nested } = parseFrontmatter(raw);
+    expect(frontmatter.schedule).toBe("every 5 minutes");
+    expect(nested.on_failure).toEqual({
+      notify: "slack",
+      channel: "#cron-alerts",
+    });
+  });
+
+  test("parses on_failure block in shell comment frontmatter", () => {
+    const raw = `#!/bin/bash
+# ---
+# schedule: every 5 minutes
+# on_failure:
+#   notify: slack
+# ---
+echo hi`;
+    const { frontmatter, nested } = parseShellFrontmatter(raw);
+    expect(frontmatter.schedule).toBe("every 5 minutes");
+    expect(nested.on_failure).toEqual({ notify: "slack" });
+  });
+
+  test("parses on_failure inline object in TS config", () => {
+    const src = `export const config = {
+      schedule: "every 5 minutes",
+      on_failure: { notify: "slack", channel: "#cron-alerts" },
+    };`;
+    const cfg = parseTsJobConfig(src);
+    expect(cfg.on_failure).toEqual({
+      notify: "slack",
+      channel: "#cron-alerts",
+    });
+  });
+
+  test("rejects indented line outside a nested block", () => {
+    const raw = `---\nschedule: "5m"\n  stray: yes\n---\n`;
+    expect(() => parseFrontmatter(raw)).toThrow(/indented/);
   });
 });
 

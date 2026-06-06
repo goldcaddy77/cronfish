@@ -1,8 +1,10 @@
 // Strict YAML-subset frontmatter parser for cronfish job files.
 //
 // Supported scalar types: string, integer, boolean. No floats, no arrays,
-// no nesting, no nulls. Every key is validated against an expected type;
-// unexpected types throw with file + key + expected + got.
+// no nulls. One level of nesting is supported (a key with no value followed
+// by indented child key/value scalars) — used today only for `on_failure:`.
+// Every key is validated against an expected type; unexpected types throw
+// with file + key + expected + got.
 //
 // `every:` is no longer accepted — use `schedule:`.
 
@@ -10,6 +12,7 @@ export type Scalar = string | number | boolean;
 
 export interface ParsedFrontmatter {
   frontmatter: Record<string, Scalar>;
+  nested: Record<string, Record<string, Scalar>>;
   body: string;
 }
 
@@ -47,15 +50,27 @@ function unquote(val: string): string {
   return val;
 }
 
+function indentOf(line: string): number {
+  const m = line.match(/^( *)/);
+  return m ? m[0].length : 0;
+}
+
 export function parseFrontmatter(raw: string): ParsedFrontmatter {
   const m = raw.match(FM_RE);
-  if (!m) return { frontmatter: {}, body: raw };
+  if (!m) return { frontmatter: {}, nested: {}, body: raw };
   const fm: Record<string, Scalar> = {};
+  const nested: Record<string, Record<string, Scalar>> = {};
   const lines = m[1].split(/\r?\n/);
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     const trimmed = line.trim();
     if (!trimmed || trimmed.startsWith("#")) continue;
+    if (indentOf(line) > 0) {
+      // Stray indented line outside a nested block — surface clearly.
+      throw new FrontmatterError(
+        `line ${i + 1}: unexpected indented line outside a nested block`,
+      );
+    }
     const idx = trimmed.indexOf(":");
     if (idx < 0) {
       throw new FrontmatterError(
@@ -65,15 +80,48 @@ export function parseFrontmatter(raw: string): ParsedFrontmatter {
     const key = trimmed.slice(0, idx).trim();
     if (!key) throw new FrontmatterError(`line ${i + 1}: empty key`);
     const rawVal = trimmed.slice(idx + 1).trim();
-    const cleaned = unquote(stripInlineComment(rawVal));
     if (key === "every") {
       throw new FrontmatterError(
         `key "every" is no longer supported — rename to "schedule"`,
       );
     }
+    if (rawVal === "") {
+      // Nested block — consume following indented lines.
+      const child: Record<string, Scalar> = {};
+      while (i + 1 < lines.length) {
+        const next = lines[i + 1];
+        const nextTrimmed = next.trim();
+        if (!nextTrimmed || nextTrimmed.startsWith("#")) {
+          i++;
+          continue;
+        }
+        if (indentOf(next) === 0) break;
+        i++;
+        const cIdx = nextTrimmed.indexOf(":");
+        if (cIdx < 0) {
+          throw new FrontmatterError(
+            `line ${i + 1}: missing ":" inside nested "${key}" block`,
+          );
+        }
+        const cKey = nextTrimmed.slice(0, cIdx).trim();
+        if (!cKey)
+          throw new FrontmatterError(`line ${i + 1}: empty nested key`);
+        const cRaw = nextTrimmed.slice(cIdx + 1).trim();
+        if (cRaw === "") {
+          throw new FrontmatterError(
+            `line ${i + 1}: nested key "${cKey}" needs a value (only one level of nesting supported)`,
+          );
+        }
+        const cleaned = unquote(stripInlineComment(cRaw));
+        child[cKey] = parseScalar(cleaned);
+      }
+      nested[key] = child;
+      continue;
+    }
+    const cleaned = unquote(stripInlineComment(rawVal));
     fm[key] = parseScalar(cleaned);
   }
-  return { frontmatter: fm, body: m[2] };
+  return { frontmatter: fm, nested, body: m[2] };
 }
 
 // --- Shell job frontmatter parser ---
@@ -118,15 +166,23 @@ function findShellFmBlock(
   };
 }
 
-export function parseShellFrontmatter(raw: string): Record<string, Scalar> {
+export interface ParsedShellFrontmatter {
+  frontmatter: Record<string, Scalar>;
+  nested: Record<string, Record<string, Scalar>>;
+}
+
+export function parseShellFrontmatter(raw: string): ParsedShellFrontmatter {
   const block = findShellFmBlock(raw);
-  if (!block) return {};
+  if (!block) return { frontmatter: {}, nested: {} };
   const inner = block.inner
     .split(/\r?\n/)
-    .map((line) => line.replace(/^\s*#\s?/, ""))
+    // Strip the leading `# ` but preserve indentation after it so nested
+    // `#   notify: x` lines come through as `  notify: x`.
+    .map((line) => line.replace(/^\s*#(?: |$)/, ""))
     .join("\n");
   const fake = `---\n${inner}\n---\n`;
-  return parseFrontmatter(fake).frontmatter;
+  const parsed = parseFrontmatter(fake);
+  return { frontmatter: parsed.frontmatter, nested: parsed.nested };
 }
 
 // --- TS job config parser ---
@@ -142,6 +198,8 @@ export interface TsJobConfigShape {
   concurrency?: "skip" | "queue";
   model?: string;
   description?: string;
+  missed_after?: string;
+  on_failure?: Record<string, Scalar>;
 }
 
 function extractConfigBlock(source: string): string | null {
@@ -268,7 +326,113 @@ export function parseTsJobConfig(source: string): TsJobConfigShape {
   if (description !== undefined) {
     cfg.description = description.replace(/^['"`]|['"`]$/g, "");
   }
+  const missedAfter = pickFromConfig(body, "missed_after");
+  if (missedAfter !== undefined) {
+    cfg.missed_after = missedAfter.replace(/^['"`]|['"`]$/g, "");
+  }
+  const onFailure = pickNestedObjectFromConfig(body, "on_failure");
+  if (onFailure !== undefined) cfg.on_failure = onFailure;
   return cfg;
+}
+
+// Find `key: { ... }` at the top level of the config block and return the
+// inner k/v pairs as scalars. Only supports flat objects with string / number /
+// boolean values — same surface as the YAML nested block.
+function pickNestedObjectFromConfig(
+  body: string,
+  key: string,
+): Record<string, Scalar> | undefined {
+  const re = new RegExp(`\\b${key}\\b\\s*:\\s*\\{`, "g");
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(body))) {
+    // Verify top-level
+    let depth = 0;
+    let s: string | null = null;
+    for (let i = 0; i < m.index; i++) {
+      const c = body[i];
+      const prev = body[i - 1];
+      if (s) {
+        if (c === s && prev !== "\\") s = null;
+        continue;
+      }
+      if (c === '"' || c === "'" || c === "`") {
+        s = c;
+        continue;
+      }
+      if (c === "{") depth++;
+      else if (c === "}") depth--;
+    }
+    if (depth !== 0 || s !== null) continue;
+    const start = m.index + m[0].length;
+    let d = 1;
+    let str: string | null = null;
+    for (let i = start; i < body.length; i++) {
+      const c = body[i];
+      const prev = body[i - 1];
+      if (str) {
+        if (c === str && prev !== "\\") str = null;
+        continue;
+      }
+      if (c === '"' || c === "'" || c === "`") {
+        str = c;
+        continue;
+      }
+      if (c === "{") d++;
+      else if (c === "}") {
+        d--;
+        if (d === 0) {
+          const inner = body.slice(start, i);
+          return parseInlineObject(inner);
+        }
+      }
+    }
+    return undefined;
+  }
+  return undefined;
+}
+
+function parseInlineObject(inner: string): Record<string, Scalar> {
+  const out: Record<string, Scalar> = {};
+  // Split on commas at depth 0.
+  const parts: string[] = [];
+  let buf = "";
+  let s: string | null = null;
+  let d = 0;
+  for (let i = 0; i < inner.length; i++) {
+    const c = inner[i];
+    const prev = inner[i - 1];
+    if (s) {
+      buf += c;
+      if (c === s && prev !== "\\") s = null;
+      continue;
+    }
+    if (c === '"' || c === "'" || c === "`") {
+      s = c;
+      buf += c;
+      continue;
+    }
+    if (c === "{" || c === "[") d++;
+    else if (c === "}" || c === "]") d--;
+    if (c === "," && d === 0) {
+      parts.push(buf);
+      buf = "";
+    } else {
+      buf += c;
+    }
+  }
+  if (buf.trim()) parts.push(buf);
+  for (const p of parts) {
+    const idx = p.indexOf(":");
+    if (idx < 0) continue;
+    const k = p.slice(0, idx).trim().replace(/^['"`]|['"`]$/g, "");
+    const v = p.slice(idx + 1).trim().replace(/,$/, "").trim();
+    if (!k) continue;
+    if (v === "true") out[k] = true;
+    else if (v === "false") out[k] = false;
+    else if (/^-?\d+$/.test(v)) out[k] = parseInt(v, 10);
+    else out[k] = v.replace(/^['"`]|['"`]$/g, "");
+  }
+  return out;
 }
 
 // Update or insert a key in a shell job's comment-block frontmatter. If no
