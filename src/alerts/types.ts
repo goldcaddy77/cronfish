@@ -18,7 +18,13 @@ export interface Adapter {
 }
 
 export interface AlertsConfig {
+  // Default adapter for `cronfish alerts test` (CLI) when no adapter arg is given.
   default?: string;
+  // Fleet-wide on_failure default. Per-job frontmatter `on_failure` wins.
+  // Per-job `on_failure: { notify: "none" }` opts out of the fleet default.
+  on_failure?: {
+    notify?: string;
+  };
   slack?: {
     webhook_url_env?: string;
   };

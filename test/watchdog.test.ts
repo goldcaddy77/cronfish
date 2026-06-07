@@ -149,7 +149,7 @@ describe("runWatchdog (integration)", () => {
       join(root, ".cronfish.json"),
       JSON.stringify({
         alerts: {
-          default: "shell",
+          on_failure: { notify: "shell" },
           shell: { command: `printenv CRONFISH_ALERT_SLUG >> "${sentinel}"` },
         },
       }),

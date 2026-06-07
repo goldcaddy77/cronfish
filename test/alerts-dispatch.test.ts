@@ -47,13 +47,30 @@ describe("alertStatusFor", () => {
 });
 
 describe("chooseAdapterName", () => {
-  test("job override wins over default", () => {
+  test("job override wins over fleet on_failure", () => {
     expect(
-      chooseAdapterName({ notify: "shell" }, { default: "slack" }),
+      chooseAdapterName(
+        { notify: "shell" },
+        { on_failure: { notify: "slack" } },
+      ),
     ).toBe("shell");
   });
-  test("falls back to alerts.default", () => {
-    expect(chooseAdapterName(undefined, { default: "slack" })).toBe("slack");
+  test("falls back to alerts.on_failure", () => {
+    expect(
+      chooseAdapterName(undefined, { on_failure: { notify: "slack" } }),
+    ).toBe("slack");
+  });
+  test("alerts.default does NOT pick an adapter for the failure path", () => {
+    // alerts.default is for the CLI `alerts test` command only.
+    expect(chooseAdapterName(undefined, { default: "slack" })).toBeNull();
+  });
+  test("per-job notify: \"none\" opts out of fleet default", () => {
+    expect(
+      chooseAdapterName(
+        { notify: "none" },
+        { on_failure: { notify: "slack" } },
+      ),
+    ).toBeNull();
   });
   test("returns null when nothing configured", () => {
     expect(chooseAdapterName(undefined, undefined)).toBeNull();
@@ -114,12 +131,12 @@ describe("loadConsumerAlertsConfig", () => {
       join(root, ".cronfish.json"),
       JSON.stringify({
         bundle_prefix: "com.test",
-        alerts: { default: "slack", slack: { webhook_url_env: "X" } },
+        alerts: { on_failure: { notify: "slack" }, slack: { webhook_url_env: "X" } },
         ui: { public_url: "https://ui.example" },
       }),
     );
     const cfg = loadConsumerAlertsConfig(root);
-    expect(cfg.alerts?.default).toBe("slack");
+    expect(cfg.alerts?.on_failure?.notify).toBe("slack");
     expect(cfg.ui?.public_url).toBe("https://ui.example");
   });
 
@@ -154,7 +171,7 @@ describe("dispatchAlert", () => {
     writeFileSync(
       join(root, ".cronfish.json"),
       JSON.stringify({
-        alerts: { default: "slack", slack: { webhook_url_env: "TEST_HOOK" } },
+        alerts: { on_failure: { notify: "slack" }, slack: { webhook_url_env: "TEST_HOOK" } },
       }),
     );
     process.env.TEST_HOOK = "https://hooks.example/x";
@@ -184,7 +201,7 @@ describe("dispatchAlert", () => {
     writeFileSync(
       join(root, ".cronfish.json"),
       JSON.stringify({
-        alerts: { default: "slack", slack: { webhook_url_env: "TEST_HOOK2" } },
+        alerts: { on_failure: { notify: "slack" }, slack: { webhook_url_env: "TEST_HOOK2" } },
       }),
     );
     process.env.TEST_HOOK2 = "https://hooks.example/x";
