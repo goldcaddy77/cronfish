@@ -98,7 +98,33 @@ const MIGRATIONS: Migration[] = [
         "ALTER TABLE cron_invocations ADD COLUMN result_truncated INTEGER NOT NULL DEFAULT 0",
       );
   },
+  // v4 — alert outcome per invocation
+  (db) => {
+    const cols = db.query("PRAGMA table_info(cron_invocations)").all() as {
+      name: string;
+    }[];
+    const have = new Set(cols.map((c) => c.name));
+    if (!have.has("alert_status"))
+      db.exec("ALTER TABLE cron_invocations ADD COLUMN alert_status TEXT");
+    if (!have.has("alert_error"))
+      db.exec("ALTER TABLE cron_invocations ADD COLUMN alert_error TEXT");
+  },
+  // v5 — missed-schedule alerts table (watchdog dedup)
+  (db) => {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS cron_missed_alerts (
+        id          INTEGER PRIMARY KEY,
+        job_id      INTEGER NOT NULL REFERENCES cron_jobs(id),
+        expected_at TEXT NOT NULL,
+        fired_at    TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_missed_job_fired
+        ON cron_missed_alerts(job_id, fired_at DESC);
+    `);
+  },
 ];
+
+export type AlertLedgerStatus = "sent" | "skipped" | "error" | "recovered";
 
 export function migrate(db: Database): void {
   const current = (
@@ -241,4 +267,99 @@ export function finishInvocation(
     $result_json: result?.json ?? null,
     $result_truncated: result?.truncated ? 1 : 0,
   });
+}
+
+export function setInvocationAlert(
+  db: Database,
+  invocationId: number,
+  status: AlertLedgerStatus,
+  error: string | null,
+): void {
+  db.prepare(
+    `UPDATE cron_invocations
+     SET alert_status = $status, alert_error = $error
+     WHERE id = $id`,
+  ).run({ $id: invocationId, $status: status, $error: error });
+}
+
+export interface EnabledJobRow {
+  id: number;
+  slug: string;
+  schedule: string;
+}
+
+export function listEnabledJobs(db: Database): EnabledJobRow[] {
+  return db
+    .query(
+      `SELECT id, slug, schedule FROM cron_jobs
+       WHERE enabled = 1 AND deleted_at IS NULL`,
+    )
+    .all() as EnabledJobRow[];
+}
+
+export function getLastOkStartedAt(
+  db: Database,
+  jobId: number,
+): string | null {
+  const row = db
+    .query(
+      `SELECT started_at FROM cron_invocations
+       WHERE job_id = $job_id AND status = 'ok'
+       ORDER BY started_at DESC LIMIT 1`,
+    )
+    .get({ $job_id: jobId }) as { started_at: string } | undefined;
+  return row?.started_at ?? null;
+}
+
+export function getLatestMissedFiredAt(
+  db: Database,
+  jobId: number,
+): string | null {
+  const row = db
+    .query(
+      `SELECT fired_at FROM cron_missed_alerts
+       WHERE job_id = $job_id
+       ORDER BY fired_at DESC LIMIT 1`,
+    )
+    .get({ $job_id: jobId }) as { fired_at: string } | undefined;
+  return row?.fired_at ?? null;
+}
+
+export function recordMissedAlert(
+  db: Database,
+  jobId: number,
+  expectedAtIso: string,
+): number {
+  const res = db
+    .prepare(
+      `INSERT INTO cron_missed_alerts (job_id, expected_at, fired_at)
+       VALUES ($job_id, $expected_at, $now)`,
+    )
+    .run({
+      $job_id: jobId,
+      $expected_at: expectedAtIso,
+      $now: nowIso(),
+    });
+  return Number(res.lastInsertRowid);
+}
+
+// Most recent finished invocation for a job (excluding the given id).
+// Used by the runner to decide whether the current ok run is a recovery.
+export function getPreviousFinishedStatus(
+  db: Database,
+  jobId: number,
+  excludingId: number,
+): InvocationStatus | null {
+  const row = db
+    .query(
+      `SELECT status FROM cron_invocations
+       WHERE job_id = $job_id
+         AND id <> $id
+         AND finished_at IS NOT NULL
+       ORDER BY started_at DESC LIMIT 1`,
+    )
+    .get({ $job_id: jobId, $id: excludingId }) as
+    | { status: InvocationStatus }
+    | undefined;
+  return row?.status ?? null;
 }

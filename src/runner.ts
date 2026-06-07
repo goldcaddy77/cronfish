@@ -24,9 +24,12 @@ import type { Database } from "bun:sqlite";
 import {
   finishInvocation,
   getJobIdBySlug,
+  getPreviousFinishedStatus,
   openDb,
+  setInvocationAlert,
   startInvocation,
   upsertJob,
+  type AlertLedgerStatus,
   type InvocationResultRow,
   type InvocationStatus,
   type InvocationTrigger,
@@ -34,6 +37,11 @@ import {
 import { loadJob, slugFromPath, type JobMeta } from "./jobs.ts";
 import { resolveModel, localClaudeEnv } from "./models.ts";
 import { parseLastResult } from "./result.ts";
+import {
+  alertStatusFor,
+  dispatchAlert,
+  type DispatchOutcome,
+} from "./alerts/dispatch.ts";
 
 const DEFAULT_TIMEOUT_S = 300;
 
@@ -329,6 +337,51 @@ function tryFinishInvocation(
   }
 }
 
+function trySetAlert(
+  db: Database | null,
+  invocationId: number | null,
+  status: AlertLedgerStatus,
+  error: string | null,
+): void {
+  if (!db || invocationId === null) return;
+  try {
+    setInvocationAlert(db, invocationId, status, error);
+  } catch (e) {
+    warn(`setInvocationAlert failed: ${(e as Error).message}`);
+  }
+}
+
+function tryPrevStatus(
+  db: Database | null,
+  jobSlug: string,
+  invocationId: number,
+): InvocationStatus | null {
+  if (!db) return null;
+  try {
+    const jobId = getJobIdBySlug(db, jobSlug);
+    if (jobId === null) return null;
+    return getPreviousFinishedStatus(db, jobId, invocationId);
+  } catch (e) {
+    warn(`getPreviousFinishedStatus failed: ${(e as Error).message}`);
+    return null;
+  }
+}
+
+function outcomeToLedger(o: DispatchOutcome): {
+  status: AlertLedgerStatus;
+  error: string | null;
+} {
+  if (o.kind === "sent") return { status: "sent", error: null };
+  if (o.kind === "error") return { status: "error", error: o.error };
+  return { status: "skipped", error: null };
+}
+
+const FAILURE_STATUSES = new Set<InvocationStatus>([
+  "fail",
+  "timeout",
+  "crashed",
+]);
+
 async function tryParseResult(
   logPath: string,
   exitCode: number,
@@ -473,11 +526,73 @@ async function main(): Promise<void> {
           : "fail";
     const resultRow = await tryParseResult(logFile, lastResult.code);
     tryFinishInvocation(db, invocationId, status, lastResult.code, resultRow);
+    await maybeFireAlert({
+      db,
+      job,
+      invocationId,
+      status,
+      trigger,
+      exitCode: lastResult.code,
+      durationMs: Date.now() - start,
+      startedAtIso: new Date(start).toISOString(),
+      logPath: logFile,
+    });
     try {
       db?.close();
     } catch {}
   }
   process.exit(lastResult.code);
+}
+
+interface AlertFireInput {
+  db: Database | null;
+  job: JobMeta;
+  invocationId: number | null;
+  status: InvocationStatus;
+  trigger: InvocationTrigger;
+  exitCode: number | null;
+  durationMs: number;
+  startedAtIso: string;
+  logPath: string;
+}
+
+async function maybeFireAlert(input: AlertFireInput): Promise<void> {
+  // Manual runs never fire alerts (debugging path).
+  if (input.trigger !== "schedule") return;
+  if (input.invocationId === null) return;
+  const failureStatus = alertStatusFor(input.status);
+  const isFailure = failureStatus !== null;
+  const isRecovery =
+    input.status === "ok" &&
+    FAILURE_STATUSES.has(
+      tryPrevStatus(input.db, input.job.slug, input.invocationId) ??
+        ("ok" as InvocationStatus),
+    );
+  if (!isFailure && !isRecovery) return;
+  try {
+    const outcome = await dispatchAlert({
+      job: input.job,
+      invocationId: input.invocationId,
+      invocationStatus: input.status,
+      alertStatus: isFailure ? failureStatus : "recovered",
+      exitCode: input.exitCode,
+      durationMs: input.durationMs,
+      startedAt: input.startedAtIso,
+      logPath: input.logPath,
+      consumerRoot: consumerRoot(),
+    });
+    if (isRecovery && outcome.kind === "sent") {
+      trySetAlert(input.db, input.invocationId, "recovered", null);
+    } else {
+      const ledger = outcomeToLedger(outcome);
+      trySetAlert(input.db, input.invocationId, ledger.status, ledger.error);
+    }
+  } catch (e) {
+    // dispatchAlert is meant to be failure-safe; this catch is a last-resort
+    // guard so a runner crash here never blocks the run.
+    warn(`maybeFireAlert: ${(e as Error).message}`);
+    trySetAlert(input.db, input.invocationId, "error", (e as Error).message);
+  }
 }
 
 main().catch((e) => {

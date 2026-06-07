@@ -61,6 +61,79 @@ function validateCronExpr(expr: string): string {
   return parts.join(" ");
 }
 
+// Next fire time strictly after `from`, in UTC. Returns null for manual or
+// unparseable. For our constrained cron form (each field "*" or a single
+// integer, no `*/N`) we walk minute-by-minute up to 7 days; that's fine for
+// the watchdog's needs and avoids pulling in cronosjs.
+export function nextFireAfter(
+  schedule: string | number | undefined,
+  from: Date,
+): Date | null {
+  let d: Dispatched;
+  try {
+    d = dispatchSchedule(schedule);
+  } catch {
+    return null;
+  }
+  if (d.kind === "manual") return null;
+  if (d.kind === "seconds") {
+    return new Date(from.getTime() + d.value * 1000);
+  }
+  const parts = d.expr.split(/\s+/);
+  const [m, h, dom, mon, dow] = parts;
+  // Start at the next whole minute boundary strictly after `from`.
+  const start = new Date(from.getTime());
+  start.setUTCSeconds(0, 0);
+  start.setUTCMinutes(start.getUTCMinutes() + 1);
+  const limit = new Date(from.getTime() + 7 * 86400 * 1000);
+  for (let t = start; t <= limit; t = new Date(t.getTime() + 60_000)) {
+    if (m !== "*" && t.getUTCMinutes() !== parseInt(m, 10)) continue;
+    if (h !== "*" && t.getUTCHours() !== parseInt(h, 10)) continue;
+    if (dom !== "*" && t.getUTCDate() !== parseInt(dom, 10)) continue;
+    if (mon !== "*" && t.getUTCMonth() + 1 !== parseInt(mon, 10)) continue;
+    if (dow !== "*") {
+      const want = parseInt(dow, 10) % 7; // 0 == 7 == Sunday
+      if (t.getUTCDay() !== want) continue;
+    }
+    return t;
+  }
+  return null;
+}
+
+// Approximate the configured interval. For seconds schedule this is exact.
+// For cron we use (next_after_expected - expected). Returns null when
+// indeterminate (manual / unparseable).
+export function intervalSecondsAt(
+  schedule: string | number | undefined,
+  anchor: Date,
+): number | null {
+  let d: Dispatched;
+  try {
+    d = dispatchSchedule(schedule);
+  } catch {
+    return null;
+  }
+  if (d.kind === "manual") return null;
+  if (d.kind === "seconds") return d.value;
+  const a = nextFireAfter(schedule, anchor);
+  if (!a) return null;
+  const b = nextFireAfter(schedule, a);
+  if (!b) return null;
+  return Math.round((b.getTime() - a.getTime()) / 1000);
+}
+
+// Parse a `missed_after:` override. Accepts the same compact units as
+// `schedule:` (`30m`, `2h`, `90s`, `1d`, or a bare seconds integer).
+// Returns null when not parseable.
+export function parseMissedAfter(input: string | number | undefined): number | null {
+  if (input === undefined || input === null || input === "") return null;
+  try {
+    const d = dispatchSchedule(input);
+    if (d.kind === "seconds") return d.value;
+  } catch {}
+  return null;
+}
+
 export function dispatchSchedule(
   input: string | number | undefined,
 ): Dispatched {

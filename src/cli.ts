@@ -21,7 +21,7 @@ import { dbPath, markDeleted, openDb, upsertJob } from "./db.ts";
 import { Database } from "bun:sqlite";
 import { startUiServer } from "./ui/server.ts";
 
-const VERSION = "0.2.0";
+const VERSION = "0.8.0";
 
 const CONSUMER_ROOT = process.env.CRONFISH_CONSUMER_ROOT || process.cwd();
 const CRON_DIR = join(CONSUMER_ROOT, "cron");
@@ -557,6 +557,63 @@ function cmdUiStatus(): void {
   if (s.url) console.log(`           url:   ${s.url}`);
 }
 
+async function cmdWatchdog(): Promise<void> {
+  const { runWatchdog } = await import("./watchdog.ts");
+  const decisions = await runWatchdog({ consumerRoot: CONSUMER_ROOT });
+  let fired = 0;
+  let errors = 0;
+  for (const d of decisions) {
+    if (d.outcome === "fired") {
+      fired++;
+      console.log(`[watchdog] FIRED ${d.slug} (expected ${d.expected_at})`);
+    } else if (d.outcome === "fire-failed") {
+      errors++;
+      console.error(
+        `[watchdog] FAIL  ${d.slug}: ${d.error ?? "unknown"} (expected ${d.expected_at})`,
+      );
+    }
+  }
+  if (fired === 0 && errors === 0) {
+    // Silent: spec says "no missed jobs and exits 0 silently".
+    return;
+  }
+  if (errors > 0) process.exit(1);
+}
+
+async function cmdAlertsTest(adapterName?: string): Promise<void> {
+  const { loadConsumerAlertsConfig, buildRegistry, safeNotify } = await import(
+    "./alerts/index.ts"
+  );
+  const cfg = loadConsumerAlertsConfig(CONSUMER_ROOT);
+  const name = adapterName ?? cfg.alerts?.default;
+  if (!name) {
+    console.error(
+      `[cronfish] alerts test: no adapter given and alerts.default not set in .cronfish.json`,
+    );
+    process.exit(2);
+  }
+  const registry = buildRegistry(cfg.alerts);
+  if (!registry.has(name)) {
+    console.error(`[cronfish] alerts test: unknown adapter "${name}"`);
+    process.exit(2);
+  }
+  const outcome = await safeNotify(registry.get(name), {
+    slug: "cronfish-alerts-test",
+    status: "test",
+    exit_code: 0,
+    duration_ms: 0,
+    started_at: new Date().toISOString(),
+    log_tail: "This is a cronfish alerts test ping.",
+    ui_url: cfg.ui?.public_url ?? null,
+  });
+  if (outcome.status === "sent") {
+    console.log(`[cronfish] alerts test: ${name} OK`);
+    return;
+  }
+  console.error(`[cronfish] alerts test: ${name} FAILED — ${outcome.error}`);
+  process.exit(1);
+}
+
 function cmdNext(slug?: string, n = 5): void {
   const { jobs } = discoverJobs(CRON_DIR);
   const targets = slug ? jobs.filter((j) => j.slug === slug) : jobs;
@@ -631,6 +688,19 @@ set -euo pipefail
 echo "[ping] hello from bash at $(date -u +%FT%TZ)"
 `;
 
+const INIT_WATCHDOG_SH = `#!/bin/bash
+# Cronfish watchdog — detects missed schedules and pings the configured alert
+# adapter. Safe to run frequently; one alert per missed window.
+# ---
+# description: "Cronfish missed-schedule watchdog"
+# schedule: "every 5 minutes"
+# enabled: false
+# timeout: 60
+# ---
+set -euo pipefail
+exec cronfish watchdog
+`;
+
 const GITIGNORE_BLOCK = "# cronfish\n.cronfish/\n";
 
 function ensureGitignoreBlock(): void {
@@ -656,6 +726,7 @@ function cmdInit(): void {
     ["hello.md", INIT_MD],
     ["touch.ts", INIT_TS],
     ["ping.sh", INIT_SH],
+    ["watchdog.sh", INIT_WATCHDOG_SH],
   ] as const) {
     const p = join(CRON_DIR, name);
     if (existsSync(p)) {
@@ -685,6 +756,8 @@ usage:
   cronfish delete <slug> --yes        bootout + remove plist + job file
   cronfish status [slug]              all jobs (no arg) or one slug's launchctl + log tail
   cronfish run <slug>                 invoke runner directly (no launchd)
+  cronfish watchdog                   check enabled jobs for missed schedules → fire alerts
+  cronfish alerts test [adapter]      send a test alert via the named (or default) adapter
   cronfish ui [--port N] [--host ADDR] [--no-open]  local web dashboard (default 127.0.0.1:4747)
   cronfish ui install [--port N] [--host ADDR]      install dashboard as a launchd daemon (auto-restart, runs at login)
   cronfish ui uninstall               bootout + remove dashboard daemon
@@ -746,6 +819,17 @@ async function main(): Promise<void> {
       if (!rest[0]) throw new Error("usage: cronfish run <slug>");
       await cmdRun(rest[0]);
       return;
+    case "watchdog":
+      await cmdWatchdog();
+      return;
+    case "alerts": {
+      if (rest[0] !== "test") {
+        console.error(`[cronfish] usage: cronfish alerts test [adapter]`);
+        process.exit(2);
+      }
+      await cmdAlertsTest(rest[1]);
+      return;
+    }
     case "ui": {
       const sub = rest[0];
       if (sub === "install") {
