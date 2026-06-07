@@ -31,9 +31,9 @@ export function chooseAdapterName(
   cfg: AlertsConfig | undefined,
 ): string | null {
   const fromJob = onFailure?.notify?.trim();
-  if (fromJob) return fromJob;
-  const dflt = cfg?.default?.trim();
-  if (dflt) return dflt;
+  if (fromJob) return fromJob === "none" ? null : fromJob;
+  const fromFleet = cfg?.on_failure?.notify?.trim();
+  if (fromFleet) return fromFleet === "none" ? null : fromFleet;
   return null;
 }
 

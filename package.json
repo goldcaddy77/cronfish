@@ -1,6 +1,6 @@
 {
   "name": "cronfish",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "description": "Drop a file. Cronfish does the rest. Markdown is a valid cron job.",
   "type": "module",
   "bin": {

@@ -138,6 +138,7 @@ a real schedule. Pure on-demand scripts that aren't scheduling candidates belong
   "bun_path": "/opt/homebrew/bin/bun",
   "ui": { "public_url": "https://mini.tail-xxx.ts.net:4747" },
   "alerts": {
+    "on_failure": { "notify": "slack" },
     "default": "slack",
     "slack": { "webhook_url_env": "CRONFISH_SLACK_WEBHOOK" },
     "shell": { "command": "/Users/you/bin/cronfish-pushover.sh" }
@@ -186,16 +187,26 @@ Adapters ship with cronfish:
 - **`slack`** — POSTs Block Kit to an incoming webhook. Reads the URL from the env var named in `alerts.slack.webhook_url_env` (default `CRONFISH_SLACK_WEBHOOK`).
 - **`shell`** — runs an arbitrary command from `alerts.shell.command` with the payload as env vars (`CRONFISH_ALERT_SLUG`, `…_STATUS`, `…_EXIT_CODE`, `…_DURATION_MS`, `…_STARTED_AT`, `…_UI_URL`, `…_LOG_TAIL`) plus the JSON payload on stdin. Use this for Pushover/ntfy/osascript.
 
-Per-job opt-in via frontmatter:
+Two knobs in `.cronfish.json`, two distinct jobs:
+
+- **`alerts.on_failure: { notify: "slack" }`** — fleet-wide default. When set, every scheduled job alerts via that adapter on failure unless its frontmatter says otherwise. When unset, jobs are silent by default.
+- **`alerts.default: "slack"`** — picks which adapter `cronfish alerts test` uses when invoked without an arg. Adapter-selection only; does NOT cause jobs to alert.
+
+Per-job overrides via frontmatter:
 
 ```yaml
 schedule: "every 5 minutes"
 on_failure:
-  notify: slack
-missed_after: 30m   # optional override of the watchdog's grace window
+  notify: slack          # opt in / pick a specific adapter for this job
+missed_after: 30m        # optional override of the watchdog's grace window
 ```
 
-When `on_failure` is absent, cronfish falls back to `alerts.default` from `.cronfish.json`. If neither is set, no alert fires (silent skip — the run is still recorded in the ledger with `alert_status='skipped'`).
+```yaml
+on_failure:
+  notify: none           # opt OUT of the fleet default for this job
+```
+
+Resolution order: per-job `notify` (including the `"none"` opt-out) → `alerts.on_failure.notify` → no alert (silent skip — recorded in the ledger as `alert_status='skipped'`).
 
 Failures inside the adapter never block the run: `alert_status='error'` and `alert_error` capture the reason; stderr gets one line. Manual `cronfish run <slug>` invocations do **not** fire alerts — that's the debugging path.
 
