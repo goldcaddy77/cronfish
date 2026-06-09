@@ -216,11 +216,79 @@ function killTree(pid: number | undefined): void {
 
 // --- Per-kind execution ---
 
+// Custom runner registry loaded from .cronfish.json. Each entry maps a
+// frontmatter `runner:` name to an executable script (resolved relative
+// to consumer root). When a .md job declares `runner: <name>`, we spawn
+// that script with the .md path as argv[2] instead of the default claude
+// CLI path. The script is responsible for parsing the frontmatter + body,
+// driving the model, and printing the __CRONFISH_RESULT_V1__ line.
+//
+// Failure-safe: malformed runners config logs a warning and falls back to
+// claude CLI for that run. A typo in .cronfish.json shouldn't brick every
+// .md cron.
+
+interface RunnerSpec {
+  path: string;
+}
+
+function loadRunners(): Record<string, RunnerSpec> {
+  const cfgPath = join(consumerRoot(), ".cronfish.json");
+  if (!existsSync(cfgPath)) return {};
+  try {
+    const raw = JSON.parse(readFileSync(cfgPath, "utf-8")) as {
+      runners?: Record<string, { path?: string }>;
+    };
+    const out: Record<string, RunnerSpec> = {};
+    for (const [name, spec] of Object.entries(raw.runners ?? {})) {
+      if (!spec?.path || typeof spec.path !== "string") continue;
+      out[name] = { path: spec.path };
+    }
+    return out;
+  } catch (e) {
+    warn(`runners config: ${(e as Error).message}`);
+    return {};
+  }
+}
+
+async function execMarkdownCustomRunner(
+  job: JobMeta,
+  spec: RunnerSpec,
+  fd: number,
+  timeoutS: number,
+): Promise<SpawnResult> {
+  const runnerPath = resolve(consumerRoot(), spec.path);
+  appendLog(
+    fd,
+    `[runner] kind=md runner=${job.runner} path=${runnerPath} timeout=${timeoutS}s`,
+  );
+  if (!existsSync(runnerPath)) {
+    appendLog(
+      fd,
+      `[runner] ERROR: runner script not found at ${runnerPath} — check .cronfish.json runners.${job.runner}.path`,
+    );
+    return { code: 1, timedOut: false };
+  }
+  return runSpawn(
+    { cmd: ["bun", runnerPath, job.path], cwd: consumerRoot() },
+    fd,
+    timeoutS,
+  );
+}
+
 async function execMarkdown(
   job: JobMeta,
   fd: number,
   timeoutS: number,
 ): Promise<SpawnResult> {
+  if (job.runner) {
+    const runners = loadRunners();
+    const spec = runners[job.runner];
+    if (spec) return execMarkdownCustomRunner(job, spec, fd, timeoutS);
+    appendLog(
+      fd,
+      `[runner] WARN: runner "${job.runner}" not in .cronfish.json#runners — falling back to claude CLI`,
+    );
+  }
   const raw = await Bun.file(job.path).text();
   const { parseFrontmatter } = await import("./frontmatter.ts");
   const { body } = parseFrontmatter(raw);

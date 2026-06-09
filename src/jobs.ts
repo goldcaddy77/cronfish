@@ -36,6 +36,11 @@ export interface JobMeta {
   description?: string;
   missed_after?: string;
   on_failure?: OnFailure;
+  // .md jobs only. When set, the .md is dispatched to a runner registered
+  // in `.cronfish.json#runners.<runner>.path` instead of the default
+  // claude-cli path. Lets a single .md format target multiple engines
+  // (claude CLI, Vercel AI SDK, future LangChain/Mastra, etc.).
+  runner?: string;
 }
 
 export class JobValidationError extends Error {
@@ -199,6 +204,7 @@ function fromMarkdown(path: string, slug: string): JobMeta {
     description: asString(path, "description", frontmatter.description),
     missed_after: asString(path, "missed_after", frontmatter.missed_after),
     on_failure: asOnFailure(path, nested.on_failure),
+    runner: asString(path, "runner", frontmatter.runner),
   };
 }
 
@@ -241,7 +247,10 @@ function fromShell(path: string, slug: string): JobMeta {
       throw new JobValidationError(path, e.message);
     throw e;
   }
-  if (Object.keys(frontmatter).length === 0 && Object.keys(nested).length === 0) {
+  if (
+    Object.keys(frontmatter).length === 0 &&
+    Object.keys(nested).length === 0
+  ) {
     throw new JobValidationError(
       path,
       `shell job needs a "# ---" frontmatter block at the top (with at least "schedule:")`,
