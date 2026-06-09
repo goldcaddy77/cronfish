@@ -21,7 +21,7 @@ import { dbPath, markDeleted, openDb, upsertJob } from "./db.ts";
 import { Database } from "bun:sqlite";
 import { startUiServer } from "./ui/server.ts";
 
-const VERSION = "0.8.0";
+const VERSION = "0.10.1";
 
 const CONSUMER_ROOT = process.env.CRONFISH_CONSUMER_ROOT || process.cwd();
 const CRON_DIR = join(CONSUMER_ROOT, "cron");
@@ -228,10 +228,36 @@ function shouldInstall(job: JobMeta): {
   return { ok: true, dispatched: d };
 }
 
+function loadRunnerNames(): Set<string> {
+  const cfgPath = join(CONSUMER_ROOT, ".cronfish.json");
+  if (!existsSync(cfgPath)) return new Set();
+  try {
+    const raw = JSON.parse(readFileSync(cfgPath, "utf-8")) as {
+      runners?: Record<string, { path?: string }>;
+    };
+    return new Set(Object.keys(raw.runners ?? {}));
+  } catch {
+    return new Set();
+  }
+}
+
 function cmdSync(): void {
   const p = platform();
   const { jobs, errors } = discoverJobs(CRON_DIR);
   for (const e of errors) console.error(`[cronfish] ${e.path}: ${e.message}`);
+
+  // Warn loudly when a .md job declares a runner that isn't registered in
+  // .cronfish.json#runners. Runtime hard-fails anyway (see runner.ts), but
+  // catching the typo at sync time is friendlier than at 3am.
+  const knownRunners = loadRunnerNames();
+  for (const j of jobs) {
+    if (j.runner && !knownRunners.has(j.runner)) {
+      const known = [...knownRunners].join(", ") || "(none)";
+      console.error(
+        `[cronfish] WARN ${j.slug}: runner "${j.runner}" not in .cronfish.json#runners — known: ${known}`,
+      );
+    }
+  }
 
   const state = rememberPrefix(CONSUMER_ROOT, PREFIX);
   const desired = new Map<string, JobMeta>();
@@ -581,9 +607,8 @@ async function cmdWatchdog(): Promise<void> {
 }
 
 async function cmdAlertsTest(adapterName?: string): Promise<void> {
-  const { loadConsumerAlertsConfig, buildRegistry, safeNotify } = await import(
-    "./alerts/index.ts"
-  );
+  const { loadConsumerAlertsConfig, buildRegistry, safeNotify } =
+    await import("./alerts/index.ts");
   const cfg = loadConsumerAlertsConfig(CONSUMER_ROOT);
   const name = adapterName ?? cfg.alerts?.default;
   if (!name) {

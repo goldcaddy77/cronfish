@@ -284,10 +284,16 @@ async function execMarkdown(
     const runners = loadRunners();
     const spec = runners[job.runner];
     if (spec) return execMarkdownCustomRunner(job, spec, fd, timeoutS);
+    // Hard-fail rather than fall back to claude CLI. The cron's prompt
+    // is shaped for a specific runner; sending an ai-sdk-shaped prompt
+    // (with tool-call protocol the CLI doesn't speak) through claude CLI
+    // can corrupt vault files. Better to alert than to silently misroute.
+    const known = Object.keys(runners).join(", ") || "(none)";
     appendLog(
       fd,
-      `[runner] WARN: runner "${job.runner}" not in .cronfish.json#runners — falling back to claude CLI`,
+      `[runner] ERROR: runner "${job.runner}" not in .cronfish.json#runners — known: ${known}. Refusing to fall back to claude CLI.`,
     );
+    return { code: 2, timedOut: false };
   }
   const raw = await Bun.file(job.path).text();
   const { parseFrontmatter } = await import("./frontmatter.ts");
