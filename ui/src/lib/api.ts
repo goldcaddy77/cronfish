@@ -38,7 +38,6 @@ export interface Invocation {
   status: InvocationStatus;
   exit_code: number | null;
   trigger: "schedule" | "manual" | "retry";
-  log_path: string;
   duration_ms: number | null;
   slug?: string;
   result_summary: string | null;

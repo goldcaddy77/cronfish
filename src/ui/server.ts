@@ -301,6 +301,16 @@ function getJob(consumerRoot: string, slug: string): unknown {
   }
 }
 
+// log_path holds an absolute filesystem path on the host (e.g.
+// /Users/<user>/...) — strip it from API responses so consumers that proxy
+// the dashboard to the public internet don't leak host paths. The bytes are
+// still served via /api/invocations/:id/log, which looks log_path up
+// server-side.
+function stripLogPath<T extends { log_path?: string }>(row: T): Omit<T, "log_path"> {
+  const { log_path: _, ...rest } = row;
+  return rest;
+}
+
 function listInvocations(
   consumerRoot: string,
   slug: string,
@@ -326,7 +336,7 @@ function listInvocations(
       `,
       )
       .all(slug, limit);
-    return rows;
+    return rows.map(stripLogPath);
   } finally {
     db.close();
   }
@@ -355,7 +365,7 @@ function listAllInvocations(consumerRoot: string, limit: number): unknown {
       `,
       )
       .all(limit);
-    return rows;
+    return rows.map(stripLogPath);
   } finally {
     db.close();
   }
@@ -383,7 +393,7 @@ function getInvocation(consumerRoot: string, id: number): unknown {
       `,
       )
       .get(id);
-    return row ?? null;
+    return row ? stripLogPath(row) : null;
   } finally {
     db.close();
   }
