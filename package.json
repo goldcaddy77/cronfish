@@ -1,7 +1,7 @@
 {
   "name": "cronfish",
   "version": "0.11.0",
-  "description": "Drop a file. Cronfish does the rest. Markdown is a valid cron job.",
+  "description": "A file-based job scheduler for macOS. Drop a script in a folder; launchd runs it on a schedule.",
   "type": "module",
   "bin": {
     "cronfish": "./src/cli.ts"
