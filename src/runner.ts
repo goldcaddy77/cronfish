@@ -36,6 +36,16 @@ import {
 } from "./db.ts";
 import { loadJob, slugFromPath, type JobMeta } from "./jobs.ts";
 import { resolveModel, localClaudeEnv } from "./models.ts";
+import {
+  archiveOneTime,
+  releaseFlock,
+  setTsExecutedAt,
+  tryFlockExclusive,
+  writeAndFsync,
+  writeSentinel,
+  type FlockHandle,
+} from "./oneTime.ts";
+import { setFrontmatterKey, setShellFrontmatterKey } from "./frontmatter.ts";
 import { parseLastResult } from "./result.ts";
 import {
   alertStatusFor,
@@ -476,6 +486,60 @@ async function tryParseResult(
   }
 }
 
+// --- One-shot completion ---
+//
+// On any termination of a one-time job (success or failure), stamp
+// `executed_at: <ISO>` into the source file's frontmatter, fsync, and
+// move the file to ~/Library/Application Support/cronfish/done/. The
+// flock + executed_at re-fire guard depends on this write landing before
+// the file is archived. Failures here surface as sentinels but never
+// crash the runner.
+
+function stampExecutedAt(job: JobMeta, iso: string): void {
+  if (!existsSync(job.path)) return;
+  const raw = readFileSync(job.path, "utf-8");
+  let next: string;
+  if (job.kind === "md") {
+    next = setFrontmatterKey(raw, "executed_at", iso);
+  } else if (job.kind === "sh") {
+    next = setShellFrontmatterKey(raw, "executed_at", iso);
+  } else {
+    next = setTsExecutedAt(raw, iso);
+  }
+  writeAndFsync(job.path, next);
+}
+
+function completeOneTime(job: JobMeta, fd: number): void {
+  if (!job.oneTime) return;
+  const iso = new Date().toISOString();
+  try {
+    stampExecutedAt(job, iso);
+  } catch (e) {
+    appendLog(fd, `[runner] one-time: stampExecutedAt failed: ${(e as Error).message}`);
+    try {
+      writeSentinel(
+        join(consumerRoot(), "cron"),
+        job.slug,
+        `stampExecutedAt failed: ${(e as Error).message}`,
+      );
+    } catch {}
+    return;
+  }
+  try {
+    const dest = archiveOneTime(job.path);
+    appendLog(fd, `[runner] one-time: archived to ${dest}`);
+  } catch (e) {
+    appendLog(fd, `[runner] one-time: archive failed: ${(e as Error).message}`);
+    try {
+      writeSentinel(
+        join(consumerRoot(), "cron"),
+        job.slug,
+        `archive failed: ${(e as Error).message}`,
+      );
+    } catch {}
+  }
+}
+
 // --- Top-level orchestration ---
 
 async function main(): Promise<void> {
@@ -497,12 +561,47 @@ async function main(): Promise<void> {
 
   const cronDir = join(consumerRoot(), "cron");
   const slug = existsSync(cronDir) ? slugFromPath(cronDir, abs) : undefined;
-  const job = loadJob(abs, slug);
+  const job = loadJob(abs, slug, cronDir);
   const timeoutS = job.timeout ?? DEFAULT_TIMEOUT_S;
   const retries = job.retries ?? 0;
   const trigger: InvocationTrigger =
     (process.env.CRONFISH_TRIGGER as InvocationTrigger | undefined) ??
     "schedule";
+
+  // One-time re-fire guard: flock the source file + re-check executed_at.
+  // Both checks must happen before any work, so launchd retries / system
+  // unsleep / crash recovery can't double-fire the job. Lock is held for
+  // the lifetime of this process; release is implicit on exit.
+  let oneTimeLock: FlockHandle | null = null;
+  if (job.oneTime) {
+    if (job.executedAt) {
+      console.log(
+        `[runner] one-time: ${job.slug} already executed at ${job.executedAt} — exit`,
+      );
+      process.exit(0);
+    }
+    oneTimeLock = tryFlockExclusive(abs);
+    if (!oneTimeLock) {
+      console.log(
+        `[runner] one-time: ${job.slug} lock held by another process — exit`,
+      );
+      process.exit(0);
+    }
+    // Re-parse under lock — the file could have been stamped between
+    // discovery and lock acquisition.
+    try {
+      const fresh = loadJob(abs, slug, cronDir);
+      if (fresh.executedAt) {
+        console.log(
+          `[runner] one-time: ${job.slug} stamped under-lock at ${fresh.executedAt} — exit`,
+        );
+        releaseFlock(oneTimeLock);
+        process.exit(0);
+      }
+    } catch {
+      // re-parse failed; proceed with the original meta.
+    }
+  }
 
   if (job.concurrency) {
     const got = await waitForLock(job.slug, job.concurrency, timeoutS);
@@ -559,6 +658,7 @@ async function main(): Promise<void> {
       sig === "SIGTERM" ? 143 : 130,
     );
     if (job.concurrency) releaseLock(job.slug);
+    if (oneTimeLock) releaseFlock(oneTimeLock);
     process.exit(sig === "SIGTERM" ? 143 : 130);
   };
   process.on("SIGTERM", cleanup);
@@ -589,6 +689,12 @@ async function main(): Promise<void> {
   } finally {
     const dur = ((Date.now() - start) / 1000).toFixed(1);
     appendLog(fd, `\n[runner] exit=${lastResult.code} duration=${dur}s`);
+    // One-time completion: write executed_at + archive BEFORE we close the
+    // log fd, so the archive line lands in the log. Then release flock.
+    if (job.oneTime) {
+      completeOneTime(job, fd);
+      if (oneTimeLock) releaseFlock(oneTimeLock);
+    }
     closeSync(fd);
     if (job.concurrency) releaseLock(job.slug);
     const status: InvocationStatus = crashed

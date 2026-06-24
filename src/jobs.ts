@@ -14,6 +14,11 @@ import {
   type Scalar,
   type TsJobConfigShape,
 } from "./frontmatter.ts";
+import {
+  DEFAULT_GRACE_SECONDS,
+  isOneTimePath,
+  parseRunAt,
+} from "./oneTime.ts";
 
 export type JobKind = "md" | "ts" | "sh";
 export type Concurrency = "skip" | "queue";
@@ -41,6 +46,11 @@ export interface JobMeta {
   // claude-cli path. Lets a single .md format target multiple engines
   // (claude CLI, Vercel AI SDK, future LangChain/Mastra, etc.).
   runner?: string;
+  // One-shot scheduled jobs (files under `cron/one-time/`).
+  oneTime?: boolean;
+  runAtMs?: number;
+  graceSeconds?: number;
+  executedAt?: string;
 }
 
 export class JobValidationError extends Error {
@@ -178,7 +188,70 @@ function asOnFailure(
   return out;
 }
 
-function fromMarkdown(path: string, slug: string): JobMeta {
+// Apply one-time fields and validate the schedule/run_at exclusivity rule.
+// Mutates the meta in place. Throws on validation errors.
+function applyOneTime(
+  meta: JobMeta,
+  isOneTime: boolean,
+  runAtRaw: Scalar | undefined,
+  graceRaw: Scalar | undefined,
+  executedAtRaw: Scalar | undefined,
+): void {
+  if (!isOneTime) {
+    if (runAtRaw !== undefined) {
+      throw new JobValidationError(
+        meta.path,
+        `run_at is only valid inside cron/one-time/`,
+      );
+    }
+    return;
+  }
+  meta.oneTime = true;
+  if (meta.schedule !== undefined) {
+    throw new JobValidationError(
+      meta.path,
+      `one-time job must NOT set "schedule"; use "run_at" instead`,
+    );
+  }
+  if (runAtRaw === undefined) {
+    throw new JobValidationError(
+      meta.path,
+      `one-time job missing required "run_at" (ISO timestamp or "+N{s,m,h,d}")`,
+    );
+  }
+  let mtimeMs: number;
+  try {
+    mtimeMs = statSync(meta.path).mtimeMs;
+  } catch {
+    mtimeMs = Date.now();
+  }
+  try {
+    meta.runAtMs = parseRunAt(runAtRaw, mtimeMs);
+  } catch (e) {
+    throw new JobValidationError(meta.path, (e as Error).message);
+  }
+  if (graceRaw === undefined) {
+    meta.graceSeconds = DEFAULT_GRACE_SECONDS;
+  } else if (typeof graceRaw === "number" && Number.isInteger(graceRaw) && graceRaw >= 0) {
+    meta.graceSeconds = graceRaw;
+  } else {
+    throw new JobValidationError(
+      meta.path,
+      `grace_seconds must be a non-negative integer, got: ${graceRaw}`,
+    );
+  }
+  if (executedAtRaw !== undefined) {
+    if (typeof executedAtRaw !== "string") {
+      throw new JobValidationError(
+        meta.path,
+        `executed_at must be a string, got ${typeof executedAtRaw}`,
+      );
+    }
+    meta.executedAt = executedAtRaw;
+  }
+}
+
+function fromMarkdown(path: string, slug: string, isOneTime: boolean): JobMeta {
   const raw = readFileSync(path, "utf-8");
   let frontmatter: Record<string, Scalar>;
   let nested: Record<string, Record<string, Scalar>>;
@@ -191,7 +264,7 @@ function fromMarkdown(path: string, slug: string): JobMeta {
       throw new JobValidationError(path, e.message);
     throw e;
   }
-  return {
+  const meta: JobMeta = {
     slug,
     path,
     kind: "md",
@@ -206,9 +279,17 @@ function fromMarkdown(path: string, slug: string): JobMeta {
     on_failure: asOnFailure(path, nested.on_failure),
     runner: asString(path, "runner", frontmatter.runner),
   };
+  applyOneTime(
+    meta,
+    isOneTime,
+    frontmatter.run_at,
+    frontmatter.grace_seconds,
+    frontmatter.executed_at,
+  );
+  return meta;
 }
 
-function fromTypescript(path: string, slug: string): JobMeta {
+function fromTypescript(path: string, slug: string, isOneTime: boolean): JobMeta {
   const source = readFileSync(path, "utf-8");
   let cfg: TsJobConfigShape;
   try {
@@ -218,7 +299,7 @@ function fromTypescript(path: string, slug: string): JobMeta {
       throw new JobValidationError(path, e.message);
     throw e;
   }
-  return {
+  const meta: JobMeta = {
     slug,
     path,
     kind: "ts",
@@ -232,9 +313,11 @@ function fromTypescript(path: string, slug: string): JobMeta {
     missed_after: cfg.missed_after,
     on_failure: asOnFailure(path, cfg.on_failure),
   };
+  applyOneTime(meta, isOneTime, cfg.run_at, cfg.grace_seconds, cfg.executed_at);
+  return meta;
 }
 
-function fromShell(path: string, slug: string): JobMeta {
+function fromShell(path: string, slug: string, isOneTime: boolean): JobMeta {
   const raw = readFileSync(path, "utf-8");
   let frontmatter: Record<string, Scalar>;
   let nested: Record<string, Record<string, Scalar>>;
@@ -256,7 +339,7 @@ function fromShell(path: string, slug: string): JobMeta {
       `shell job needs a "# ---" frontmatter block at the top (with at least "schedule:")`,
     );
   }
-  return {
+  const meta: JobMeta = {
     slug,
     path,
     kind: "sh",
@@ -269,14 +352,27 @@ function fromShell(path: string, slug: string): JobMeta {
     missed_after: asString(path, "missed_after", frontmatter.missed_after),
     on_failure: asOnFailure(path, nested.on_failure),
   };
+  applyOneTime(
+    meta,
+    isOneTime,
+    frontmatter.run_at,
+    frontmatter.grace_seconds,
+    frontmatter.executed_at,
+  );
+  return meta;
 }
 
-export function loadJob(absPath: string, slug?: string): JobMeta {
+export function loadJob(
+  absPath: string,
+  slug?: string,
+  cronDir?: string,
+): JobMeta {
   const ext = extname(absPath);
   const s = slug ?? slugOf(absPath);
-  if (ext === ".md") return fromMarkdown(absPath, s);
-  if (ext === ".ts") return fromTypescript(absPath, s);
-  if (ext === ".sh") return fromShell(absPath, s);
+  const isOneTime = cronDir ? isOneTimePath(cronDir, absPath) : false;
+  if (ext === ".md") return fromMarkdown(absPath, s, isOneTime);
+  if (ext === ".ts") return fromTypescript(absPath, s, isOneTime);
+  if (ext === ".sh") return fromShell(absPath, s, isOneTime);
   throw new JobValidationError(absPath, `unsupported extension ${ext}`);
 }
 
@@ -301,6 +397,9 @@ function walkJobFiles(cronDir: string): string[] {
         continue;
       }
       if (st.isDirectory()) {
+        // Skip the sentinel folder cronfish writes to under cron/. Anything
+        // else (including nested project folders) is recursed.
+        if (name === ".errors") continue;
         visit(full);
         continue;
       }
@@ -324,7 +423,7 @@ export function discoverJobs(cronDir: string): {
   const errors: { path: string; message: string }[] = [];
   for (const p of entries) {
     try {
-      jobs.push(loadJob(p, slugFromPath(cronDir, p)));
+      jobs.push(loadJob(p, slugFromPath(cronDir, p), cronDir));
     } catch (e) {
       errors.push({ path: p, message: (e as Error).message });
     }

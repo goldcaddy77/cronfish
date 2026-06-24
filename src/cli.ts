@@ -15,13 +15,14 @@ import { basename, join } from "node:path";
 import { setFrontmatterKey, setShellFrontmatterKey } from "./frontmatter.ts";
 import { discoverJobs, findJobFile, loadJob, type JobMeta } from "./jobs.ts";
 import { dispatchSchedule, type Dispatched } from "./schedule.ts";
+import { resolveOneTime, writeSentinel } from "./oneTime.ts";
 import { platform } from "./platform/index.ts";
 import { loadState, rememberPrefix } from "./state.ts";
 import { dbPath, markDeleted, openDb, upsertJob } from "./db.ts";
 import { Database } from "bun:sqlite";
 import { startUiServer } from "./ui/server.ts";
 
-const VERSION = "0.10.1";
+const VERSION = "0.11.0";
 
 const CONSUMER_ROOT = process.env.CRONFISH_CONSUMER_ROOT || process.cwd();
 const CRON_DIR = join(CONSUMER_ROOT, "cron");
@@ -218,6 +219,26 @@ function shouldInstall(job: JobMeta): {
   dispatched?: Dispatched;
 } {
   if (!job.enabled) return { ok: false, reason: "disabled" };
+  if (job.oneTime) {
+    if (job.runAtMs === undefined) {
+      return { ok: false, reason: "one-time: missing run_at" };
+    }
+    const status = resolveOneTime(
+      job.runAtMs,
+      job.graceSeconds ?? 0,
+      Date.now(),
+      job.executedAt,
+    );
+    if (status.kind === "executed") {
+      return { ok: false, reason: "one-time: already executed" };
+    }
+    if (status.kind === "past-grace") {
+      return { ok: false, reason: `one-time past grace: ${status.reason}` };
+    }
+    // fire-now and scheduled are both installable; launchd.render handles
+    // the plist shape via the JobMeta.oneTime fields directly.
+    return { ok: true };
+  }
   let d: Dispatched;
   try {
     d = dispatchSchedule(job.schedule);
@@ -244,7 +265,16 @@ function loadRunnerNames(): Set<string> {
 function cmdSync(): void {
   const p = platform();
   const { jobs, errors } = discoverJobs(CRON_DIR);
-  for (const e of errors) console.error(`[cronfish] ${e.path}: ${e.message}`);
+  for (const e of errors) {
+    console.error(`[cronfish] ${e.path}: ${e.message}`);
+    // Bad YAML / invalid run_at on a one-time file → sentinel. Any other
+    // discovery error lands in the .errors folder too if it's under
+    // cron/one-time/ since silent-skip is the failure mode we're killing.
+    if (e.path.includes(`/${"one-time"}/`)) {
+      const slug = e.path.split("/").pop() ?? "unknown";
+      writeSentinel(CRON_DIR, slug, `discovery error: ${e.message}`);
+    }
+  }
 
   // Warn loudly when a .md job declares a runner that isn't registered in
   // .cronfish.json#runners. Runtime hard-fails anyway (see runner.ts), but
@@ -270,9 +300,13 @@ function cmdSync(): void {
     } else if (
       decision.reason &&
       decision.reason !== "disabled" &&
-      decision.reason !== "manual"
+      decision.reason !== "manual" &&
+      decision.reason !== "one-time: already executed"
     ) {
       console.error(`[cronfish] ${j.slug}: ${decision.reason}`);
+      if (j.oneTime && decision.reason?.startsWith("one-time past grace:")) {
+        writeSentinel(CRON_DIR, j.slug, decision.reason);
+      }
     }
   }
 
@@ -439,7 +473,7 @@ async function cmdRun(slug: string): Promise<void> {
   const path = findJobFile(CRON_DIR, slug);
   if (!path) throw new Error(`no job file for slug "${slug}"`);
   // Validate before spawning.
-  loadJob(path);
+  loadJob(path, undefined, CRON_DIR);
   const runnerTs = new URL("./runner.ts", import.meta.url).pathname;
   const proc = Bun.spawn(["bun", runnerTs, path], {
     stdout: "inherit",

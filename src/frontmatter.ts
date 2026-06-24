@@ -200,6 +200,10 @@ export interface TsJobConfigShape {
   description?: string;
   missed_after?: string;
   on_failure?: Record<string, Scalar>;
+  // one-time jobs (cron/one-time/)
+  run_at?: string | number;
+  grace_seconds?: number;
+  executed_at?: string;
 }
 
 function extractConfigBlock(source: string): string | null {
@@ -332,6 +336,24 @@ export function parseTsJobConfig(source: string): TsJobConfigShape {
   }
   const onFailure = pickNestedObjectFromConfig(body, "on_failure");
   if (onFailure !== undefined) cfg.on_failure = onFailure;
+  const runAt = pickFromConfig(body, "run_at");
+  if (runAt !== undefined) {
+    const u = runAt.replace(/^['"`]|['"`]$/g, "");
+    cfg.run_at = /^-?\d+$/.test(u) ? parseInt(u, 10) : u;
+  }
+  const graceSeconds = pickFromConfig(body, "grace_seconds");
+  if (graceSeconds !== undefined) {
+    if (!/^\d+$/.test(graceSeconds)) {
+      throw new FrontmatterError(
+        `grace_seconds must be a non-negative integer, got: ${graceSeconds}`,
+      );
+    }
+    cfg.grace_seconds = parseInt(graceSeconds, 10);
+  }
+  const executedAt = pickFromConfig(body, "executed_at");
+  if (executedAt !== undefined) {
+    cfg.executed_at = executedAt.replace(/^['"`]|['"`]$/g, "");
+  }
   return cfg;
 }
 
