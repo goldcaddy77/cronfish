@@ -296,12 +296,46 @@ cronfish ui install --host 0.0.0.0
 ```
 cron/<slug>.{md,ts,sh}                              # job files (you write these)
 ~/Library/LaunchAgents/<prefix>.<slug>.plist        # launchd registration
-<consumer>/tmp/cron/<slug>/<ISO>.log                # per-run log
-<consumer>/tmp/cron/<slug>/runner.pid               # concurrency lock
+<consumer>/.cronfish/logs/<slug>/<id>.log           # per-run log
+<consumer>/.cronfish/locks/<slug>/runner.pid        # concurrency lock
+<consumer>/.cronfish/db.sqlite                       # run ledger (history, metrics)
 ```
 
-Per-run logs are not pruned — they accumulate under `tmp/cron/`. Add `tmp/` to `.gitignore`, and
-clean old logs yourself (a `find … -mtime` cron works) if disk matters.
+`.cronfish/` is created automatically; add it to `.gitignore`.
+
+### Log retention
+
+Per-run logs accumulate forever — on an always-on machine that grows unbounded. `cronfish prune`
+deletes old ones:
+
+```
+cronfish prune                       # prune every slug per retention config
+cronfish prune <slug>                # prune one slug
+cronfish prune --dry-run             # show what would go, delete nothing
+cronfish prune --max-age-days 14     # ad-hoc override (ignores config)
+cronfish prune --max-runs 50         # keep only the 50 newest logs per slug
+```
+
+With no config and no flags, `prune` falls back to `max_age_days: 30`. Configure retention in
+`.cronfish.json` to set a policy — and `sync` will then auto-prune on every run:
+
+```json
+{
+  "retention": {
+    "max_age_days": 30,
+    "max_runs": 100,
+    "per_slug": {
+      "noisy-job-md": { "max_runs": 20 }
+    }
+  }
+}
+```
+
+`max_age_days` deletes logs older than N days; `max_runs` keeps only the N newest per slug; set both
+and a log is pruned if it fails *either*. A `per_slug` entry fully replaces the global policy for
+that slug. Auto-prune on `sync` is opt-in: it runs only when `retention` is set, so an unconfigured
+repo never silently loses logs. The run ledger (`db.sqlite`) and the dashboard's `ui.log` are left
+untouched — only per-run log files are pruned.
 
 ## Retries & concurrency
 
