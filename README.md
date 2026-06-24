@@ -23,6 +23,12 @@ the path is the slug. You also get per-run logs, retries, concurrency guards, fa
 fire-once jobs, and a dashboard, with no registration step. See [`examples/`](./examples) for a
 copy-pasteable job of every kind.
 
+<p align="center">
+  <img src="assets/cronfish-dashboard.png" alt="cronfish dashboard — the jobs view, showing each job's schedule, last-run status, and timing" width="900">
+</p>
+
+<p align="center"><em>The built-in dashboard (<code>cronfish ui</code>): every job cronfish has seen, with its latest run.</em></p>
+
 ## Quickstart
 
 ```bash
