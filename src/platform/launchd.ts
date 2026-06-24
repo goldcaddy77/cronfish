@@ -48,6 +48,70 @@ function sh(cmd: string[]): { code: number; out: string; err: string } {
   };
 }
 
+// --- .env preservation ---
+//
+// Per spec: every plist's EnvironmentVariables block should carry the
+// consumer's .env so .md/.sh runs (which don't go through bun's
+// auto-loader) can still reach postgres / Linear / Slack tokens. Failure
+// to parse .env is non-fatal — we surface to stderr and continue.
+
+function parseDotEnv(text: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.replace(/^\s+/, "");
+    if (!line || line.startsWith("#")) continue;
+    const eq = line.indexOf("=");
+    if (eq < 0) continue;
+    const key = line.slice(0, eq).trim();
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue;
+    let val = line.slice(eq + 1);
+    // strip surrounding quotes (single or double) if balanced
+    const trimmed = val.trim();
+    if (
+      (trimmed.startsWith('"') && trimmed.endsWith('"')) ||
+      (trimmed.startsWith("'") && trimmed.endsWith("'"))
+    ) {
+      val = trimmed.slice(1, -1);
+    } else {
+      // strip inline `#` comments only for unquoted values
+      const hash = val.search(/\s#/);
+      if (hash >= 0) val = val.slice(0, hash);
+      val = val.trim();
+    }
+    out[key] = val;
+  }
+  return out;
+}
+
+function loadConsumerEnv(consumerRoot: string): Record<string, string> {
+  const path = join(consumerRoot, ".env");
+  if (!existsSync(path)) return {};
+  try {
+    return parseDotEnv(readFileSync(path, "utf-8"));
+  } catch (e) {
+    console.error(
+      `[cronfish] .env parse failed (${path}): ${(e as Error).message}`,
+    );
+    return {};
+  }
+}
+
+function escapeXml(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+function renderEnvBlock(env: Record<string, string>): string {
+  const lines: string[] = [];
+  for (const [k, v] of Object.entries(env)) {
+    lines.push(`        <key>${escapeXml(k)}</key>`);
+    lines.push(`        <string>${escapeXml(v)}</string>`);
+  }
+  return lines.join("\n");
+}
+
 function calendarBlock(cronExpr: string): string {
   const [m, h, dom, mon, dow] = cronExpr.split(/\s+/);
   const fields: [string, string][] = [
@@ -132,11 +196,32 @@ function plistPathFor(label: string): string {
   return join(LAUNCH_AGENTS, `${label}.plist`);
 }
 
-export function render(job: JobMeta, cfg: LaunchdConfig): LaunchdRender {
-  const d = dispatchSchedule(job.schedule);
-  if (d.kind === "manual") {
-    throw new Error(`render: ${job.slug} is manual — should not be installed`);
+function oneTimeScheduleBlock(job: JobMeta): { block: string; runAtLoad: boolean } {
+  if (job.runAtMs === undefined) {
+    throw new Error(`one-time job ${job.slug} missing runAtMs`);
   }
+  const ageMs = Date.now() - job.runAtMs;
+  if (ageMs >= -1000) {
+    // Within grace — fire on bootstrap. Omit StartCalendarInterval entirely
+    // so launchd doesn't repeat on the next calendar match.
+    return { block: "", runAtLoad: true };
+  }
+  // Future — match the exact minute/hour/day/month. Annual recurrence is
+  // theoretically possible but the runner's flock + executed_at guard
+  // (and archive on success) prevents a second fire.
+  const d = new Date(job.runAtMs);
+  const inner =
+    `        <key>Minute</key>\n        <integer>${d.getMinutes()}</integer>\n` +
+    `        <key>Hour</key>\n        <integer>${d.getHours()}</integer>\n` +
+    `        <key>Day</key>\n        <integer>${d.getDate()}</integer>\n` +
+    `        <key>Month</key>\n        <integer>${d.getMonth() + 1}</integer>`;
+  return {
+    block: `    <key>StartCalendarInterval</key>\n    <dict>\n${inner}\n    </dict>`,
+    runAtLoad: false,
+  };
+}
+
+export function render(job: JobMeta, cfg: LaunchdConfig): LaunchdRender {
   const bunDir = findBunDir(cfg.bunPath);
   if (!bunDir) {
     if (cfg.bunPath) {
@@ -153,16 +238,43 @@ export function render(job: JobMeta, cfg: LaunchdConfig): LaunchdRender {
     ...DEFAULT_PATH_DIRS.filter((d) => d !== bunDir),
   ].join(":");
   const label = labelFor(cfg.bundlePrefix, job.slug);
+
+  let schedBlock: string;
+  let runAtLoad: boolean;
+  if (job.oneTime) {
+    const r = oneTimeScheduleBlock(job);
+    schedBlock = r.block;
+    runAtLoad = r.runAtLoad;
+  } else {
+    const d = dispatchSchedule(job.schedule);
+    if (d.kind === "manual") {
+      throw new Error(`render: ${job.slug} is manual — should not be installed`);
+    }
+    schedBlock = scheduleBlock(d);
+    runAtLoad = false;
+  }
+
+  // Build EnvironmentVariables block: required keys + consumer .env merged
+  // in. Required keys win over .env if a collision occurs (HOME etc.).
+  const required: Record<string, string> = {
+    HOME: homedir(),
+    CRONFISH_CONSUMER_ROOT: cfg.consumerRoot,
+    PATH: pathEnv,
+  };
+  const consumerEnv = loadConsumerEnv(cfg.consumerRoot);
+  const merged: Record<string, string> = { ...consumerEnv, ...required };
+  const envBlock = renderEnvBlock(merged);
+
   const tmpl = readFileSync(TEMPLATE, "utf-8");
   const contents = tmpl
     .replace(/__LABEL__/g, label)
     .replace(/__CONSUMER_ROOT__/g, cfg.consumerRoot)
-    .replace(/__HOME__/g, homedir())
     .replace(/__JOB_PATH__/g, job.path)
     .replace(/__SLUG__/g, job.slug)
     .replace(/__RUNNER_TS__/g, RUNNER_TS)
-    .replace(/__PATH__/g, pathEnv)
-    .replace("__SCHEDULE_BLOCK__", scheduleBlock(d));
+    .replace("__SCHEDULE_BLOCK__", schedBlock)
+    .replace("__RUN_AT_LOAD__", runAtLoad ? "true" : "false")
+    .replace("__ENV_BLOCK__", envBlock);
   return { label, plistPath: plistPathFor(label), contents };
 }
 

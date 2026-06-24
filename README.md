@@ -116,6 +116,48 @@ will hallucinate tool calls. Use 14B+ for any agentic loop; 32B is the practical
 multi-step work. Local providers serve one request at a time — set `concurrency: queue` on
 overlapping jobs.
 
+## One-shot jobs — `cron/one-time/`
+
+Drop a `.md`, `.ts`, or `.sh` under `cron/one-time/` to schedule a job that
+fires **exactly once** at a `run_at` timestamp, then archives itself. Same
+file format as recurring jobs except `schedule:` is replaced by `run_at:`.
+
+```yaml
+---
+run_at: 2026-06-25T15:00:00-04:00   # absolute ISO, OR
+run_at: "+30s"                      # relative to file mtime (s|m|h|d)
+grace_seconds: 300                  # optional override; default 300 (5 min)
+---
+```
+
+Sync behavior:
+
+| `run_at` vs. now              | What happens                                      |
+| ----------------------------- | ------------------------------------------------- |
+| Future                        | plist installed with `StartCalendarInterval` for the exact minute |
+| Within `grace_seconds` of now | plist installed with `RunAtLoad: true` — fires on bootstrap |
+| Past `grace_seconds`          | **refused**; sentinel written to `cron/.errors/`  |
+| `executed_at:` already set    | skipped (file should already be archived)         |
+
+On every fire the runner takes a `flock(LOCK_EX|LOCK_NB)` on the source file,
+re-checks `executed_at` under lock, runs the job, then writes
+`executed_at: <ISO>` (with `fsync`) and **moves the file to
+`~/Library/Application Support/cronfish/done/`** — outside the repo so the
+audit trail doesn't bloat git. The next `cronfish sync` removes the orphaned
+plist.
+
+**One-time jobs must be idempotent.** launchd can re-fire on machine restart,
+system unsleep, or load spikes; the flock + `executed_at` guard catches the
+double-fire, but only after the file is stamped. Anything destructive between
+"start" and "stamp" can repeat. Write handlers that tolerate two invocations.
+
+**Failure surface — `cron/.errors/`.** Any sync-time refusal (past-grace, bad
+YAML, missing `run_at`) writes a sentinel file there with the slug, timestamp,
+and reason. Runner-side failures (archive failed, executed_at write failed)
+also land here. Wire a heartbeat cron to alert on non-empty.
+
+Smoke-test template: `templates/_examples/one-time/echo-at.md`.
+
 ## `schedule:` — one key, five shapes
 
 | Input                     | Meaning                                       |
@@ -250,6 +292,17 @@ cron/<slug>.{md,ts,sh}                              # job files (you write these
   capped at 60s). Retry lines append to the same log.
 - `concurrency: skip` — if a prior run is still in flight, exit 0 immediately.
 - `concurrency: queue` — poll every 2s for the lock, up to the job's `timeout`.
+
+## `.env` is baked into every plist
+
+At `cronfish sync`, every plist's `EnvironmentVariables` block is populated
+with the consumer's `.env` plus the required keys (`HOME`,
+`CRONFISH_CONSUMER_ROOT`, `PATH`). This is what lets `.md` and `.sh` runs
+(which bypass bun's auto-`.env` loader) reach postgres, Linear, Slack, etc.
+
+Required keys win on collision. Quoted values are unquoted; `#` is treated as
+an inline comment only on unquoted values. Re-run `cronfish sync` after
+editing `.env` so the plists pick up the new values.
 
 ## How cronfish finds bun
 

@@ -19,7 +19,7 @@
 __SCHEDULE_BLOCK__
 
     <key>RunAtLoad</key>
-    <false/>
+    <__RUN_AT_LOAD__/>
 
     <key>StandardOutPath</key>
     <string>__CONSUMER_ROOT__/tmp/cron/__SLUG__/launchd.out</string>
@@ -29,12 +29,7 @@ __SCHEDULE_BLOCK__
 
     <key>EnvironmentVariables</key>
     <dict>
-        <key>HOME</key>
-        <string>__HOME__</string>
-        <key>CRONFISH_CONSUMER_ROOT</key>
-        <string>__CONSUMER_ROOT__</string>
-        <key>PATH</key>
-        <string>__PATH__</string>
+__ENV_BLOCK__
     </dict>
 </dict>
 </plist>
