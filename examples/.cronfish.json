@@ -1,0 +1,17 @@
+{
+  "$comment": "Optional. Drop this at your repo root (next to cron/). All keys are optional.",
+
+  "bundle_prefix": "com.example.myapp",
+  "bun_path": "/opt/homebrew/bin/bun",
+
+  "ui": {
+    "public_url": "http://127.0.0.1:4747"
+  },
+
+  "alerts": {
+    "on_failure": { "notify": "slack" },
+    "default": "slack",
+    "slack": { "webhook_url_env": "CRONFISH_SLACK_WEBHOOK" },
+    "shell": { "command": "/usr/local/bin/my-notify.sh" }
+  }
+}

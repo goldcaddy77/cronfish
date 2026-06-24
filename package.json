@@ -16,10 +16,29 @@
   "files": [
     "src",
     "templates",
+    "examples",
     "ui/dist",
     "README.md",
     "LICENSE"
   ],
+  "keywords": [
+    "cron",
+    "scheduler",
+    "launchd",
+    "macos",
+    "bun",
+    "automation",
+    "claude",
+    "task-scheduler"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/goldcaddy77/cronfish.git"
+  },
+  "homepage": "https://github.com/goldcaddy77/cronfish#readme",
+  "bugs": {
+    "url": "https://github.com/goldcaddy77/cronfish/issues"
+  },
   "license": "MIT",
   "author": "Dan Caddigan"
 }

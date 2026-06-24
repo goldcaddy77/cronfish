@@ -1,10 +1,27 @@
-# cronfish 🐟
+<p align="center">
+  <img src="assets/cronfish-mascot.png" alt="cronfish mascot" width="240">
+</p>
 
-**Drop a file. Cronfish does the rest. Markdown is a valid cron job.**
+<h1 align="center">cronfish 🐟</h1>
+
+<p align="center"><strong>Drop a file. Cronfish does the rest. Markdown is a valid cron job.</strong></p>
+
+<p align="center">
+  <a href="https://github.com/goldcaddy77/cronfish/actions/workflows/ci.yml"><img src="https://github.com/goldcaddy77/cronfish/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <img src="https://img.shields.io/badge/runtime-Bun%20%E2%89%A5%201.0-black?logo=bun" alt="Bun >= 1.0">
+  <img src="https://img.shields.io/badge/platform-macOS-lightgrey?logo=apple" alt="macOS">
+  <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT License"></a>
+</p>
 
 The simplest scheduler for personal automation on macOS. Drop a `.md` (agentic Claude prompt),
 `.ts` (Bun program), or `.sh` (bash script) in `cron/`, run `cronfish sync`, and launchd takes
 it from there.
+
+**Why not raw `crontab` or `launchd`?** Because both make you hand-write plists or crontab lines,
+wire your own logging, and guess at why a job didn't fire. Cronfish makes the *file* the job:
+frontmatter is the schedule, the path is the slug, and you get per-run logs, retries, concurrency
+guards, failure alerts, fire-once jobs, and a dashboard for free — no registration step, no plist
+XML. See the [`examples/`](./examples) directory for a copy-pasteable job of every kind.
 
 ## 60-second quickstart
 
@@ -325,8 +342,8 @@ is needed.
 
 ## Status
 
-v0.2 — private, used in production by the author. API may break before v1. File issues if you
-hit something rough.
+v0.11 — used in production by the author. API may still break before v1. File issues if you hit
+something rough.
 
 ## License
 
