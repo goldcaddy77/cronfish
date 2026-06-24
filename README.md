@@ -4,7 +4,7 @@
 
 <h1 align="center">cronfish 🐟</h1>
 
-<p align="center"><strong>Drop a file. Cronfish does the rest. Markdown is a valid cron job.</strong></p>
+<p align="center"><strong>A file-based job scheduler for macOS. Drop a script in a folder; launchd runs it on a schedule.</strong></p>
 
 <p align="center">
   <a href="https://github.com/goldcaddy77/cronfish/actions/workflows/ci.yml"><img src="https://github.com/goldcaddy77/cronfish/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
@@ -13,17 +13,16 @@
   <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT License"></a>
 </p>
 
-The simplest scheduler for personal automation on macOS. Drop a `.md` (agentic Claude prompt),
-`.ts` (Bun program), or `.sh` (bash script) in `cron/`, run `cronfish sync`, and launchd takes
-it from there.
+A scheduler for personal automation on macOS. Drop a `.md` (Claude prompt), `.ts` (Bun program),
+or `.sh` (bash script) in `cron/`, run `cronfish sync`, and launchd takes it from there.
 
-**Why not raw `crontab` or `launchd`?** Because both make you hand-write plists or crontab lines,
-wire your own logging, and guess at why a job didn't fire. Cronfish makes the *file* the job:
-frontmatter is the schedule, the path is the slug, and you get per-run logs, retries, concurrency
-guards, failure alerts, fire-once jobs, and a dashboard for free — no registration step, no plist
-XML. See the [`examples/`](./examples) directory for a copy-pasteable job of every kind.
+Raw `crontab` and `launchd` make you hand-write plists or crontab lines, wire your own logging,
+and guess at why a job didn't fire. Cronfish makes the file the job: frontmatter is the schedule,
+the path is the slug. You also get per-run logs, retries, concurrency guards, failure alerts,
+fire-once jobs, and a dashboard, with no registration step. See [`examples/`](./examples) for a
+copy-pasteable job of every kind.
 
-## 60-second quickstart
+## Quickstart
 
 ```bash
 bun add cronfish                 # or `bun add file:../cronfish` for local dev
@@ -32,13 +31,13 @@ bunx cronfish enable hello-md    # flip on, sync to launchd
 bunx cronfish list               # see what's scheduled and what's loaded
 ```
 
-That's it. No code change to register a job — just drop a file in `cron/`.
+No code change registers a job — you just drop a file in `cron/`.
 
 ## Where jobs live
 
 `cron/` is a tree, not a flat directory. Any `.md`, `.ts`, or `.sh` file at any depth is a job.
 
-**The slug encodes the kind.** The path relative to `cron/` has its trailing `.<ext>` rewritten
+The slug encodes the kind: the path relative to `cron/` has its trailing `.<ext>` rewritten
 to `-<ext>`, so:
 
 - `cron/email/triage.ts` → slug `email/triage-ts`
@@ -48,9 +47,8 @@ to `-<ext>`, so:
 This means `foo.md` and `foo.sh` can coexist without colliding. Use folders to group related
 crons (`cron/email/`, `cron/linkedin/`).
 
-**One magic filename: `README.md`.** A file named exactly `README.md` is ignored at any depth, so
-you can document a folder of crons without the README getting parsed as a job. No other reserved
-names.
+One reserved filename: `README.md`. A file named exactly `README.md` is ignored at any depth, so
+you can document a folder of crons without the README getting parsed as a job.
 
 ## Job spec
 
@@ -66,7 +64,7 @@ retries: 0 # retry count on non-zero exit
 concurrency: skip # skip | queue
 ---
 
-Anything you'd type into a fresh Claude session. Tools, files, prompts, all of it.
+Anything you'd type into a fresh Claude session — tools, files, prompts.
 ```
 
 Cronfish shells to `claude --dangerously-skip-permissions --model <id> -p <body>` with `cwd =
