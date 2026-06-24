@@ -13,8 +13,9 @@
   <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT License"></a>
 </p>
 
-A scheduler for personal automation on macOS. Drop a `.md` (Claude prompt), `.ts` (Bun program),
-or `.sh` (bash script) in `cron/`, run `cronfish sync`, and launchd takes it from there.
+Cronfish is for personal automation — the small scheduled jobs you'd otherwise hand-roll as
+launchd plists or crontab lines. Drop a `.md` (Claude prompt), `.ts` (Bun program), or `.sh`
+(bash script) in `cron/`, run `cronfish sync`, and launchd takes it from there.
 
 Raw `crontab` and `launchd` make you hand-write plists or crontab lines, wire your own logging,
 and guess at why a job didn't fire. Cronfish makes the file the job: frontmatter is the schedule,
@@ -26,7 +27,7 @@ copy-pasteable job of every kind.
 
 ```bash
 bun add cronfish                 # or `bun add file:../cronfish` for local dev
-bunx cronfish init               # creates cron/hello.md, touch.ts, ping.sh (disabled)
+bunx cronfish init               # scaffolds starter jobs in cron/ (disabled)
 bunx cronfish enable hello-md    # flip on, sync to launchd
 bunx cronfish list               # see what's scheduled and what's loaded
 ```
@@ -154,12 +155,10 @@ Sync behavior:
 | Past `grace_seconds`          | **refused**; sentinel written to `cron/.errors/`  |
 | `executed_at:` already set    | skipped (file should already be archived)         |
 
-On every fire the runner takes a `flock(LOCK_EX|LOCK_NB)` on the source file,
-re-checks `executed_at` under lock, runs the job, then writes
-`executed_at: <ISO>` (with `fsync`) and **moves the file to
-`~/Library/Application Support/cronfish/done/`** — outside the repo so the
-audit trail doesn't bloat git. The next `cronfish sync` removes the orphaned
-plist.
+After firing, the runner stamps `executed_at: <ISO>` and moves the file to
+`~/Library/Application Support/cronfish/done/` — outside the repo, so the
+audit trail doesn't bloat git. A `flock` plus the `executed_at` re-check guard
+against double-fires. The next `cronfish sync` removes the orphaned plist.
 
 **One-time jobs must be idempotent.** launchd can re-fire on machine restart,
 system unsleep, or load spikes; the flock + `executed_at` guard catches the
@@ -301,6 +300,9 @@ cron/<slug>.{md,ts,sh}                              # job files (you write these
 <consumer>/tmp/cron/<slug>/runner.pid               # concurrency lock
 ```
 
+Per-run logs are not pruned — they accumulate under `tmp/cron/`. Add `tmp/` to `.gitignore`, and
+clean old logs yourself (a `find … -mtime` cron works) if disk matters.
+
 ## Retries & concurrency
 
 - `retries:` — on non-zero exit, retry up to N more times with exponential backoff (5s, 15s, 45s,
@@ -321,17 +323,14 @@ editing `.env` so the plists pick up the new values.
 
 ## How cronfish finds bun
 
-Plists invoke `/usr/bin/env bun <runner.ts>`. At `cronfish sync` time, cronfish resolves your
-current `bun` binary and bakes its directory into the plist's `PATH` along with the standard
-candidates (`~/.bun/bin`, `/opt/homebrew/bin`, `/usr/local/bin`, `/usr/bin`, `/bin`). Bun
-auto-loads `.env` from the consumer root (set via plist `WorkingDirectory`), so no shell wrapper
-is needed.
+Plists invoke `/usr/bin/env bun <runner.ts>`. At `cronfish sync`, cronfish resolves your current
+`bun` binary and bakes its directory into the plist's `PATH` (the `bun_path` config option above
+covers the resolution order and how to pin it). Bun auto-loads `.env` from the consumer root (set
+via plist `WorkingDirectory`), so no shell wrapper is needed.
 
 - After `bun upgrade` (in place) or a `brew upgrade bun` (same dir) — no re-sync needed.
 - After moving bun to a different directory — re-run `cronfish sync` so the plist PATH picks up
   the new location.
-- asdf-managed bun is **not** in the default allowlist; install bun via the official installer
-  (`curl -fsSL https://bun.sh/install | bash` → `~/.bun/bin`) or Homebrew.
 
 ## Requirements
 
