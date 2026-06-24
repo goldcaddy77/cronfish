@@ -17,17 +17,16 @@ Cronfish is for personal automation — the small scheduled jobs you'd otherwise
 launchd plists or crontab lines. Drop a `.md` (Claude prompt), `.ts` (Bun program), or `.sh`
 (bash script) in `cron/`, run `cronfish sync`, and launchd takes it from there.
 
-Raw `crontab` and `launchd` make you hand-write plists or crontab lines, wire your own logging,
-and guess at why a job didn't fire. Cronfish makes the file the job: frontmatter is the schedule,
-the path is the slug. You also get per-run logs, retries, concurrency guards, failure alerts,
-fire-once jobs, and a dashboard, with no registration step. See [`examples/`](./examples) for a
-copy-pasteable job of every kind.
+It makes the file the job: frontmatter is the schedule, the path is the slug — no hand-written
+plists, no registration step. You also get per-run logs, retries, concurrency guards, failure
+alerts, fire-once jobs, and a dashboard. See [`examples/`](./examples) for a copy-pasteable job of
+every kind.
 
 <p align="center">
   <img src="assets/cronfish-dashboard.png" alt="cronfish dashboard — the jobs view, showing each job's schedule, last-run status, and timing" width="900">
 </p>
 
-<p align="center"><em>The built-in dashboard (<code>cronfish ui</code>): every job cronfish has seen, with its latest run.</em></p>
+<p align="center"><em>The built-in dashboard — <code>cronfish ui</code>.</em></p>
 
 ## Why cronfish?
 
@@ -54,8 +53,6 @@ bunx cronfish init               # scaffolds starter jobs in cron/ (disabled)
 bunx cronfish enable hello-md    # flip on, sync to launchd
 bunx cronfish list               # see what's scheduled and what's loaded
 ```
-
-No code change registers a job — you just drop a file in `cron/`.
 
 ## Where jobs live
 
