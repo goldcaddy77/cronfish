@@ -29,6 +29,23 @@ copy-pasteable job of every kind.
 
 <p align="center"><em>The built-in dashboard (<code>cronfish ui</code>): every job cronfish has seen, with its latest run.</em></p>
 
+## Why cronfish?
+
+Claude's native scheduled agents are the obvious alternative, and for pure-LLM tasks they're great
+— zero setup, nothing to host. But everything runs on Anthropic's managed runtime: you pay their
+rates, and every job is a Claude job. Cronfish trades that convenience for control:
+
+- **Any job, not just LLM jobs.** Most scheduled work is plain bash or a TypeScript script — a
+  backup, a sync, a healthcheck. Cronfish runs those first-class, alongside `.md` Claude prompts.
+- **Any harness.** `.md` jobs shell out to a CLI you choose — Claude Code by default, or another
+  agent runner — so you're not locked to one model or one vendor.
+- **Local, so you control the bill.** Jobs run on your machine against whatever model you point
+  them at (hosted Claude, a local Ollama model, a LAN LiteLLM box). No managed-runtime markup, and
+  your data stays on your hardware.
+
+Reach for Claude's scheduler when you want zero-ops and a single LLM task. Reach for cronfish when
+you have a mix of scripts and agents, care about cost, or want to choose the model.
+
 ## Quickstart
 
 ```bash
