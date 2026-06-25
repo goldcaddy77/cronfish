@@ -2,7 +2,12 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { discoverJobs, findJobFile, slugFromPath } from "../src/jobs.ts";
+import {
+  discoverJobs,
+  findJobFile,
+  loadJob,
+  slugFromPath,
+} from "../src/jobs.ts";
 
 const MD = `---
 schedule: "every 5 minutes"
@@ -127,5 +132,51 @@ echo hello
     expect(slugFromPath(cron, p)).toBe("email/triage-ts");
     expect(slugFromPath(cron, join(cron, "foo.sh"))).toBe("foo-sh");
     expect(slugFromPath(cron, join(cron, "foo.md"))).toBe("foo-md");
+  });
+});
+
+describe("security frontmatter fields on .md jobs", () => {
+  let root: string;
+  let cron: string;
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "cronfish-sec-"));
+    cron = join(root, "cron");
+    mkdirSync(cron, { recursive: true });
+  });
+  afterEach(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  test("env / allowed_tools / max_cost land on the parsed meta", () => {
+    const p = join(cron, "fenced.md");
+    writeFileSync(
+      p,
+      `---\nschedule: "5m"\nenv: [LINEAR_TOKEN, DATABASE_URL]\nallowed_tools: [Read, "Bash(git status)"]\nmax_cost: 0.50\n---\nbody\n`,
+    );
+    const job = loadJob(p, "fenced-md", cron);
+    expect(job.env).toEqual(["LINEAR_TOKEN", "DATABASE_URL"]);
+    expect(job.allowed_tools).toEqual(["Read", "Bash(git status)"]);
+    expect(job.max_cost).toBe(0.5);
+  });
+
+  test("integer max_cost is accepted", () => {
+    const p = join(cron, "cap.md");
+    writeFileSync(p, `---\nschedule: "5m"\nmax_cost: 3\n---\nbody\n`);
+    expect(loadJob(p, "cap-md", cron).max_cost).toBe(3);
+  });
+
+  test("non-numeric max_cost is a validation error", () => {
+    const p = join(cron, "bad.md");
+    writeFileSync(p, `---\nschedule: "5m"\nmax_cost: lots\n---\nbody\n`);
+    expect(() => loadJob(p, "bad-md", cron)).toThrow(/max_cost/);
+  });
+
+  test("the fields are absent by default", () => {
+    const p = join(cron, "plain.md");
+    writeFileSync(p, `---\nschedule: "5m"\n---\nbody\n`);
+    const job = loadJob(p, "plain-md", cron);
+    expect(job.env).toBeUndefined();
+    expect(job.allowed_tools).toBeUndefined();
+    expect(job.max_cost).toBeUndefined();
   });
 });

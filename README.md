@@ -414,6 +414,21 @@ headless mode any tool **not** on the list can't prompt, so it auto-denies —
 the job never hangs. Omitting `allowed_tools:` keeps the skip-permissions
 default (backward compatible). `.md` jobs only — `.ts`/`.sh` run your own code.
 
+### Budget cap — `max_cost:` (`.md` jobs)
+
+Cap the dollars an LLM job may spend in a single run:
+
+```
+---
+schedule: every 5 minutes
+max_cost: 0.50
+---
+```
+
+Passed to the CLI as `--max-budget-usd`; the run stops making API calls once
+the cap is hit. Backstops a runaway loop or an LLM quietly billing on a short
+cron. Accepts a fraction (`0.50`) or a whole number (`2`). Unset → no cap.
+
 ## How cronfish finds bun
 
 Plists invoke `/usr/bin/env bun <runner.ts>`. At `cronfish sync`, cronfish resolves your current

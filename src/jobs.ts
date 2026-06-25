@@ -53,6 +53,11 @@ export interface JobMeta {
   // on the list auto-denies in headless mode. Unset → skip-permissions
   // (backward compatible). See README "Security".
   allowed_tools?: string[];
+  // .md jobs only. Dollar budget cap for the Claude Code run, passed to the
+  // CLI as `--max-budget-usd`. The run stops making API calls once the cap is
+  // hit — backstops a runaway loop or an LLM quietly billing on a short cron.
+  // Accepts a fraction (e.g. `0.50`). Unset → no cap. See README "Security".
+  max_cost?: number;
   // .md jobs only. When set, the .md is dispatched to a runner registered
   // in `.cronfish.json#runners.<runner>.path` instead of the default
   // claude-cli path. Lets a single .md format target multiple engines
@@ -139,6 +144,34 @@ function asStringList(
     }
   }
   return val;
+}
+
+// A positive number that may be fractional. The frontmatter parser only
+// coerces integers, so a value like `0.50` arrives as the string "0.50" — we
+// accept both a parsed number and a numeric string here. `> 0` required.
+function asPositiveNumber(
+  path: string,
+  key: string,
+  val: Scalar | undefined,
+): number | undefined {
+  if (val === undefined) return undefined;
+  let n: number;
+  if (typeof val === "number") n = val;
+  else if (typeof val === "string" && /^\d*\.?\d+$/.test(val.trim())) {
+    n = parseFloat(val);
+  } else {
+    throw new JobValidationError(
+      path,
+      `${key} must be a positive number, got: ${val}`,
+    );
+  }
+  if (!(n > 0) || !Number.isFinite(n)) {
+    throw new JobValidationError(
+      path,
+      `${key} must be a positive number, got: ${val}`,
+    );
+  }
+  return n;
 }
 
 function asConcurrency(
@@ -314,6 +347,7 @@ function fromMarkdown(path: string, slug: string, isOneTime: boolean): JobMeta {
     on_failure: asOnFailure(path, nested.on_failure),
     env: asStringList(path, "env", lists.env),
     allowed_tools: asStringList(path, "allowed_tools", lists.allowed_tools),
+    max_cost: asPositiveNumber(path, "max_cost", frontmatter.max_cost),
     runner: asString(path, "runner", frontmatter.runner),
   };
   applyOneTime(
