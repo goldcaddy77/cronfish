@@ -364,7 +364,30 @@ untouched — only per-run log files are pruned.
 - `concurrency: skip` — if a prior run is still in flight, exit 0 immediately.
 - `concurrency: queue` — poll every 2s for the lock, up to the job's `timeout`.
 
-## `.env` is baked into every plist
+## Security
+
+cronfish runs three kinds of job, and they don't carry the same risk:
+
+- **`.ts` and `.sh`** run code *you* wrote — the standard cron trust model.
+  Nothing here is more dangerous than the cron line you'd write by hand.
+- **`.md`** runs an agent (Claude Code) that decides for itself which tools to
+  call. That's the tier worth fencing, and the controls below are aimed at it.
+
+The default for a `.md` job is `--dangerously-skip-permissions` (every tool
+allowed) so existing setups keep working. Treat that as fine for jobs you
+fully trust and dial in the controls — **scope secrets, fence tools, cap
+spend, go read-only** — for anything open-ended or untrusted. For true
+isolation, run the job in a [container](#container-escape-hatch).
+
+| Control                       | Knob              | Tier        |
+| ----------------------------- | ----------------- | ----------- |
+| Inject only the secrets needed | `env:`           | `.md`/`.sh` |
+| Allow only specific tools      | `allowed_tools:`  | `.md`       |
+| Cap dollars per run            | `max_cost:`       | `.md`       |
+| Deny mutating tools            | `read_only:`      | `.md`       |
+| Network egress + filesystem    | container         | any         |
+
+### Secrets in plists
 
 At `cronfish sync`, every plist's `EnvironmentVariables` block is populated
 with the consumer's `.env` plus the required keys (`HOME`,
@@ -446,6 +469,51 @@ both the skip-permissions default and an `allowed_tools` fence (deny wins on
 overlap). **MCP sends aren't auto-detected** — cronfish can't tell a reading
 MCP tool from a sending one by name, so pair `read_only:` with an
 `allowed_tools:` list to fence Gmail/Linear mutations.
+
+### Container escape hatch
+
+The frontmatter controls fence *which tools* a job may call; they don't
+sandbox the filesystem or the network. For an untrusted or wide-open job, run
+it inside an ephemeral container — the only option on macOS that gets you real
+network-egress control. The job file is a plain `.sh` that shells out to
+Docker / [OrbStack](https://orbstack.dev):
+
+```bash
+#!/bin/bash
+# ---
+# schedule: every day at 3am
+# env: [ANTHROPIC_API_KEY, DATABASE_URL]
+# ---
+set -euo pipefail
+
+docker run --rm \
+  --network cronfish-egress \
+  --mount type=bind,src="$PWD/cron/_work",dst=/work \
+  --env ANTHROPIC_API_KEY --env DATABASE_URL \
+  --memory 1g --cpus 1 \
+  my-claude-runner:latest /work/task.md
+```
+
+Each flag earns its place:
+
+- `--rm` — the container dies on exit; nothing persists between runs.
+- `--network cronfish-egress` — a Docker network whose policy allows only
+  `api.anthropic.com` + your DB, so a compromised job can't phone home.
+- `--mount …src=cron/_work` — the job sees **only** that directory, not your
+  whole repo or home dir.
+- `--env ANTHROPIC_API_KEY --env DATABASE_URL` — forwards just the scoped
+  secrets; pair with the `env:` frontmatter so the launchd plist hands the
+  wrapper only those keys to begin with.
+
+Build the egress network once (then add your allow rules to it):
+
+```bash
+docker network create --internal cronfish-egress
+```
+
+This is opt-in and heavier than the frontmatter knobs — reach for it when a
+job is genuinely untrusted or you need hard network/filesystem boundaries, not
+for everyday jobs.
 
 ## How cronfish finds bun
 
