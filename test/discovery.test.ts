@@ -147,16 +147,17 @@ describe("security frontmatter fields on .md jobs", () => {
     rmSync(root, { recursive: true, force: true });
   });
 
-  test("env / allowed_tools / max_cost land on the parsed meta", () => {
+  test("env / allowed_tools / max_cost / read_only land on the parsed meta", () => {
     const p = join(cron, "fenced.md");
     writeFileSync(
       p,
-      `---\nschedule: "5m"\nenv: [LINEAR_TOKEN, DATABASE_URL]\nallowed_tools: [Read, "Bash(git status)"]\nmax_cost: 0.50\n---\nbody\n`,
+      `---\nschedule: "5m"\nenv: [LINEAR_TOKEN, DATABASE_URL]\nallowed_tools: [Read, "Bash(git status)"]\nmax_cost: 0.50\nread_only: true\n---\nbody\n`,
     );
     const job = loadJob(p, "fenced-md", cron);
     expect(job.env).toEqual(["LINEAR_TOKEN", "DATABASE_URL"]);
     expect(job.allowed_tools).toEqual(["Read", "Bash(git status)"]);
     expect(job.max_cost).toBe(0.5);
+    expect(job.read_only).toBe(true);
   });
 
   test("integer max_cost is accepted", () => {
@@ -178,5 +179,6 @@ describe("security frontmatter fields on .md jobs", () => {
     expect(job.env).toBeUndefined();
     expect(job.allowed_tools).toBeUndefined();
     expect(job.max_cost).toBeUndefined();
+    expect(job.read_only).toBeUndefined();
   });
 });

@@ -58,6 +58,12 @@ export interface JobMeta {
   // hit — backstops a runaway loop or an LLM quietly billing on a short cron.
   // Accepts a fraction (e.g. `0.50`). Unset → no cap. See README "Security".
   max_cost?: number;
+  // .md jobs only. "Draft but don't send." When true, the run denies the
+  // mutating built-in tools (Write, Edit, NotebookEdit, Bash) via
+  // `--disallowedTools`, so the model can read/search/draft but not edit files
+  // or shell out. Composes with `allowed_tools` (deny wins). MCP sends aren't
+  // auto-detected — pair with `allowed_tools` to fence those. See README.
+  read_only?: boolean;
   // .md jobs only. When set, the .md is dispatched to a runner registered
   // in `.cronfish.json#runners.<runner>.path` instead of the default
   // claude-cli path. Lets a single .md format target multiple engines
@@ -204,6 +210,17 @@ function asBool(
   return val;
 }
 
+// Like asBool but stays undefined when the key is absent — keeps the field off
+// the meta entirely unless the author opts in.
+function asOptionalBool(
+  path: string,
+  key: string,
+  val: Scalar | undefined,
+): boolean | undefined {
+  if (val === undefined) return undefined;
+  return asBool(path, key, val, false);
+}
+
 // Slug = path relative to cron/, with the trailing `.<ext>` rewritten to
 // `-<ext>` so the kind is encoded in the slug itself. This makes collisions
 // impossible (`foo.md` and `foo.sh` coexist as `foo-md` and `foo-sh`) and
@@ -348,6 +365,7 @@ function fromMarkdown(path: string, slug: string, isOneTime: boolean): JobMeta {
     env: asStringList(path, "env", lists.env),
     allowed_tools: asStringList(path, "allowed_tools", lists.allowed_tools),
     max_cost: asPositiveNumber(path, "max_cost", frontmatter.max_cost),
+    read_only: asOptionalBool(path, "read_only", frontmatter.read_only),
     runner: asString(path, "runner", frontmatter.runner),
   };
   applyOneTime(

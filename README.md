@@ -429,6 +429,24 @@ Passed to the CLI as `--max-budget-usd`; the run stops making API calls once
 the cap is hit. Backstops a runaway loop or an LLM quietly billing on a short
 cron. Accepts a fraction (`0.50`) or a whole number (`2`). Unset → no cap.
 
+### Read-only — `read_only:` (`.md` jobs)
+
+"Draft but don't send." Denies the mutating built-in tools so a job can
+read, search, and draft but never edit files or shell out:
+
+```
+---
+schedule: every morning at 8
+read_only: true
+---
+```
+
+Passed as `--disallowedTools Write Edit NotebookEdit Bash`, which holds under
+both the skip-permissions default and an `allowed_tools` fence (deny wins on
+overlap). **MCP sends aren't auto-detected** — cronfish can't tell a reading
+MCP tool from a sending one by name, so pair `read_only:` with an
+`allowed_tools:` list to fence Gmail/Linear mutations.
+
 ## How cronfish finds bun
 
 Plists invoke `/usr/bin/env bun <runner.ts>`. At `cronfish sync`, cronfish resolves your current
