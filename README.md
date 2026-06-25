@@ -7,6 +7,7 @@
 <p align="center"><strong>A file-based job scheduler for macOS. Drop a script in a folder; launchd runs it on a schedule.</strong></p>
 
 <p align="center">
+  <a href="https://www.npmjs.com/package/cronfish"><img src="https://img.shields.io/npm/v/cronfish?logo=npm" alt="npm"></a>
   <a href="https://github.com/goldcaddy77/cronfish/actions/workflows/ci.yml"><img src="https://github.com/goldcaddy77/cronfish/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <img src="https://img.shields.io/badge/runtime-Bun%20%E2%89%A5%201.0-black?logo=bun" alt="Bun >= 1.0">
   <img src="https://img.shields.io/badge/platform-macOS-lightgrey?logo=apple" alt="macOS">

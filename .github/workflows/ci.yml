@@ -21,3 +21,32 @@ jobs:
 
       - name: Test
         run: bun test
+
+  release:
+    # Automated versioning + npm publish + GitHub release + CHANGELOG, driven by
+    # conventional commits. Runs only on push to main, after tests pass.
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # push the release commit + tag
+      issues: write # comment on released issues
+      pull-requests: write # comment on released PRs
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history so semantic-release sees all tags/commits
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Semantic Release
+        uses: cycjimmy/semantic-release-action@v4
+        with:
+          extra_plugins: |
+            @semantic-release/changelog
+            @semantic-release/git
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
