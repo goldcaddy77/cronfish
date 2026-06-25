@@ -92,6 +92,71 @@ describe("launchd render — .env preservation", () => {
   });
 });
 
+describe("launchd render — scoped secrets (env:)", () => {
+  let h: ReturnType<typeof makeRoot>;
+  beforeEach(() => {
+    h = makeRoot();
+  });
+  afterEach(() => {
+    rmSync(h.root, { recursive: true, force: true });
+  });
+
+  test("env: injects only declared keys, not the whole .env", () => {
+    writeFileSync(
+      join(h.root, ".env"),
+      `LINEAR_TOKEN=lt\nDATABASE_URL=db\nSECRET_KEY=shh\n`,
+    );
+    writeFileSync(
+      join(h.cron, "scoped.md"),
+      `---\nschedule: "5m"\nenv: [LINEAR_TOKEN, DATABASE_URL]\n---\nbody\n`,
+    );
+    const job = loadJob(join(h.cron, "scoped.md"), "scoped-md", h.cron);
+    const r = render(job, {
+      bundlePrefix: "com.test.app",
+      consumerRoot: h.root,
+    });
+    expect(r.contents).toContain("<key>LINEAR_TOKEN</key>");
+    expect(r.contents).toContain("<key>DATABASE_URL</key>");
+    expect(r.contents).not.toContain("SECRET_KEY");
+    expect(r.contents).not.toContain("shh");
+    // required keys always present
+    expect(r.contents).toContain("<key>HOME</key>");
+    expect(r.contents).toContain("<key>PATH</key>");
+  });
+
+  test("no env: declaration injects the whole .env (backward compatible)", () => {
+    writeFileSync(join(h.root, ".env"), `FOO=bar\nBAZ=qux\n`);
+    writeFileSync(
+      join(h.cron, "wide.md"),
+      `---\nschedule: "5m"\n---\nbody\n`,
+    );
+    const job = loadJob(join(h.cron, "wide.md"), "wide-md", h.cron);
+    const r = render(job, {
+      bundlePrefix: "com.test.app",
+      consumerRoot: h.root,
+    });
+    expect(r.contents).toContain("<key>FOO</key>");
+    expect(r.contents).toContain("<key>BAZ</key>");
+  });
+
+  test("env: [] injects no consumer secrets at all", () => {
+    writeFileSync(join(h.root, ".env"), `FOO=bar\nBAZ=qux\n`);
+    writeFileSync(
+      join(h.cron, "none.md"),
+      `---\nschedule: "5m"\nenv: []\n---\nbody\n`,
+    );
+    const job = loadJob(join(h.cron, "none.md"), "none-md", h.cron);
+    const r = render(job, {
+      bundlePrefix: "com.test.app",
+      consumerRoot: h.root,
+    });
+    expect(r.contents).not.toContain("<key>FOO</key>");
+    expect(r.contents).not.toContain("<key>BAZ</key>");
+    // required keys still present
+    expect(r.contents).toContain("<key>HOME</key>");
+  });
+});
+
 describe("launchd render — one-time", () => {
   let h: ReturnType<typeof makeRoot>;
   beforeEach(() => {

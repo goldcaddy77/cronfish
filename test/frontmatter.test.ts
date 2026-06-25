@@ -107,6 +107,60 @@ describe("parseTsJobConfig", () => {
   });
 });
 
+describe("inline arrays (env / allowed_tools)", () => {
+  test("parses a YAML inline array into lists", () => {
+    const { lists, frontmatter } = parseFrontmatter(
+      `---\nschedule: "5m"\nenv: [LINEAR_TOKEN, DATABASE_URL]\n---\nbody`,
+    );
+    expect(frontmatter.schedule).toBe("5m");
+    expect(lists.env).toEqual(["LINEAR_TOKEN", "DATABASE_URL"]);
+  });
+
+  test("keeps commas inside quotes and parens, strips quotes", () => {
+    const { lists } = parseFrontmatter(
+      `---\nallowed_tools: [Read, "Bash(git commit, git push)", mcp__linear__*]\n---\n`,
+    );
+    expect(lists.allowed_tools).toEqual([
+      "Read",
+      "Bash(git commit, git push)",
+      "mcp__linear__*",
+    ]);
+  });
+
+  test("empty array is declared-but-empty (distinct from absent)", () => {
+    const { lists } = parseFrontmatter(`---\nenv: []\n---\n`);
+    expect(lists.env).toEqual([]);
+  });
+
+  test("ignores a trailing comment after the closing bracket", () => {
+    const { lists } = parseFrontmatter(
+      `---\nenv: [A, B] # just two\n---\n`,
+    );
+    expect(lists.env).toEqual(["A", "B"]);
+  });
+
+  test("shell frontmatter surfaces inline arrays", () => {
+    const { lists } = parseShellFrontmatter(
+      `#!/bin/bash\n# ---\n# schedule: 5m\n# env: [FOO, BAR]\n# ---\necho hi`,
+    );
+    expect(lists.env).toEqual(["FOO", "BAR"]);
+  });
+
+  test("TS config parses env array", () => {
+    const cfg = parseTsJobConfig(
+      `export const config = {\n  schedule: "5m",\n  env: ["LINEAR_TOKEN", "DATABASE_URL"],\n};`,
+    );
+    expect(cfg.env).toEqual(["LINEAR_TOKEN", "DATABASE_URL"]);
+  });
+
+  test("TS config without env leaves it undefined", () => {
+    const cfg = parseTsJobConfig(
+      `export const config = { schedule: "5m" };`,
+    );
+    expect(cfg.env).toBeUndefined();
+  });
+});
+
 describe("nested on_failure", () => {
   test("parses on_failure block in YAML frontmatter", () => {
     const raw = `---
