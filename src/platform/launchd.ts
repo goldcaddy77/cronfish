@@ -96,6 +96,29 @@ function loadConsumerEnv(consumerRoot: string): Record<string, string> {
   }
 }
 
+// Scope a parsed .env to a job's declared `env: [...]` allowlist. `undefined`
+// (no declaration) → full env, backward compatible. An empty list → no
+// secrets at all. A declared key absent from .env is silently skipped (and
+// warned) rather than failing the sync — the job simply won't see it.
+function scopeEnv(
+  env: Record<string, string>,
+  allow: string[] | undefined,
+): Record<string, string> {
+  if (allow === undefined) return env;
+  const out: Record<string, string> = {};
+  const missing: string[] = [];
+  for (const key of allow) {
+    if (key in env) out[key] = env[key];
+    else missing.push(key);
+  }
+  if (missing.length > 0) {
+    console.error(
+      `[cronfish] env: declares ${missing.join(", ")} not found in .env — skipped`,
+    );
+  }
+  return out;
+}
+
 function escapeXml(s: string): string {
   return s
     .replace(/&/g, "&amp;")
@@ -256,12 +279,14 @@ export function render(job: JobMeta, cfg: LaunchdConfig): LaunchdRender {
 
   // Build EnvironmentVariables block: required keys + consumer .env merged
   // in. Required keys win over .env if a collision occurs (HOME etc.).
+  // When the job declares `env: [...]`, scope the injected .env to just those
+  // keys (scoped secrets); unset → whole .env (backward compatible).
   const required: Record<string, string> = {
     HOME: homedir(),
     CRONFISH_CONSUMER_ROOT: cfg.consumerRoot,
     PATH: pathEnv,
   };
-  const consumerEnv = loadConsumerEnv(cfg.consumerRoot);
+  const consumerEnv = scopeEnv(loadConsumerEnv(cfg.consumerRoot), job.env);
   const merged: Record<string, string> = { ...consumerEnv, ...required };
   const envBlock = renderEnvBlock(merged);
 

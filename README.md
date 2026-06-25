@@ -375,6 +375,27 @@ Required keys win on collision. Quoted values are unquoted; `#` is treated as
 an inline comment only on unquoted values. Re-run `cronfish sync` after
 editing `.env` so the plists pick up the new values.
 
+### Scoped secrets — `env:`
+
+By default a job's plist carries the **whole** `.env`. Declare an `env:`
+allowlist in frontmatter to inject only the keys a job actually needs:
+
+```
+---
+schedule: every 30 minutes
+env: [LINEAR_TOKEN, DATABASE_URL]
+---
+```
+
+The job sees those two keys, not all forty. `env: []` injects no consumer
+secrets at all; omitting `env:` keeps the full-`.env` default (backward
+compatible). A declared key missing from `.env` is skipped with a warning.
+
+This fences the `.md` (Claude Code) and `.sh` tiers, which read secrets from
+the plist block. **`.ts` jobs also read `.env` directly via bun's auto-loader,
+so `env:` does not constrain them** — for a `.ts` job, keep secrets out of
+`.env` or isolate the job in a container.
+
 ## How cronfish finds bun
 
 Plists invoke `/usr/bin/env bun <runner.ts>`. At `cronfish sync`, cronfish resolves your current

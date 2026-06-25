@@ -1,8 +1,10 @@
 // Strict YAML-subset frontmatter parser for cronfish job files.
 //
-// Supported scalar types: string, integer, boolean. No floats, no arrays,
-// no nulls. One level of nesting is supported (a key with no value followed
-// by indented child key/value scalars) — used today only for `on_failure:`.
+// Supported scalar types: string, integer, boolean. No floats, no nulls.
+// One level of nesting is supported (a key with no value followed by
+// indented child key/value scalars) — used today only for `on_failure:`.
+// Single-line inline arrays (`key: [a, "b c", d]`) are supported and land in
+// a separate `lists` map — used by `env:` and `allowed_tools:`.
 // Every key is validated against an expected type; unexpected types throw
 // with file + key + expected + got.
 //
@@ -13,6 +15,7 @@ export type Scalar = string | number | boolean;
 export interface ParsedFrontmatter {
   frontmatter: Record<string, Scalar>;
   nested: Record<string, Record<string, Scalar>>;
+  lists: Record<string, string[]>;
   body: string;
 }
 
@@ -55,11 +58,64 @@ function indentOf(line: string): number {
   return m ? m[0].length : 0;
 }
 
+// Split on commas at bracket/brace/paren depth 0, respecting quotes. Shared by
+// inline-array parsing (YAML and TS config). Tool patterns like
+// `Bash(git *, git status)` keep their inner commas because parens raise depth.
+function splitTopLevelCommas(inner: string): string[] {
+  const parts: string[] = [];
+  let buf = "";
+  let s: string | null = null;
+  let d = 0;
+  for (let i = 0; i < inner.length; i++) {
+    const c = inner[i];
+    const prev = inner[i - 1];
+    if (s) {
+      buf += c;
+      if (c === s && prev !== "\\") s = null;
+      continue;
+    }
+    if (c === '"' || c === "'" || c === "`") {
+      s = c;
+      buf += c;
+      continue;
+    }
+    if (c === "(" || c === "[" || c === "{") d++;
+    else if (c === ")" || c === "]" || c === "}") d--;
+    if (c === "," && d === 0) {
+      parts.push(buf);
+      buf = "";
+    } else {
+      buf += c;
+    }
+  }
+  if (buf.trim()) parts.push(buf);
+  return parts;
+}
+
+// Parse a single-line inline array `[a, "b c", d]` into a string[]. Everything
+// after the closing `]` (e.g. a trailing ` # comment`) is ignored. An empty
+// `[]` yields `[]` — meaningfully "declared but empty" (scope to nothing),
+// distinct from the key being absent.
+function parseInlineList(raw: string, lineNo: number): string[] {
+  const t = raw.trim();
+  const lb = t.indexOf("[");
+  const rb = t.lastIndexOf("]");
+  if (lb < 0 || rb < lb) {
+    throw new FrontmatterError(
+      `line ${lineNo}: inline array must open with "[" and close with "]" on the same line`,
+    );
+  }
+  return splitTopLevelCommas(t.slice(lb + 1, rb))
+    .map((p) => unquote(p.trim()).trim())
+    .filter((p) => p.length > 0);
+}
+
 export function parseFrontmatter(raw: string): ParsedFrontmatter {
   const m = raw.match(FM_RE);
-  if (!m) return { frontmatter: {}, nested: {}, body: raw };
+  if (!m) return { frontmatter: {}, nested: {}, lists: {}, body: raw };
   const fm: Record<string, Scalar> = {};
   const nested: Record<string, Record<string, Scalar>> = {};
+  const lists: Record<string, string[]> = {};
   const lines = m[1].split(/\r?\n/);
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
@@ -118,10 +174,14 @@ export function parseFrontmatter(raw: string): ParsedFrontmatter {
       nested[key] = child;
       continue;
     }
+    if (rawVal.startsWith("[")) {
+      lists[key] = parseInlineList(rawVal, i + 1);
+      continue;
+    }
     const cleaned = unquote(stripInlineComment(rawVal));
     fm[key] = parseScalar(cleaned);
   }
-  return { frontmatter: fm, nested, body: m[2] };
+  return { frontmatter: fm, nested, lists, body: m[2] };
 }
 
 // --- Shell job frontmatter parser ---
@@ -169,11 +229,12 @@ function findShellFmBlock(
 export interface ParsedShellFrontmatter {
   frontmatter: Record<string, Scalar>;
   nested: Record<string, Record<string, Scalar>>;
+  lists: Record<string, string[]>;
 }
 
 export function parseShellFrontmatter(raw: string): ParsedShellFrontmatter {
   const block = findShellFmBlock(raw);
-  if (!block) return { frontmatter: {}, nested: {} };
+  if (!block) return { frontmatter: {}, nested: {}, lists: {} };
   const inner = block.inner
     .split(/\r?\n/)
     // Strip the leading `# ` but preserve indentation after it so nested
@@ -182,7 +243,11 @@ export function parseShellFrontmatter(raw: string): ParsedShellFrontmatter {
     .join("\n");
   const fake = `---\n${inner}\n---\n`;
   const parsed = parseFrontmatter(fake);
-  return { frontmatter: parsed.frontmatter, nested: parsed.nested };
+  return {
+    frontmatter: parsed.frontmatter,
+    nested: parsed.nested,
+    lists: parsed.lists,
+  };
 }
 
 // --- TS job config parser ---
@@ -200,6 +265,8 @@ export interface TsJobConfigShape {
   description?: string;
   missed_after?: string;
   on_failure?: Record<string, Scalar>;
+  // scoped secrets / capability fence (string arrays)
+  env?: string[];
   // one-time jobs (cron/one-time/)
   run_at?: string | number;
   grace_seconds?: number;
@@ -336,6 +403,8 @@ export function parseTsJobConfig(source: string): TsJobConfigShape {
   }
   const onFailure = pickNestedObjectFromConfig(body, "on_failure");
   if (onFailure !== undefined) cfg.on_failure = onFailure;
+  const env = pickListFromConfig(body, "env");
+  if (env !== undefined) cfg.env = env;
   const runAt = pickFromConfig(body, "run_at");
   if (runAt !== undefined) {
     const u = runAt.replace(/^['"`]|['"`]$/g, "");
@@ -405,6 +474,63 @@ function pickNestedObjectFromConfig(
         if (d === 0) {
           const inner = body.slice(start, i);
           return parseInlineObject(inner);
+        }
+      }
+    }
+    return undefined;
+  }
+  return undefined;
+}
+
+// Find `key: [ ... ]` at the top level of the config block and return the
+// items as a string[]. Mirrors pickNestedObjectFromConfig but for arrays.
+function pickListFromConfig(
+  body: string,
+  key: string,
+): string[] | undefined {
+  const re = new RegExp(`\\b${key}\\b\\s*:\\s*\\[`, "g");
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(body))) {
+    // Verify top-level (depth 0, not inside a string).
+    let depth = 0;
+    let s: string | null = null;
+    for (let i = 0; i < m.index; i++) {
+      const c = body[i];
+      const prev = body[i - 1];
+      if (s) {
+        if (c === s && prev !== "\\") s = null;
+        continue;
+      }
+      if (c === '"' || c === "'" || c === "`") {
+        s = c;
+        continue;
+      }
+      if (c === "{" || c === "[") depth++;
+      else if (c === "}" || c === "]") depth--;
+    }
+    if (depth !== 0 || s !== null) continue;
+    const start = m.index + m[0].length;
+    let d = 1;
+    let str: string | null = null;
+    for (let i = start; i < body.length; i++) {
+      const c = body[i];
+      const prev = body[i - 1];
+      if (str) {
+        if (c === str && prev !== "\\") str = null;
+        continue;
+      }
+      if (c === '"' || c === "'" || c === "`") {
+        str = c;
+        continue;
+      }
+      if (c === "[" || c === "{") d++;
+      else if (c === "]" || c === "}") {
+        d--;
+        if (d === 0) {
+          const inner = body.slice(start, i);
+          return splitTopLevelCommas(inner)
+            .map((p) => p.trim().replace(/^['"`]|['"`]$/g, "").trim())
+            .filter((p) => p.length > 0);
         }
       }
     }

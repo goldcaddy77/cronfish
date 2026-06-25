@@ -41,6 +41,12 @@ export interface JobMeta {
   description?: string;
   missed_after?: string;
   on_failure?: OnFailure;
+  // Scoped secrets. When set, only these keys from the consumer .env are
+  // injected into the job's launchd plist EnvironmentVariables — instead of
+  // the whole .env. Unset → full .env (backward compatible). Note: `.ts` jobs
+  // also read `.env` via bun's auto-loader, so `env:` only fences `.md`/`.sh`
+  // runs (which rely on the plist block). See README "Security".
+  env?: string[];
   // .md jobs only. When set, the .md is dispatched to a runner registered
   // in `.cronfish.json#runners.<runner>.path` instead of the default
   // claude-cli path. Lets a single .md format target multiple engines
@@ -104,6 +110,27 @@ function asPositiveInt(
   }
   if (val < min) {
     throw new JobValidationError(path, `${key} must be >= ${min}, got ${val}`);
+  }
+  return val;
+}
+
+// Validate an inline-array field (e.g. `env:`). `undefined` (key absent) →
+// undefined, meaning "not declared". An explicit empty `[]` stays `[]`,
+// meaning "declared but empty". Every item must be a non-empty string; the
+// frontmatter parser already produced a string[] so this is mostly a guard.
+function asStringList(
+  path: string,
+  key: string,
+  val: string[] | undefined,
+): string[] | undefined {
+  if (val === undefined) return undefined;
+  for (const item of val) {
+    if (typeof item !== "string" || item.length === 0) {
+      throw new JobValidationError(
+        path,
+        `${key} entries must be non-empty strings, got: ${JSON.stringify(item)}`,
+      );
+    }
   }
   return val;
 }
@@ -255,10 +282,12 @@ function fromMarkdown(path: string, slug: string, isOneTime: boolean): JobMeta {
   const raw = readFileSync(path, "utf-8");
   let frontmatter: Record<string, Scalar>;
   let nested: Record<string, Record<string, Scalar>>;
+  let lists: Record<string, string[]>;
   try {
     const parsed = parseFrontmatter(raw);
     frontmatter = parsed.frontmatter;
     nested = parsed.nested;
+    lists = parsed.lists;
   } catch (e) {
     if (e instanceof FrontmatterError)
       throw new JobValidationError(path, e.message);
@@ -277,6 +306,7 @@ function fromMarkdown(path: string, slug: string, isOneTime: boolean): JobMeta {
     description: asString(path, "description", frontmatter.description),
     missed_after: asString(path, "missed_after", frontmatter.missed_after),
     on_failure: asOnFailure(path, nested.on_failure),
+    env: asStringList(path, "env", lists.env),
     runner: asString(path, "runner", frontmatter.runner),
   };
   applyOneTime(
@@ -312,6 +342,7 @@ function fromTypescript(path: string, slug: string, isOneTime: boolean): JobMeta
     description: cfg.description,
     missed_after: cfg.missed_after,
     on_failure: asOnFailure(path, cfg.on_failure),
+    env: asStringList(path, "env", cfg.env),
   };
   applyOneTime(meta, isOneTime, cfg.run_at, cfg.grace_seconds, cfg.executed_at);
   return meta;
@@ -321,10 +352,12 @@ function fromShell(path: string, slug: string, isOneTime: boolean): JobMeta {
   const raw = readFileSync(path, "utf-8");
   let frontmatter: Record<string, Scalar>;
   let nested: Record<string, Record<string, Scalar>>;
+  let lists: Record<string, string[]>;
   try {
     const parsed = parseShellFrontmatter(raw);
     frontmatter = parsed.frontmatter;
     nested = parsed.nested;
+    lists = parsed.lists;
   } catch (e) {
     if (e instanceof FrontmatterError)
       throw new JobValidationError(path, e.message);
@@ -351,6 +384,7 @@ function fromShell(path: string, slug: string, isOneTime: boolean): JobMeta {
     description: asString(path, "description", frontmatter.description),
     missed_after: asString(path, "missed_after", frontmatter.missed_after),
     on_failure: asOnFailure(path, nested.on_failure),
+    env: asStringList(path, "env", lists.env),
   };
   applyOneTime(
     meta,
