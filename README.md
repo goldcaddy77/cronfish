@@ -396,6 +396,24 @@ the plist block. **`.ts` jobs also read `.env` directly via bun's auto-loader,
 so `env:` does not constrain them** — for a `.ts` job, keep secrets out of
 `.env` or isolate the job in a container.
 
+### Permission fence — `allowed_tools:` (`.md` jobs)
+
+By default the Claude Code runner runs with `--dangerously-skip-permissions`
+(every tool allowed). Declare an `allowed_tools:` list to swap that blanket
+bypass for a capability fence:
+
+```
+---
+schedule: every 30 minutes
+allowed_tools: [Read, "Bash(git status)", mcp__linear__*]
+---
+```
+
+The run then uses `--permission-mode default --allowedTools <list>`; in
+headless mode any tool **not** on the list can't prompt, so it auto-denies —
+the job never hangs. Omitting `allowed_tools:` keeps the skip-permissions
+default (backward compatible). `.md` jobs only — `.ts`/`.sh` run your own code.
+
 ## How cronfish finds bun
 
 Plists invoke `/usr/bin/env bun <runner.ts>`. At `cronfish sync`, cronfish resolves your current

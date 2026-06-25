@@ -285,6 +285,28 @@ async function execMarkdownCustomRunner(
   );
 }
 
+// Build the `claude` CLI argv for a .md job. Pure (no I/O) so it's unit
+// testable. Default posture is `--dangerously-skip-permissions` (backward
+// compatible). When the job declares `allowed_tools`, swap to a capability
+// fence: `--permission-mode default --allowedTools <list>` — off-list tools
+// auto-deny in headless `-p` mode.
+export function buildClaudeArgs(
+  claudeBin: string,
+  job: Pick<JobMeta, "allowed_tools">,
+  modelId: string,
+  prompt: string,
+): string[] {
+  const cmd = [claudeBin];
+  if (job.allowed_tools) {
+    cmd.push("--permission-mode", "default");
+    cmd.push("--allowedTools", ...job.allowed_tools);
+  } else {
+    cmd.push("--dangerously-skip-permissions");
+  }
+  cmd.push("--model", modelId, "-p", prompt);
+  return cmd;
+}
+
 async function execMarkdown(
   job: JobMeta,
   fd: number,
@@ -314,14 +336,13 @@ async function execMarkdown(
     fd,
     `[runner] kind=md model=${model.provider}:${model.id} timeout=${timeoutS}s`,
   );
-  const cmd = [
-    CLAUDE_BIN,
-    "--dangerously-skip-permissions",
-    "--model",
-    model.id,
-    "-p",
-    prompt,
-  ];
+  if (job.allowed_tools) {
+    appendLog(
+      fd,
+      `[runner] permission fence: allowedTools=[${job.allowed_tools.join(", ")}]`,
+    );
+  }
+  const cmd = buildClaudeArgs(CLAUDE_BIN, job, model.id, prompt);
   const env = model.provider === "local" ? localClaudeEnv(model.id) : undefined;
   if (env) {
     appendLog(
@@ -775,7 +796,12 @@ async function maybeFireAlert(input: AlertFireInput): Promise<void> {
   }
 }
 
-main().catch((e) => {
-  console.error("runner: fatal", e);
-  process.exit(1);
-});
+// Guarded so the module can be imported (e.g. by unit tests for the pure
+// helpers above) without launching a run. launchd invokes this file as the
+// program entry, where import.meta.main is true.
+if (import.meta.main) {
+  main().catch((e) => {
+    console.error("runner: fatal", e);
+    process.exit(1);
+  });
+}
