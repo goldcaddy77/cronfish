@@ -47,6 +47,12 @@ export interface JobMeta {
   // also read `.env` via bun's auto-loader, so `env:` only fences `.md`/`.sh`
   // runs (which rely on the plist block). See README "Security".
   env?: string[];
+  // .md jobs only. Capability fence for the Claude Code runner. When set, the
+  // run drops `--dangerously-skip-permissions` and instead passes
+  // `--allowedTools <list>` under the default permission mode, so any tool not
+  // on the list auto-denies in headless mode. Unset → skip-permissions
+  // (backward compatible). See README "Security".
+  allowed_tools?: string[];
   // .md jobs only. When set, the .md is dispatched to a runner registered
   // in `.cronfish.json#runners.<runner>.path` instead of the default
   // claude-cli path. Lets a single .md format target multiple engines
@@ -307,6 +313,7 @@ function fromMarkdown(path: string, slug: string, isOneTime: boolean): JobMeta {
     missed_after: asString(path, "missed_after", frontmatter.missed_after),
     on_failure: asOnFailure(path, nested.on_failure),
     env: asStringList(path, "env", lists.env),
+    allowed_tools: asStringList(path, "allowed_tools", lists.allowed_tools),
     runner: asString(path, "runner", frontmatter.runner),
   };
   applyOneTime(

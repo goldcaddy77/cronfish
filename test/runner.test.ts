@@ -10,6 +10,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { buildClaudeArgs } from "../src/runner.ts";
 
 const RUNNER = new URL("../src/runner.ts", import.meta.url).pathname;
 
@@ -232,4 +233,49 @@ export default async function run() {
     const log = latestLog(root, "slow-ts");
     expect(log).toContain("timeout after 1s");
   }, 15_000);
+});
+
+describe("buildClaudeArgs — permission posture", () => {
+  const BIN = "/usr/bin/claude";
+
+  test("no allowed_tools → skip-permissions (backward compatible)", () => {
+    const args = buildClaudeArgs(BIN, {}, "haiku", "do the thing");
+    expect(args).toEqual([
+      BIN,
+      "--dangerously-skip-permissions",
+      "--model",
+      "haiku",
+      "-p",
+      "do the thing",
+    ]);
+  });
+
+  test("allowed_tools → capability fence, no skip-permissions", () => {
+    const args = buildClaudeArgs(
+      BIN,
+      { allowed_tools: ["Read", "Bash(git *)", "mcp__linear__*"] },
+      "sonnet",
+      "prompt",
+    );
+    expect(args).not.toContain("--dangerously-skip-permissions");
+    expect(args).toContain("--permission-mode");
+    expect(args).toContain("default");
+    const i = args.indexOf("--allowedTools");
+    expect(i).toBeGreaterThan(-1);
+    // each tool is its own variadic arg
+    expect(args.slice(i + 1, i + 4)).toEqual([
+      "Read",
+      "Bash(git *)",
+      "mcp__linear__*",
+    ]);
+    expect(args).toContain("--model");
+    expect(args[args.length - 2]).toBe("-p");
+    expect(args[args.length - 1]).toBe("prompt");
+  });
+
+  test("empty allowed_tools [] still fences (denies everything off-list)", () => {
+    const args = buildClaudeArgs(BIN, { allowed_tools: [] }, "haiku", "p");
+    expect(args).not.toContain("--dangerously-skip-permissions");
+    expect(args).toContain("--allowedTools");
+  });
 });
