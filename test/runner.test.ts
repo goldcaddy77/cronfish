@@ -278,4 +278,28 @@ describe("buildClaudeArgs — permission posture", () => {
     expect(args).not.toContain("--dangerously-skip-permissions");
     expect(args).toContain("--allowedTools");
   });
+
+  test("max_cost adds --max-budget-usd", () => {
+    const args = buildClaudeArgs(BIN, { max_cost: 0.5 }, "haiku", "p");
+    const i = args.indexOf("--max-budget-usd");
+    expect(i).toBeGreaterThan(-1);
+    expect(args[i + 1]).toBe("0.5");
+  });
+
+  test("no max_cost omits the budget flag", () => {
+    const args = buildClaudeArgs(BIN, {}, "haiku", "p");
+    expect(args).not.toContain("--max-budget-usd");
+  });
+
+  test("max_cost composes with the permission fence", () => {
+    const args = buildClaudeArgs(
+      BIN,
+      { allowed_tools: ["Read"], max_cost: 2 },
+      "haiku",
+      "p",
+    );
+    expect(args).toContain("--allowedTools");
+    expect(args).toContain("--max-budget-usd");
+    expect(args).not.toContain("--dangerously-skip-permissions");
+  });
 });

@@ -292,7 +292,7 @@ async function execMarkdownCustomRunner(
 // auto-deny in headless `-p` mode.
 export function buildClaudeArgs(
   claudeBin: string,
-  job: Pick<JobMeta, "allowed_tools">,
+  job: Pick<JobMeta, "allowed_tools" | "max_cost">,
   modelId: string,
   prompt: string,
 ): string[] {
@@ -302,6 +302,10 @@ export function buildClaudeArgs(
     cmd.push("--allowedTools", ...job.allowed_tools);
   } else {
     cmd.push("--dangerously-skip-permissions");
+  }
+  if (job.max_cost !== undefined) {
+    // CLI stops making API calls once the budget is hit (works with -p/--print).
+    cmd.push("--max-budget-usd", String(job.max_cost));
   }
   cmd.push("--model", modelId, "-p", prompt);
   return cmd;
@@ -341,6 +345,9 @@ async function execMarkdown(
       fd,
       `[runner] permission fence: allowedTools=[${job.allowed_tools.join(", ")}]`,
     );
+  }
+  if (job.max_cost !== undefined) {
+    appendLog(fd, `[runner] budget cap: max_cost=$${job.max_cost}`);
   }
   const cmd = buildClaudeArgs(CLAUDE_BIN, job, model.id, prompt);
   const env = model.provider === "local" ? localClaudeEnv(model.id) : undefined;
