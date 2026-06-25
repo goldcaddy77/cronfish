@@ -290,9 +290,13 @@ async function execMarkdownCustomRunner(
 // compatible). When the job declares `allowed_tools`, swap to a capability
 // fence: `--permission-mode default --allowedTools <list>` — off-list tools
 // auto-deny in headless `-p` mode.
+// Mutating built-in tools denied by `read_only:`. Reading/searching and MCP
+// tools stay available; MCP sends must be fenced via `allowed_tools`.
+const READ_ONLY_DENY = ["Write", "Edit", "NotebookEdit", "Bash"];
+
 export function buildClaudeArgs(
   claudeBin: string,
-  job: Pick<JobMeta, "allowed_tools" | "max_cost">,
+  job: Pick<JobMeta, "allowed_tools" | "max_cost" | "read_only">,
   modelId: string,
   prompt: string,
 ): string[] {
@@ -302,6 +306,12 @@ export function buildClaudeArgs(
     cmd.push("--allowedTools", ...job.allowed_tools);
   } else {
     cmd.push("--dangerously-skip-permissions");
+  }
+  if (job.read_only) {
+    // Hard-remove the mutating built-ins. `--disallowedTools` wins over both
+    // skip-permissions and an `--allowedTools` overlap, so this holds under
+    // either posture.
+    cmd.push("--disallowedTools", ...READ_ONLY_DENY);
   }
   if (job.max_cost !== undefined) {
     // CLI stops making API calls once the budget is hit (works with -p/--print).
@@ -348,6 +358,9 @@ async function execMarkdown(
   }
   if (job.max_cost !== undefined) {
     appendLog(fd, `[runner] budget cap: max_cost=$${job.max_cost}`);
+  }
+  if (job.read_only) {
+    appendLog(fd, `[runner] read-only: deny [${READ_ONLY_DENY.join(", ")}]`);
   }
   const cmd = buildClaudeArgs(CLAUDE_BIN, job, model.id, prompt);
   const env = model.provider === "local" ? localClaudeEnv(model.id) : undefined;

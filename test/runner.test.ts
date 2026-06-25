@@ -302,4 +302,35 @@ describe("buildClaudeArgs — permission posture", () => {
     expect(args).toContain("--max-budget-usd");
     expect(args).not.toContain("--dangerously-skip-permissions");
   });
+
+  test("read_only denies the mutating built-ins", () => {
+    const args = buildClaudeArgs(BIN, { read_only: true }, "haiku", "p");
+    const i = args.indexOf("--disallowedTools");
+    expect(i).toBeGreaterThan(-1);
+    expect(args.slice(i + 1, i + 5)).toEqual([
+      "Write",
+      "Edit",
+      "NotebookEdit",
+      "Bash",
+    ]);
+    // read_only alone keeps the skip-permissions default for everything else
+    expect(args).toContain("--dangerously-skip-permissions");
+  });
+
+  test("read_only composes with the allowlist (deny + allow both present)", () => {
+    const args = buildClaudeArgs(
+      BIN,
+      { allowed_tools: ["Read", "mcp__linear__*"], read_only: true },
+      "haiku",
+      "p",
+    );
+    expect(args).toContain("--allowedTools");
+    expect(args).toContain("--disallowedTools");
+    expect(args).not.toContain("--dangerously-skip-permissions");
+  });
+
+  test("no read_only omits the deny flag", () => {
+    const args = buildClaudeArgs(BIN, {}, "haiku", "p");
+    expect(args).not.toContain("--disallowedTools");
+  });
 });
