@@ -27,8 +27,11 @@ import {
 } from "./prune.ts";
 import { Database } from "bun:sqlite";
 import { startUiServer } from "./ui/server.ts";
+import pkg from "../package.json" with { type: "json" };
 
-const VERSION = "0.11.0";
+// Single source of truth: package.json. semantic-release bumps it on release,
+// so `cronfish --version` can never drift from the published version again.
+const VERSION = pkg.version;
 
 const CONSUMER_ROOT = process.env.CRONFISH_CONSUMER_ROOT || process.cwd();
 const CRON_DIR = join(CONSUMER_ROOT, "cron");
