@@ -139,6 +139,13 @@ describe("inline arrays (env / allowed_tools)", () => {
     expect(lists.env).toEqual(["A", "B"]);
   });
 
+  test("ignores a trailing comment that itself contains a bracket", () => {
+    const { lists } = parseFrontmatter(
+      `---\nenv: [A, B] # see arr[0]\n---\n`,
+    );
+    expect(lists.env).toEqual(["A", "B"]);
+  });
+
   test("shell frontmatter surfaces inline arrays", () => {
     const { lists } = parseShellFrontmatter(
       `#!/bin/bash\n# ---\n# schedule: 5m\n# env: [FOO, BAR]\n# ---\necho hi`,

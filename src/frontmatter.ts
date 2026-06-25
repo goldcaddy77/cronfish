@@ -99,7 +99,33 @@ function splitTopLevelCommas(inner: string): string[] {
 function parseInlineList(raw: string, lineNo: number): string[] {
   const t = raw.trim();
   const lb = t.indexOf("[");
-  const rb = t.lastIndexOf("]");
+  // Find the matching close bracket by scanning from `[`, respecting quotes
+  // and nesting — not lastIndexOf("]"), which a `]` inside a trailing comment
+  // (`[A, B] # arr[0]`) or a quoted item would defeat. Everything after the
+  // matched `]` (e.g. a trailing comment) is ignored.
+  let rb = -1;
+  let s: string | null = null;
+  let d = 0;
+  for (let i = lb; i >= 0 && i < t.length; i++) {
+    const c = t[i];
+    const prev = t[i - 1];
+    if (s) {
+      if (c === s && prev !== "\\") s = null;
+      continue;
+    }
+    if (c === '"' || c === "'" || c === "`") {
+      s = c;
+      continue;
+    }
+    if (c === "[") d++;
+    else if (c === "]") {
+      d--;
+      if (d === 0) {
+        rb = i;
+        break;
+      }
+    }
+  }
   if (lb < 0 || rb < lb) {
     throw new FrontmatterError(
       `line ${lineNo}: inline array must open with "[" and close with "]" on the same line`,
