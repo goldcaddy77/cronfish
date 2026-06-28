@@ -13,12 +13,15 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  readdirSync,
   renameSync,
+  rmSync,
   statSync,
   writeFileSync,
   writeSync,
   fsyncSync,
 } from "node:fs";
+import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
 import { dlopen, FFIType, suffix } from "bun:ffi";
@@ -111,21 +114,103 @@ export function resolveOneTime(
 
 // --- Error sentinel surface ---
 //
-// Any sync-time failure for a one-time job writes a sentinel here. The
-// heartbeat cron (Phase 2) sweeps this folder and alerts on non-empty.
+// A failure for a one-time job writes a sentinel here; consumers (e.g. a
+// heartbeat job) sweep the folder and alert on non-empty. Two invariants
+// keep the folder from running away:
+//
+//   1. Dedup — the filename is derived from (slug, hash(reason)), so the
+//      SAME error recurring on every sync overwrites one file instead of
+//      writing a new one each minute. An unfixed config error is 1 file,
+//      not thousands.
+//   2. Ownership + class — cronfish-written files carry a `.<class>.cronfish.txt`
+//      suffix so a consumer can drop its own sentinels alongside without
+//      cronfish reaping them. Class "sync" = re-derived every reconcile
+//      (self-heals: reapStaleSentinels removes it once the error stops
+//      recurring). Class "run" = a one-shot runtime failure that is NOT
+//      re-detected at sync, so it persists until `cronfish errors --clear`.
 
-export function writeSentinel(cronDir: string, slug: string, reason: string): string {
+export type SentinelClass = "sync" | "run";
+
+const SENTINEL_EXT = ".cronfish.txt";
+
+function safeSlug(slug: string): string {
+  return slug.replace(/[^A-Za-z0-9._-]/g, "_");
+}
+
+// Deterministic dedup key: same (slug, reason) → same filename → overwrite.
+export function sentinelFilename(
+  slug: string,
+  reason: string,
+  cls: SentinelClass,
+): string {
+  const hash = createHash("sha1").update(reason).digest("hex").slice(0, 8);
+  return `${safeSlug(slug)}--${hash}.${cls}${SENTINEL_EXT}`;
+}
+
+export function writeSentinel(
+  cronDir: string,
+  slug: string,
+  reason: string,
+  cls: SentinelClass = "run",
+): string {
   const dir = errorsDir(cronDir);
   mkdirSync(dir, { recursive: true });
-  const ts = Date.now();
-  const safeSlug = slug.replace(/[^A-Za-z0-9._-]/g, "_");
-  const path = join(dir, `${ts}-${safeSlug}.txt`);
+  const path = join(dir, sentinelFilename(slug, reason, cls));
   const body =
     `slug: ${slug}\n` +
-    `at: ${new Date(ts).toISOString()}\n` +
+    `at: ${new Date().toISOString()}\n` +
     `reason:\n${reason}\n`;
   writeFileSync(path, body, "utf-8");
   return path;
+}
+
+// Every file currently in cron/.errors/ (basenames), or [] when absent.
+export function listSentinels(cronDir: string): string[] {
+  const dir = errorsDir(cronDir);
+  if (!existsSync(dir)) return [];
+  return readdirSync(dir).filter((f) => f.endsWith(".txt"));
+}
+
+// Remove sentinels. With no slug, clears the whole folder (cronfish-owned
+// AND any legacy/consumer .txt files — the manual `errors --clear` escape
+// hatch). With a slug, clears only files for that slug. Returns the count.
+export function clearSentinels(cronDir: string, slug?: string): number {
+  const dir = errorsDir(cronDir);
+  if (!existsSync(dir)) return 0;
+  const prefix = slug ? `${safeSlug(slug)}--` : null;
+  let n = 0;
+  for (const f of readdirSync(dir)) {
+    if (!f.endsWith(".txt")) continue;
+    if (prefix && !f.startsWith(prefix)) continue;
+    try {
+      rmSync(join(dir, f));
+      n++;
+    } catch {}
+  }
+  return n;
+}
+
+// Self-heal for "sync"-class sentinels: after a reconcile, delete any
+// cronfish "sync" sentinel whose filename was NOT (re)written this run —
+// i.e. the error it recorded no longer occurs. "run"-class and foreign
+// files are never touched here.
+export function reapStaleSentinels(
+  cronDir: string,
+  keep: Set<string>,
+): number {
+  const dir = errorsDir(cronDir);
+  if (!existsSync(dir)) return 0;
+  const suffix = `.sync${SENTINEL_EXT}`;
+  let n = 0;
+  for (const f of readdirSync(dir)) {
+    if (!f.endsWith(suffix)) continue;
+    if (keep.has(f)) continue;
+    try {
+      rmSync(join(dir, f));
+      n++;
+    } catch {}
+  }
+  return n;
 }
 
 // --- flock-based re-fire guard ---

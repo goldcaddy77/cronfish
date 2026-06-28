@@ -360,6 +360,25 @@ export function uninstall(prefix: string, slug: string): boolean {
   return existed;
 }
 
+// Self-removal for a one-time job from inside its own runner process. The
+// runner IS the launchd-managed process here, so `bootout` may SIGTERM us
+// mid-call — remove the plist FILE first so that even if we're killed before
+// bootout returns, launchd can't reload (and RunAtLoad-refire) the job on the
+// next login/reboot. The live bootout is best-effort cleanup of the already-
+// fired service.
+export function removeOneTimeSelf(prefix: string, slug: string): boolean {
+  const label = labelFor(prefix, slug);
+  const dest = plistPathFor(label);
+  const existed = existsSync(dest) || isLoaded(label);
+  if (existsSync(dest)) {
+    try {
+      rmSync(dest);
+    } catch {}
+  }
+  sh(["launchctl", "bootout", `${gui()}/${label}`]);
+  return existed;
+}
+
 export function statusOf(prefix: string, slug: string): string {
   const label = labelFor(prefix, slug);
   const { code, out, err } = sh(["launchctl", "print", `${gui()}/${label}`]);

@@ -37,14 +37,18 @@ import {
 import { loadJob, slugFromPath, type JobMeta } from "./jobs.ts";
 import { resolveModel, localClaudeEnv } from "./models.ts";
 import {
+  DEFAULT_GRACE_SECONDS,
   archiveOneTime,
   releaseFlock,
+  resolveOneTime,
   setTsExecutedAt,
   tryFlockExclusive,
   writeAndFsync,
   writeSentinel,
   type FlockHandle,
 } from "./oneTime.ts";
+import { loadBundlePrefix } from "./config.ts";
+import { platform } from "./platform/index.ts";
 import { setFrontmatterKey, setShellFrontmatterKey } from "./frontmatter.ts";
 import { parseLastResult } from "./result.ts";
 import {
@@ -550,6 +554,27 @@ function stampExecutedAt(job: JobMeta, iso: string): void {
   writeAndFsync(job.path, next);
 }
 
+// Remove this one-time job's own launchd plist after it has fired. Without
+// this, a fire-now plist (RunAtLoad=true, no calendar) lingers in
+// ~/Library/LaunchAgents until the NEXT `cronfish sync` boots it out — and a
+// reboot/login in that window reloads it and re-fires (against an already-
+// archived file). Self-removing here closes that window regardless of when
+// the consumer next syncs. Best-effort: failures never block completion.
+function selfRemoveOneTimePlist(job: JobMeta): void {
+  // Logs to console (→ launchd.out/err), not the per-run fd: this runs as the
+  // last act after the log fd is already closed, and the bootout it performs
+  // may terminate this process, so it must follow all ledger/alert work.
+  try {
+    const prefix = loadBundlePrefix(consumerRoot());
+    const existed = platform().removeOneTimeSelf(prefix, job.slug);
+    console.log(`[runner] one-time: removed own plist (existed=${existed})`);
+  } catch (e) {
+    console.error(
+      `[runner] one-time: self-remove plist failed: ${(e as Error).message}`,
+    );
+  }
+}
+
 function completeOneTime(job: JobMeta, fd: number): void {
   if (!job.oneTime) return;
   const iso = new Date().toISOString();
@@ -641,6 +666,33 @@ async function main(): Promise<void> {
       }
     } catch {
       // re-parse failed; proceed with the original meta.
+    }
+
+    // Re-assert grace at RUN time. launchd fires a StartCalendarInterval job
+    // once on wake if the machine was asleep/off through the scheduled minute
+    // (coalesced) — which can land long past run_at. Grace is checked at sync
+    // time, but nothing re-checks it when launchd actually fires. Refuse a
+    // stale wake-up fire so a one-time job can't run hours/days late, and
+    // remove the plist so it won't try again on the next wake.
+    if (job.runAtMs !== undefined) {
+      const grace = job.graceSeconds ?? DEFAULT_GRACE_SECONDS;
+      const status = resolveOneTime(job.runAtMs, grace, Date.now(), undefined);
+      if (status.kind === "past-grace") {
+        console.error(
+          `[runner] one-time: ${job.slug} fired past grace — refusing. ${status.reason}`,
+        );
+        try {
+          writeSentinel(
+            join(consumerRoot(), "cron"),
+            job.slug,
+            `runtime past grace: ${status.reason}`,
+            "run",
+          );
+        } catch {}
+        if (oneTimeLock) releaseFlock(oneTimeLock);
+        selfRemoveOneTimePlist(job);
+        process.exit(0);
+      }
     }
   }
 
@@ -761,6 +813,9 @@ async function main(): Promise<void> {
     try {
       db?.close();
     } catch {}
+    // LAST act for a one-time job: remove its own plist. May SIGTERM us via
+    // bootout, so everything above (ledger, alert) is already done.
+    if (job.oneTime) selfRemoveOneTimePlist(job);
   }
   process.exit(lastResult.code);
 }

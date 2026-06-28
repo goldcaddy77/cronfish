@@ -95,6 +95,34 @@ export default async function run() {
     expect(log).toContain("exit=1");
   }, 20_000);
 
+  test("one-time fired past grace is refused, not run, and writes a sentinel", () => {
+    const sentinel = join(root, "ran.txt");
+    const oneTime = join(root, "cron", "one-time");
+    mkdirSync(oneTime, { recursive: true });
+    const job = join(oneTime, "expired.ts");
+    writeFileSync(
+      job,
+      `export const config = { run_at: "2020-01-01T00:00:00Z", enabled: true };
+export default async function run() {
+  const fs = await import("node:fs");
+  fs.writeFileSync(${JSON.stringify(sentinel)}, "ran");
+}
+`,
+      "utf-8",
+    );
+    const r = spawnRunner(root, job);
+    expect(r.code).toBe(0);
+    expect(r.out + r.err).toContain("past grace");
+    expect(existsSync(sentinel)).toBe(false); // job body never ran
+    const errs = readdirSync(join(root, "cron", ".errors")).filter((f) =>
+      f.endsWith(".txt"),
+    );
+    expect(errs).toHaveLength(1);
+    expect(readFileSync(join(root, "cron", ".errors", errs[0]!), "utf-8")).toContain(
+      "runtime past grace",
+    );
+  });
+
   test("concurrency=skip with live lock exits 0 without running", () => {
     const sentinel = join(root, "ran.txt");
     const job = writeJob(

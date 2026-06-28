@@ -173,23 +173,34 @@ Sync behavior:
 | ----------------------------- | ------------------------------------------------- |
 | Future                        | plist installed with `StartCalendarInterval` for the exact minute |
 | Within `grace_seconds` of now | plist installed with `RunAtLoad: true` — fires on bootstrap |
-| Past `grace_seconds`          | **refused**; sentinel written to `cron/.errors/`  |
+| Past `grace_seconds`          | **refused**; sentinel written + file archived out of `cron/one-time/` |
 | `executed_at:` already set    | skipped (file should already be archived)         |
 
-After firing, the runner stamps `executed_at: <ISO>` and moves the file to
-`~/Library/Application Support/cronfish/done/` — outside the repo, so the
-audit trail doesn't bloat git. A `flock` plus the `executed_at` re-check guard
-against double-fires. The next `cronfish sync` removes the orphaned plist.
+After firing, the runner stamps `executed_at: <ISO>`, moves the file to
+`~/Library/Application Support/cronfish/done/` (outside the repo, so the audit
+trail doesn't bloat git), and **removes its own plist** so a reboot/login in
+the window before the next `cronfish sync` can't reload and re-fire it. A
+`flock` plus the `executed_at` re-check guard against double-fires.
 
-**One-time jobs must be idempotent.** launchd can re-fire on machine restart,
-system unsleep, or load spikes; the flock + `executed_at` guard catches the
+The runner also **re-checks `grace_seconds` at fire time**: launchd runs a
+`StartCalendarInterval` job once on wake if the machine slept through the
+scheduled minute (a coalesced missed fire), which can land long after `run_at`.
+A fire that arrives past grace is refused (sentinel) instead of running late.
+
+**One-time jobs must be idempotent.** The guards above catch the common
 double-fire, but only after the file is stamped. Anything destructive between
 "start" and "stamp" can repeat. Write handlers that tolerate two invocations.
 
-**Failure surface — `cron/.errors/`.** Any sync-time refusal (past-grace, bad
-YAML, missing `run_at`) writes a sentinel file there with the slug, timestamp,
-and reason. Runner-side failures (archive failed, executed_at write failed)
-also land here. Wire a heartbeat cron to alert on non-empty.
+**Failure surface — `cron/.errors/`.** Any refusal (past-grace, bad YAML,
+missing `run_at`) and any runner-side failure (archive failed, `executed_at`
+write failed) writes a sentinel there with slug, timestamp, and reason. Wire a
+heartbeat cron to alert on non-empty. Two properties keep the folder bounded:
+sentinels **dedup** (the same recurring error overwrites one file, not one per
+sync), and sync-time sentinels **self-heal** — the next clean `cronfish sync`
+clears any whose error no longer occurs. Inspect or clear by hand with
+`cronfish errors` / `cronfish errors --clear [slug]`. cronfish only manages
+files it wrote (`*.cronfish.txt`); a consumer can drop its own sentinels in the
+same folder without them being reaped.
 
 Smoke-test template: `templates/_examples/one-time/echo-at.md`.
 
@@ -206,6 +217,11 @@ Smoke-test template: `templates/_examples/one-time/echo-at.md`.
 `manual` jobs are discovered, validated, and listed, but no plist is installed and no calendar
 fires them. Use it for scheduling candidates — jobs you're staging in `cron/` before flipping on
 a real schedule. Pure on-demand scripts that aren't scheduling candidates belong outside `cron/`.
+
+**Sub-10s schedules don't work.** launchd enforces a ~10s floor between relaunches of the same
+job (its implicit `ThrottleInterval`). A `schedule:` faster than `10s` fires no quicker than every
+10s; `cronfish sync` warns when it sees one. Need true high-frequency work? Run a long-lived loop
+as a single job instead of many fast fires.
 
 ## Config — `.cronfish.json` (optional, at repo root)
 
@@ -245,6 +261,7 @@ cronfish enable <slug>              flip enabled, then sync
 cronfish disable <slug>             flip disabled, then sync
 cronfish delete <slug> --yes        bootout + remove plist + job file
 cronfish status [slug]              launchctl print + tail of latest log
+cronfish errors [--clear] [slug]    list error sentinels (cron/.errors/); --clear removes them
 cronfish run <slug>                 invoke runner directly (no launchd) — for testing
 cronfish watchdog                   detect missed schedules → fire alerts
 cronfish alerts test [adapter]      send a test alert via the named (or default) adapter
@@ -531,10 +548,15 @@ via plist `WorkingDirectory`), so no shell wrapper is needed.
 
 - macOS (launchd). Linux (systemd) and Windows (Task Scheduler) are on the backlog.
 - Bun ≥ 1.0.
+- **A logged-in GUI (Aqua) session.** cronfish installs per-user LaunchAgents under
+  `~/Library/LaunchAgents`, which only load while the user is logged into the desktop. On a
+  headless box reached only over SSH (no console login), agents never load and jobs never fire —
+  enable auto-login, or keep a desktop session active. (A system-wide `LaunchDaemon` backend that
+  runs without a login session is on the backlog.)
 
 ## Status
 
-v0.11 — used in production by the author. API may still break before v1. File issues if you hit
+v0.x — used in production by the author. API may still break before v1. File issues if you hit
 something rough.
 
 ## License

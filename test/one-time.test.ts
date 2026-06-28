@@ -18,6 +18,9 @@ import {
   tryFlockExclusive,
   releaseFlock,
   writeSentinel,
+  sentinelFilename,
+  clearSentinels,
+  reapStaleSentinels,
   errorsDir,
   setTsExecutedAt,
 } from "../src/oneTime.ts";
@@ -186,6 +189,57 @@ describe("writeSentinel", () => {
     expect(files[0]).toMatch(/verify-health-abc/);
     const body = readFileSync(join(errorsDir(h.cron), files[0]), "utf-8");
     expect(body).toMatch(/past grace/);
+  });
+
+  test("dedups: same (slug, reason) overwrites instead of piling up", () => {
+    for (let i = 0; i < 50; i++) {
+      writeSentinel(h.cron, "discover.ts", "discovery error: boom", "sync");
+    }
+    expect(readdirSync(errorsDir(h.cron))).toHaveLength(1);
+  });
+
+  test("distinct reasons for one slug coexist", () => {
+    writeSentinel(h.cron, "discover.ts", "reason A", "sync");
+    writeSentinel(h.cron, "discover.ts", "reason B", "sync");
+    expect(readdirSync(errorsDir(h.cron))).toHaveLength(2);
+  });
+});
+
+describe("sentinel lifecycle (clear / reap)", () => {
+  let h: ReturnType<typeof makeRoot>;
+  beforeEach(() => {
+    h = makeRoot();
+  });
+  afterEach(() => {
+    rmSync(h.root, { recursive: true, force: true });
+  });
+
+  test("clearSentinels(slug) only removes that slug; clearSentinels() removes all", () => {
+    writeSentinel(h.cron, "alpha", "x", "sync");
+    writeSentinel(h.cron, "beta", "y", "run");
+    writeFileSync(join(errorsDir(h.cron), "consumer-owned.txt"), "foreign");
+
+    expect(clearSentinels(h.cron, "alpha")).toBe(1);
+    expect(readdirSync(errorsDir(h.cron))).toHaveLength(2);
+
+    expect(clearSentinels(h.cron)).toBe(2); // beta + foreign
+    expect(readdirSync(errorsDir(h.cron))).toHaveLength(0);
+  });
+
+  test("reapStaleSentinels drops sync-class not rewritten, keeps run-class + foreign", () => {
+    const stale = sentinelFilename("gone", "discovery error: x", "sync");
+    writeSentinel(h.cron, "gone", "discovery error: x", "sync"); // not in keep → reaped
+    writeSentinel(h.cron, "still", "discovery error: y", "sync"); // in keep → kept
+    writeSentinel(h.cron, "past", "runtime past grace", "run"); // run-class → kept
+    writeFileSync(join(errorsDir(h.cron), "consumer.txt"), "foreign"); // foreign → kept
+
+    const keep = new Set([sentinelFilename("still", "discovery error: y", "sync")]);
+    const reaped = reapStaleSentinels(h.cron, keep);
+
+    expect(reaped).toBe(1);
+    const left = readdirSync(errorsDir(h.cron)).sort();
+    expect(left).not.toContain(stale);
+    expect(left).toHaveLength(3); // still + past + foreign
   });
 });
 

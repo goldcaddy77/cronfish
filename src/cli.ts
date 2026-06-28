@@ -15,7 +15,15 @@ import { basename, join } from "node:path";
 import { setFrontmatterKey, setShellFrontmatterKey } from "./frontmatter.ts";
 import { discoverJobs, findJobFile, loadJob, type JobMeta } from "./jobs.ts";
 import { dispatchSchedule, type Dispatched } from "./schedule.ts";
-import { resolveOneTime, writeSentinel } from "./oneTime.ts";
+import {
+  archiveOneTime,
+  clearSentinels,
+  listSentinels,
+  reapStaleSentinels,
+  resolveOneTime,
+  writeSentinel,
+} from "./oneTime.ts";
+import { defaultBundlePrefix } from "./config.ts";
 import { platform } from "./platform/index.ts";
 import { loadState, rememberPrefix } from "./state.ts";
 import { dbPath, markDeleted, openDb, upsertJob } from "./db.ts";
@@ -97,7 +105,7 @@ function parseRetention(raw: unknown): RetentionConfig | undefined {
 
 function loadConfig(): CronfishConfig {
   const path = join(CONSUMER_ROOT, ".cronfish.json");
-  const defaultPrefix = `com.cronfish.${basename(CONSUMER_ROOT)}`;
+  const defaultPrefix = defaultBundlePrefix(CONSUMER_ROOT);
   if (!existsSync(path)) return { bundle_prefix: defaultPrefix };
   let parsed: Partial<CronfishConfig>;
   try {
@@ -327,6 +335,9 @@ function loadRunnerNames(): Set<string> {
 function cmdSync(): void {
   const p = platform();
   const { jobs, errors } = discoverJobs(CRON_DIR);
+  // "sync"-class sentinel filenames written this run. Anything still on disk
+  // from a prior sync that ISN'T in here gets reaped at the end (self-heal).
+  const writtenSentinels = new Set<string>();
   for (const e of errors) {
     console.error(`[cronfish] ${e.path}: ${e.message}`);
     // Bad YAML / invalid run_at on a one-time file → sentinel. Any other
@@ -334,7 +345,13 @@ function cmdSync(): void {
     // cron/one-time/ since silent-skip is the failure mode we're killing.
     if (e.path.includes(`/${"one-time"}/`)) {
       const slug = e.path.split("/").pop() ?? "unknown";
-      writeSentinel(CRON_DIR, slug, `discovery error: ${e.message}`);
+      const written = writeSentinel(
+        CRON_DIR,
+        slug,
+        `discovery error: ${e.message}`,
+        "sync",
+      );
+      writtenSentinels.add(basename(written));
     }
   }
 
@@ -347,6 +364,15 @@ function cmdSync(): void {
       const known = [...knownRunners].join(", ") || "(none)";
       console.error(
         `[cronfish] WARN ${j.slug}: runner "${j.runner}" not in .cronfish.json#runners — known: ${known}`,
+      );
+    }
+    // launchd enforces a ~10s floor between relaunches (its implicit
+    // ThrottleInterval). A faster `schedule:` silently fires no quicker than
+    // every 10s, so warn rather than let it look like it works.
+    const d = safeDispatch(j.schedule);
+    if (d.kind === "seconds" && d.value < 10) {
+      console.error(
+        `[cronfish] WARN ${j.slug}: schedule ${d.value}s is below launchd's ~10s relaunch floor — it will fire no faster than every 10s`,
       );
     }
   }
@@ -367,7 +393,20 @@ function cmdSync(): void {
     ) {
       console.error(`[cronfish] ${j.slug}: ${decision.reason}`);
       if (j.oneTime && decision.reason?.startsWith("one-time past grace:")) {
-        writeSentinel(CRON_DIR, j.slug, decision.reason);
+        // A past-grace one-time file would otherwise be re-discovered on
+        // EVERY sync and re-write a sentinel forever. Record one durable
+        // ("run"-class, never reaped) sentinel so the missed window is
+        // visible, then archive the file out of cron/one-time/ so it stops
+        // recurring.
+        writeSentinel(CRON_DIR, j.slug, decision.reason, "run");
+        try {
+          const dest = archiveOneTime(j.path);
+          console.error(`[cronfish] ${j.slug}: archived past-grace one-time → ${dest}`);
+        } catch (e) {
+          console.error(
+            `[cronfish] ${j.slug}: archive of past-grace one-time failed: ${(e as Error).message}`,
+          );
+        }
       }
     }
   }
@@ -439,6 +478,11 @@ function cmdSync(): void {
       console.error(`[cronfish] auto-prune skipped: ${(e as Error).message}`);
     }
   }
+
+  // Self-heal: drop any "sync"-class sentinel that was NOT re-written this
+  // run (its error no longer occurs). "run"-class + foreign files survive.
+  const reaped = reapStaleSentinels(CRON_DIR, writtenSentinels);
+  if (reaped > 0) console.log(`[cronfish] cleared ${reaped} resolved sentinel(s)`);
 
   console.log("[cronfish] sync complete");
 }
@@ -949,6 +993,28 @@ function cmdInit(): void {
   );
 }
 
+function cmdErrors(clear: boolean, slug?: string): void {
+  if (clear) {
+    const n = clearSentinels(CRON_DIR, slug);
+    console.log(
+      `[cronfish] cleared ${n} sentinel(s)${slug ? ` for ${slug}` : ""}`,
+    );
+    return;
+  }
+  const files = listSentinels(CRON_DIR);
+  if (files.length === 0) {
+    console.log("[cronfish] no error sentinels");
+    return;
+  }
+  console.log(
+    `[cronfish] ${files.length} error sentinel(s) in cron/.errors/ (clear with \`cronfish errors --clear\`):\n`,
+  );
+  for (const f of files.sort()) {
+    const body = readFileSync(join(CRON_DIR, ".errors", f), "utf-8").trim();
+    console.log(`--- ${f} ---\n${body}\n`);
+  }
+}
+
 function usage(): void {
   console.log(
     `cronfish ${VERSION} — drop a file, schedule it.
@@ -964,6 +1030,7 @@ usage:
   cronfish disable <slug>             flip disabled, then sync
   cronfish delete <slug> --yes        bootout + remove plist + job file
   cronfish status [slug]              all jobs (no arg) or one slug's launchctl + log tail
+  cronfish errors [--clear] [slug]    list error sentinels (cron/.errors/); --clear removes them
   cronfish run <slug>                 invoke runner directly (no launchd)
   cronfish watchdog                   check enabled jobs for missed schedules → fire alerts
   cronfish alerts test [adapter]      send a test alert via the named (or default) adapter
@@ -1055,6 +1122,12 @@ async function main(): Promise<void> {
     case "status":
       cmdStatus(rest[0]);
       return;
+    case "errors": {
+      const clear = rest.includes("--clear");
+      const slug = rest.find((a) => !a.startsWith("-"));
+      cmdErrors(clear, slug);
+      return;
+    }
     case "run":
       if (!rest[0]) throw new Error("usage: cronfish run <slug>");
       await cmdRun(rest[0]);

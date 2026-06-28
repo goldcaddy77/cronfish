@@ -322,4 +322,92 @@ echo "hello from bash"
     expect(syncR.code).toBe(0);
     expect(listPlists(ctx)).toHaveLength(0);
   });
+
+  function writeOneTime(ctx: Ctx, name: string, body: string): string {
+    const dir = join(ctx.root, "cron", "one-time");
+    mkdirSync(dir, { recursive: true });
+    const p = join(dir, name);
+    writeFileSync(p, body, "utf-8");
+    return p;
+  }
+
+  function errorFiles(ctx: Ctx): string[] {
+    const dir = join(ctx.root, "cron", ".errors");
+    if (!existsSync(dir)) return [];
+    return readdirSync(dir).filter((f) => f.endsWith(".txt"));
+  }
+
+  test("past-grace one-time: sentinel written once, file archived, no re-flood", () => {
+    const p = writeOneTime(
+      ctx,
+      "expired.ts",
+      `export const config = { run_at: "2020-01-01T00:00:00Z", enabled: true };
+export default async function run() {}
+`,
+    );
+    runCli(ctx, ["sync"]);
+    // File archived out of cron/one-time/ so it can't be re-discovered.
+    expect(existsSync(p)).toBe(false);
+    expect(errorFiles(ctx)).toHaveLength(1);
+
+    // A second sync must NOT add another sentinel (the flood we fixed).
+    runCli(ctx, ["sync"]);
+    expect(errorFiles(ctx)).toHaveLength(1);
+
+    // The sentinel is run-class (durable) — survives a clean reconcile.
+    const errs = runCli(ctx, ["errors"]);
+    expect(errs.out).toContain("expired");
+  });
+
+  test("discovery-error sentinel self-heals once the bad file is gone", () => {
+    const p = writeOneTime(
+      ctx,
+      "broken.ts",
+      `export const config = { run_at: "not-a-real-date", enabled: true };
+export default async function run() {}
+`,
+    );
+    runCli(ctx, ["sync"]);
+    expect(errorFiles(ctx)).toHaveLength(1); // sync-class discovery sentinel
+
+    // Recurs (deduped) but does not pile up while still broken.
+    runCli(ctx, ["sync"]);
+    expect(errorFiles(ctx)).toHaveLength(1);
+
+    // Fix it → next sync reaps the now-stale sync-class sentinel.
+    rmSync(p);
+    const r = runCli(ctx, ["sync"]);
+    expect(r.out).toContain("cleared 1 resolved sentinel");
+    expect(errorFiles(ctx)).toHaveLength(0);
+  });
+
+  test("errors --clear empties the sentinel folder", () => {
+    writeOneTime(
+      ctx,
+      "expired.ts",
+      `export const config = { run_at: "2020-01-01T00:00:00Z", enabled: true };
+export default async function run() {}
+`,
+    );
+    runCli(ctx, ["sync"]);
+    expect(errorFiles(ctx)).toHaveLength(1);
+
+    const clr = runCli(ctx, ["errors", "--clear"]);
+    expect(clr.code).toBe(0);
+    expect(clr.out).toContain("cleared 1 sentinel");
+    expect(errorFiles(ctx)).toHaveLength(0);
+  });
+
+  test("sub-10s schedule warns about launchd's relaunch floor", () => {
+    writeJob(
+      ctx,
+      "fast.ts",
+      `export const config = { schedule: 5, enabled: true };
+export default async function run() {}
+`,
+    );
+    const r = runCli(ctx, ["sync"]);
+    expect(r.code).toBe(0);
+    expect(`${r.out}${r.err}`).toMatch(/below launchd's ~10s relaunch floor/);
+  });
 });
