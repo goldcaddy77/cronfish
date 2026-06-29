@@ -4,7 +4,7 @@
 
 <h1 align="center">cronfish 🐟</h1>
 
-<p align="center"><strong>A file-based job scheduler for macOS. Drop a script in a folder; launchd runs it on a schedule.</strong></p>
+<p align="center"><strong>Write a cron job in Markdown — an LLM runs it on a schedule. Or drop a <code>.ts</code>/<code>.sh</code> script for the deterministic stuff. launchd fires all three.</strong></p>
 
 <p align="center">
   <a href="https://www.npmjs.com/package/cronfish"><img src="https://img.shields.io/npm/v/cronfish?logo=npm" alt="npm"></a>
@@ -14,9 +14,24 @@
   <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT License"></a>
 </p>
 
-Cronfish is for personal automation — the small scheduled jobs you'd otherwise hand-roll as
-launchd plists or crontab lines. Drop a `.md` (Claude prompt), `.ts` (Bun program), or `.sh`
-(bash script) in `cron/`, run `cronfish sync`, and launchd takes it from there.
+The pitch in one file. This is a complete, scheduled cron job:
+
+```markdown
+---
+schedule: "every morning at 8"
+model: sonnet
+---
+
+Read my calendar for today, check the weather, and post a
+one-paragraph brief to the #daily Slack channel.
+```
+
+Drop it in `cron/`, run `cronfish sync`, and launchd runs it every morning — the body _is_ the job,
+handed to an LLM at fire time. No script to write, no glue code. **Markdown is a valid cron job.**
+
+When the work _is_ deterministic — a backup, a sync, a healthcheck — write it as `.ts` (Bun) or
+`.sh` (bash) instead. Same frontmatter, same `cronfish sync`, no LLM in the loop. One scheduler,
+three tiers; reach for the lightest that does the job.
 
 It makes the file the job: frontmatter is the schedule, the path is the slug — no hand-written
 plists, no registration step. You also get per-run logs, retries, concurrency guards, failure
@@ -31,20 +46,24 @@ every kind.
 
 ## Why cronfish?
 
-Claude's native scheduled agents are the obvious alternative, and for pure-LLM tasks they're great
-— zero setup, nothing to host. But everything runs on Anthropic's managed runtime: you pay their
-rates, and every job is a Claude job. Cronfish trades that convenience for control:
+Two kinds of scheduler exist today, and neither does both halves:
 
-- **Any job, not just LLM jobs.** Most scheduled work is plain bash or a TypeScript script — a
-  backup, a sync, a healthcheck. Cronfish runs those first-class, alongside `.md` Claude prompts.
-- **Any harness.** `.md` jobs shell out to a CLI you choose — Claude Code by default, or another
-  agent runner — so you're not locked to one model or one vendor.
-- **Local, so you control the bill.** Jobs run on your machine against whatever model you point
-  them at (hosted Claude, a local Ollama model, a LAN LiteLLM box). No managed-runtime markup, and
-  your data stays on your hardware.
+- **cron / launchd** run scripts, never prose. A natural-language job isn't expressible.
+- **Claude's native scheduled agents** run prose, but _only_ prose — every job is an LLM job on
+  Anthropic's managed runtime, at their rates.
+
+cronfish runs both from one folder:
+
+- **Markdown jobs are natural-language cron.** The body is the instruction; cronfish hands it to an
+  agent CLI (Claude Code by default) at fire time. No other scheduler runs a prose job.
+- **Script jobs stay deterministic.** `.ts` and `.sh` run code you wrote — the standard cron trust
+  model, first-class alongside `.md`.
+- **Any harness, any model, local or hosted.** `.md` jobs shell out to a CLI you choose — point them
+  at hosted Claude, a local Ollama model, or a LAN LiteLLM box. No managed-runtime markup; your data
+  stays on your hardware.
 
 Reach for Claude's scheduler when you want zero-ops and a single LLM task. Reach for cronfish when
-you have a mix of scripts and agents, care about cost, or want to choose the model.
+you want a mix of prose and scripts, care about cost, or want to choose the model.
 
 ## Quickstart
 
