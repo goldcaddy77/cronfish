@@ -35,7 +35,7 @@ import {
   type InvocationTrigger,
 } from "./db.ts";
 import { loadJob, slugFromPath, type JobMeta } from "./jobs.ts";
-import { resolveModel, localClaudeEnv } from "./models.ts";
+import { resolveModel, claudeEnvFor } from "./models.ts";
 import {
   DEFAULT_GRACE_SECONDS,
   archiveOneTime,
@@ -367,11 +367,11 @@ async function execMarkdown(
     appendLog(fd, `[runner] read-only: deny [${READ_ONLY_DENY.join(", ")}]`);
   }
   const cmd = buildClaudeArgs(CLAUDE_BIN, job, model.id, prompt);
-  const env = model.provider === "local" ? localClaudeEnv(model.id) : undefined;
+  const env = claudeEnvFor(model);
   if (env) {
     appendLog(
       fd,
-      `[runner] local base_url=${env.ANTHROPIC_BASE_URL} model=${model.id}`,
+      `[runner] ${model.provider} base_url=${env.ANTHROPIC_BASE_URL} model=${model.id}`,
     );
   }
   return runSpawn({ cmd, cwd: consumerRoot(), env }, fd, timeoutS);

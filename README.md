@@ -98,7 +98,7 @@ you can document a folder of crons without the README getting parsed as a job.
 ```markdown
 ---
 schedule: "every 5 minutes" # see below for all accepted shapes
-model: haiku # claude alias | raw ID | local:<name>
+model: haiku # claude alias | raw ID | local:<name> | subconscious/<name>
 enabled: true # default true
 timeout: 300 # seconds; runner kills past this
 retries: 0 # retry count on non-zero exit
@@ -148,7 +148,7 @@ invokes the file as `/bin/bash <path>` with `cwd = consumer repo root`; stdout/s
 per-run log. **A `.sh` file with no frontmatter block fails at discovery** — cronfish prints the
 error in `list`/`sync` so you know to add one.
 
-## `model:` — claude alias, raw ID, or local
+## `model:` — claude alias, raw ID, local, or subconscious
 
 For Anthropic-hosted models, use the aliases `haiku` / `sonnet` / `opus` (resolve to the latest
 pinned IDs), or pass a raw ID like `claude-sonnet-4-6` verbatim.
@@ -171,6 +171,13 @@ Caveats: small local models (≤7B) often can't follow Claude Code's tool-heavy 
 will hallucinate tool calls. Use 14B+ for any agentic loop; 32B is the practical floor for
 multi-step work. Local providers serve one request at a time — set `concurrency: queue` on
 overlapping jobs.
+
+For a **[Subconscious](https://subconscious.dev)-hosted model**, use the id verbatim with its
+`subconscious/` prefix — e.g. `subconscious/glm-5.2`. Same mechanics as `local:` (base URL +
+slot overrides injected at spawn), pointed at `https://api.subconscious.dev` and authenticated
+with `SUBCONSCIOUS_API_KEY` from the consumer `.env` (scope it into the job with
+`env: [SUBCONSCIOUS_API_KEY]`). Override the endpoint with `SUBCONSCIOUS_BASE_URL`. The job
+fails with a clear error if the key is unset.
 
 ## One-shot jobs — `cron/one-time/`
 
