@@ -1,3 +1,10 @@
+# [0.14.0](https://github.com/goldcaddy77/cronfish/compare/v0.13.0...v0.14.0) (2026-07-05)
+
+
+### Features
+
+* **models:** subconscious/ model prefix — hosted Anthropic-compatible backend ([24f0ab4](https://github.com/goldcaddy77/cronfish/commit/24f0ab4616b60ac7c3391f59f8cf5b062b7372aa))
+
 # [0.13.0](https://github.com/goldcaddy77/cronfish/compare/v0.12.1...v0.13.0) (2026-06-29)
 
 
