@@ -260,6 +260,7 @@ as a single job instead of many fast fires.
     "on_failure": { "notify": "slack" },
     "default": "slack",
     "slack": { "webhook_url_env": "CRONFISH_SLACK_WEBHOOK" },
+    "slack_bot": { "bot_token_env": "CRONFISH_SLACK_BOT_TOKEN", "channel": "C0123456789" },
     "shell": { "command": "/Users/you/bin/cronfish-pushover.sh" }
   }
 }
@@ -305,6 +306,7 @@ Every failed (`fail` / `timeout` / `crashed`) scheduled run pings the configured
 Adapters ship with cronfish:
 
 - **`slack`** — POSTs Block Kit to an incoming webhook. Reads the URL from the env var named in `alerts.slack.webhook_url_env` (default `CRONFISH_SLACK_WEBHOOK`).
+- **`slack_bot`** — posts the same Block Kit via `chat.postMessage` with a bot token instead of a webhook. One token reaches any channel (with `chat:write.public`, no invite needed), so you skip the per-channel browser-OAuth webhook mint. Reads the token from `alerts.slack_bot.bot_token_env` (default `CRONFISH_SLACK_BOT_TOKEN`) and the target channel from `alerts.slack_bot.channel` (a `C…` id or `#name`) or `alerts.slack_bot.channel_env`. Unlike a webhook, `chat.postMessage` returns HTTP 200 on logical errors, so the adapter inspects the JSON `ok` field and fails on `ok:false` (e.g. `channel_not_found`, `not_in_channel`).
 - **`shell`** — runs an arbitrary command from `alerts.shell.command` with the payload as env vars (`CRONFISH_ALERT_SLUG`, `…_STATUS`, `…_EXIT_CODE`, `…_DURATION_MS`, `…_STARTED_AT`, `…_UI_URL`, `…_LOG_TAIL`) plus the JSON payload on stdin. Use this for Pushover/ntfy/osascript.
 
 Two knobs in `.cronfish.json`, two distinct jobs:
@@ -335,6 +337,10 @@ Sanity check:
 ```
 export CRONFISH_SLACK_WEBHOOK=https://hooks.slack.com/services/...
 cronfish alerts test slack
+
+# or, bot-token path (no webhook to mint):
+export CRONFISH_SLACK_BOT_TOKEN=xoxb-...
+cronfish alerts test slack_bot
 ```
 
 ## Always-on dashboard

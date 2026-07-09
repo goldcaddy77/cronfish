@@ -708,6 +708,23 @@ async function main(): Promise<void> {
     }
   }
 
+  // Install lock-release signal handlers the instant a lock exists. There is
+  // real setup below (DB init, log open) before the full `cleanup` handler is
+  // registered, and a SIGTERM in that window would otherwise kill the process
+  // by default disposition — no handler runs, and the concurrency lockfile is
+  // orphaned (unlike the flock, it is not reclaimed by the OS on exit). This
+  // minimal handler is superseded by `cleanup` once the invocation state exists.
+  let releasing = false;
+  const earlyCleanup = (sig: NodeJS.Signals): void => {
+    if (releasing) return;
+    releasing = true;
+    if (job.concurrency) releaseLock(job.slug);
+    if (oneTimeLock) releaseFlock(oneTimeLock);
+    process.exit(sig === "SIGTERM" ? 143 : 130);
+  };
+  process.on("SIGTERM", earlyCleanup);
+  process.on("SIGINT", earlyCleanup);
+
   const db = tryOpenDb();
 
   // Open the log file BEFORE we know the invocation id (we need a real
@@ -739,8 +756,12 @@ async function main(): Promise<void> {
     appendLog(fd, `[runner] invocation_id=${invocationId} trigger=${trigger}`);
   }
 
-  // Signal handlers — release lock + record crash on launchd shutdown.
-  let releasing = false;
+  // Signal handlers — release lock + record crash on launchd shutdown. This
+  // supersedes earlyCleanup now that the invocation row exists, so a SIGTERM
+  // also records the run as crashed. The off→on swap is synchronous (no await
+  // between), so no signal can slip through with zero handlers installed.
+  process.off("SIGTERM", earlyCleanup);
+  process.off("SIGINT", earlyCleanup);
   const cleanup = (sig: NodeJS.Signals): void => {
     if (releasing) return;
     releasing = true;

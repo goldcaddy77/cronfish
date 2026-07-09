@@ -1,4 +1,5 @@
 import { createShellAdapter } from "./shell.ts";
+import { createSlackBotAdapter } from "./slack-bot.ts";
 import { createSlackAdapter } from "./slack.ts";
 import type { Adapter, AlertsConfig } from "./types.ts";
 
@@ -11,6 +12,7 @@ export interface AdapterRegistry {
 export function buildRegistry(cfg: AlertsConfig = {}): AdapterRegistry {
   const map = new Map<string, Adapter>();
   map.set("slack", createSlackAdapter(cfg.slack));
+  map.set("slack_bot", createSlackBotAdapter(cfg.slack_bot));
   map.set("shell", createShellAdapter(cfg.shell));
   return {
     get(name) {

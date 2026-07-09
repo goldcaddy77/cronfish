@@ -4,6 +4,7 @@ import {
   buildSlackBlocks,
   createShellAdapter,
   createSlackAdapter,
+  createSlackBotAdapter,
   payloadEnv,
   safeNotify,
   type Adapter,
@@ -119,6 +120,91 @@ describe("slack adapter", () => {
   });
 });
 
+describe("slack_bot adapter", () => {
+  function okFetch(capture: (url: string, init: RequestInit) => void) {
+    return (async (url: string, init: RequestInit) => {
+      capture(url, init);
+      return new Response(JSON.stringify({ ok: true }), { status: 200 });
+    }) as unknown as typeof fetch;
+  }
+
+  test("posts to chat.postMessage with bearer auth + channel", async () => {
+    let captured: { url: string; init: RequestInit } | null = null;
+    const adapter = createSlackBotAdapter(
+      {},
+      {
+        botToken: "xoxb-test-123",
+        channel: "C0B9QB6PR6C",
+        fetchFn: okFetch((url, init) => {
+          captured = { url, init };
+        }),
+      },
+    );
+    await adapter.notify(payload());
+    expect(captured).not.toBeNull();
+    expect(captured!.url).toBe("https://slack.com/api/chat.postMessage");
+    const headers = captured!.init.headers as Record<string, string>;
+    expect(headers.authorization).toBe("Bearer xoxb-test-123");
+    const body = JSON.parse(captured!.init.body as string) as {
+      channel: string;
+      text: string;
+      blocks: unknown[];
+    };
+    expect(body.channel).toBe("C0B9QB6PR6C");
+    expect(body.text).toContain("test-job");
+    expect(Array.isArray(body.blocks)).toBe(true);
+    expect(body.blocks.length).toBeGreaterThan(0);
+  });
+
+  test("reads token from bot_token_env and channel from channel_env", async () => {
+    const tokenEnv = "CRONFISH_TEST_BOT_TOKEN_" + Math.random().toString(36).slice(2);
+    const chanEnv = "CRONFISH_TEST_BOT_CHAN_" + Math.random().toString(36).slice(2);
+    process.env[tokenEnv] = "xoxb-env-tok";
+    process.env[chanEnv] = "#alerts";
+    let captured: { init: RequestInit } | null = null;
+    try {
+      const adapter = createSlackBotAdapter(
+        { bot_token_env: tokenEnv, channel_env: chanEnv },
+        { fetchFn: okFetch((_url, init) => {
+          captured = { init };
+        }) },
+      );
+      await adapter.notify(payload());
+    } finally {
+      delete process.env[tokenEnv];
+      delete process.env[chanEnv];
+    }
+    const headers = captured!.init.headers as Record<string, string>;
+    expect(headers.authorization).toBe("Bearer xoxb-env-tok");
+    const body = JSON.parse(captured!.init.body as string) as { channel: string };
+    expect(body.channel).toBe("#alerts");
+  });
+
+  test("throws when bot token env var is not set", async () => {
+    const envName = "CRONFISH_TEST_MISSING_BOT_" + Math.random().toString(36).slice(2);
+    delete process.env[envName];
+    const adapter = createSlackBotAdapter({ bot_token_env: envName, channel: "C1" });
+    await expect(adapter.notify(payload())).rejects.toThrow(envName);
+  });
+
+  test("throws when no channel is configured", async () => {
+    const adapter = createSlackBotAdapter({}, { botToken: "xoxb-x" });
+    await expect(adapter.notify(payload())).rejects.toThrow("no channel");
+  });
+
+  test("throws on ok:false even with HTTP 200", async () => {
+    const fakeFetch = (async () =>
+      new Response(JSON.stringify({ ok: false, error: "channel_not_found" }), {
+        status: 200,
+      })) as unknown as typeof fetch;
+    const adapter = createSlackBotAdapter(
+      {},
+      { botToken: "xoxb-x", channel: "C1", fetchFn: fakeFetch },
+    );
+    await expect(adapter.notify(payload())).rejects.toThrow("channel_not_found");
+  });
+});
+
 describe("shell adapter", () => {
   test("passes env vars + JSON stdin to command", async () => {
     let captured:
@@ -147,15 +233,18 @@ describe("shell adapter", () => {
 });
 
 describe("buildRegistry", () => {
-  test("resolves slack + shell adapters", () => {
+  test("resolves slack + slack_bot + shell adapters", () => {
     const reg = buildRegistry({
       default: "slack",
       slack: { webhook_url_env: "X" },
+      slack_bot: { bot_token_env: "Y", channel: "C1" },
       shell: { command: "/bin/true" },
     });
     expect(reg.get("slack").name).toBe("slack");
+    expect(reg.get("slack_bot").name).toBe("slack_bot");
     expect(reg.get("shell").name).toBe("shell");
     expect(reg.has("slack")).toBe(true);
+    expect(reg.has("slack_bot")).toBe(true);
     expect(reg.defaultName()).toBe("slack");
   });
 

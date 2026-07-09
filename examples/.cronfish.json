@@ -12,6 +12,7 @@
     "on_failure": { "notify": "slack" },
     "default": "slack",
     "slack": { "webhook_url_env": "CRONFISH_SLACK_WEBHOOK" },
+    "slack_bot": { "bot_token_env": "CRONFISH_SLACK_BOT_TOKEN", "channel": "C0123456789" },
     "shell": { "command": "/usr/local/bin/my-notify.sh" }
   }
 }
