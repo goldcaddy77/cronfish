@@ -28,6 +28,14 @@ export interface AlertsConfig {
   slack?: {
     webhook_url_env?: string;
   };
+  slack_bot?: {
+    // Env var holding the bot token (xoxb-…). Default CRONFISH_SLACK_BOT_TOKEN.
+    bot_token_env?: string;
+    // Target channel — id (C…) or #name. Literal value…
+    channel?: string;
+    // …or the env var to read it from (takes precedence over `channel`).
+    channel_env?: string;
+  };
   shell?: {
     command?: string;
   };
