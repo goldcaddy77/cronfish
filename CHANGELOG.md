@@ -1,3 +1,15 @@
+# [0.15.0](https://github.com/goldcaddy77/cronfish/compare/v0.14.0...v0.15.0) (2026-07-09)
+
+
+### Bug Fixes
+
+* **runner:** release concurrency lock on SIGTERM during startup window ([2666526](https://github.com/goldcaddy77/cronfish/commit/266652607a93d6c56f846effca9eaa1618881859))
+
+
+### Features
+
+* **alerts:** slack_bot adapter — chat.postMessage via bot token ([0fe4a13](https://github.com/goldcaddy77/cronfish/commit/0fe4a13b1e37f7b1cf0d622be86636faa2fc011f))
+
 # [0.14.0](https://github.com/goldcaddy77/cronfish/compare/v0.13.0...v0.14.0) (2026-07-05)
 
 
