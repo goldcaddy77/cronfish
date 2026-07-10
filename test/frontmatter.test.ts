@@ -95,6 +95,67 @@ describe("parseTsJobConfig", () => {
     expect(() => parseTsJobConfig(src)).toThrow();
   });
 
+  test("comments with apostrophes don't corrupt the quote scan", () => {
+    const src = `export const config = {
+      // this comment has an apostrophe like it's here
+      schedule: "every 5 minutes",
+      // and it's got another one between keys
+      enabled: false,
+      timeout: 120,
+    };`;
+    const cfg = parseTsJobConfig(src);
+    expect(cfg.schedule).toBe("every 5 minutes");
+    expect(cfg.enabled).toBe(false);
+    expect(cfg.timeout).toBe(120);
+  });
+
+  test("a comment containing a key name doesn't shadow the real key", () => {
+    const src = `export const config = {
+      // the schedule below runs hourly; schedule changes need a sync
+      schedule: "every 1 hour",
+      enabled: true,
+    };`;
+    const cfg = parseTsJobConfig(src);
+    expect(cfg.schedule).toBe("every 1 hour");
+    expect(cfg.enabled).toBe(true);
+  });
+
+  test("block comments inside the config are ignored", () => {
+    const src = `export const config = {
+      /* multi-line
+         block comment mentioning schedule: "bogus" {and braces} */
+      schedule: "every 10 minutes",
+      retries: 2, /* inline block */ timeout: 60,
+    };`;
+    const cfg = parseTsJobConfig(src);
+    expect(cfg.schedule).toBe("every 10 minutes");
+    expect(cfg.retries).toBe(2);
+    expect(cfg.timeout).toBe(60);
+  });
+
+  test("trailing same-line comments don't leak into values", () => {
+    const src = `export const config = {
+      schedule: "every 5 minutes", // cron cadence
+      timeout: 60, // seconds
+      retries: 1 // no trailing comma
+    };`;
+    const cfg = parseTsJobConfig(src);
+    expect(cfg.schedule).toBe("every 5 minutes");
+    expect(cfg.timeout).toBe(60);
+    expect(cfg.retries).toBe(1);
+  });
+
+  test("// inside a string value is not a comment", () => {
+    const src = `export const config = {
+      schedule: "every 5 minutes",
+      description: "see https://example.com/docs // not a comment",
+    };`;
+    const cfg = parseTsJobConfig(src);
+    expect(cfg.description).toBe(
+      "see https://example.com/docs // not a comment",
+    );
+  });
+
   test("strips trailing TS type assertions (as const, as Foo)", () => {
     const src = `export const config = {
       schedule: "5m",

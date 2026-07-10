@@ -299,6 +299,58 @@ export interface TsJobConfigShape {
   executed_at?: string;
 }
 
+// Blank out `//` line comments and `/* ... */` block comments, preserving
+// string/template contents, newlines, and overall length (comment chars become
+// spaces). Without this, the brace/quote scanners below misread comments: an
+// apostrophe in a comment opens a phantom string, and a config key name
+// mentioned in a comment matches as if it were the real key.
+function stripTsComments(source: string): string {
+  const out = source.split("");
+  let inStr: string | null = null;
+  let i = 0;
+  while (i < source.length) {
+    const c = source[i];
+    if (inStr) {
+      if (c === "\\") {
+        i += 2;
+        continue;
+      }
+      if (c === inStr) inStr = null;
+      i++;
+      continue;
+    }
+    if (c === '"' || c === "'" || c === "`") {
+      inStr = c;
+      i++;
+      continue;
+    }
+    if (c === "/" && source[i + 1] === "/") {
+      while (i < source.length && source[i] !== "\n") out[i++] = " ";
+      continue;
+    }
+    if (c === "/" && source[i + 1] === "*") {
+      out[i++] = " ";
+      out[i++] = " ";
+      while (
+        i < source.length &&
+        !(source[i] === "*" && source[i + 1] === "/")
+      ) {
+        if (source[i] !== "\n") out[i] = " ";
+        i++;
+      }
+      if (i < source.length) {
+        out[i++] = " ";
+        out[i++] = " ";
+      }
+      continue;
+    }
+    i++;
+  }
+  return out.join("");
+}
+
+// Expects comment-free source (see stripTsComments) — comments would corrupt
+// the quote/brace scan and let a commented-out `config = {` match.
 function extractConfigBlock(source: string): string | null {
   const re = /\bconfig\b\s*(?::\s*[^=]+)?=\s*\{/g;
   const m = re.exec(source);
@@ -328,8 +380,8 @@ function extractConfigBlock(source: string): string | null {
 
 function pickFromConfig(body: string, key: string): string | undefined {
   // Match `key:` only at the top level (depth 0) of the config block.
-  let depth = 0;
-  let inStr: string | null = null;
+  // Expects comment-free body (see stripTsComments), so a key name mentioned
+  // in a comment can't match and apostrophes in comments can't open strings.
   const re = new RegExp(`\\b${key}\\b`, "g");
   let m: RegExpExecArray | null;
   while ((m = re.exec(body))) {
@@ -360,12 +412,10 @@ function pickFromConfig(body: string, key: string): string | undefined {
       .trim();
   }
   return undefined;
-  void depth;
-  void inStr;
 }
 
 export function parseTsJobConfig(source: string): TsJobConfigShape {
-  const body = extractConfigBlock(source);
+  const body = extractConfigBlock(stripTsComments(source));
   if (!body) return {};
   const cfg: TsJobConfigShape = {};
 
