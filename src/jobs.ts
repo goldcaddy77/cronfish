@@ -472,7 +472,9 @@ export function loadJob(
 // Recursively collect every `.md`/`.ts`/`.sh` file under cronDir. The single magic
 // filename `README.md` is ignored at any depth so authors can document a
 // folder of crons without the README getting parsed as a job.
-function walkJobFiles(cronDir: string): string[] {
+// Exported for the daemon's mtime scan, which stats files first and only
+// parses the changed ones (discoverJobs parses everything).
+export function walkJobFiles(cronDir: string): string[] {
   const out: string[] = [];
   const visit = (dir: string): void => {
     let entries: string[];
