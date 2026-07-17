@@ -40,5 +40,8 @@
     "url": "https://github.com/goldcaddy77/cronfish/issues"
   },
   "license": "MIT",
-  "author": "Dan Caddigan"
+  "author": "Dan Caddigan",
+  "dependencies": {
+    "croner": "^10.0.1"
+  }
 }
