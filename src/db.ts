@@ -551,6 +551,7 @@ export interface DueJobRow {
   concurrency: string;
   retries: number;
   timeout_s: number | null;
+  file_path: string | null;
 }
 
 // The daemon's per-tick due query: everything active whose next_run_at has
@@ -560,12 +561,37 @@ export function listDueJobs(db: Database, nowIsoStr: string): DueJobRow[] {
   return db
     .query(
       `SELECT id, slug, kind, schedule, schedule_kind, next_run_at,
-              last_run_at, concurrency, retries, timeout_s
+              last_run_at, concurrency, retries, timeout_s, file_path
        FROM cron_jobs
        WHERE state = 'active' AND next_run_at IS NOT NULL AND next_run_at <= $now
        ORDER BY next_run_at ASC`,
     )
     .all({ $now: nowIsoStr }) as DueJobRow[];
+}
+
+export interface JobSyncStateRow {
+  id: number;
+  slug: string;
+  state: JobState | null;
+  schedule: string;
+  schedule_kind: ScheduleKind | null;
+  file_mtime: string | null;
+  next_run_at: string | null;
+  last_run_at: string | null;
+}
+
+// Everything the daemon's mtime scan needs to decide "changed since last
+// sync?" without re-parsing unchanged files. Deleted rows are excluded — a
+// re-appearing file counts as new and gets a full upsert.
+export function listJobSyncState(db: Database): JobSyncStateRow[] {
+  return db
+    .query(
+      `SELECT id, slug, state, schedule, schedule_kind, file_mtime,
+              next_run_at, last_run_at
+       FROM cron_jobs
+       WHERE state IS NULL OR state != 'deleted'`,
+    )
+    .all() as JobSyncStateRow[];
 }
 
 export function setJobNextRun(
@@ -598,6 +624,7 @@ export interface RunRequestRow {
   slug: string;
   trigger: "manual";
   requested_at: string;
+  file_path: string | null;
 }
 
 // `cron run <slug>` inserts one; the daemon drains them next tick.
@@ -618,7 +645,7 @@ export function claimPendingRunRequests(db: Database): RunRequestRow[] {
   return db.transaction(() => {
     const rows = db
       .query(
-        `SELECT r.id, r.job_id, j.slug, r.trigger, r.requested_at
+        `SELECT r.id, r.job_id, j.slug, r.trigger, r.requested_at, j.file_path
          FROM cron_run_requests r
          JOIN cron_jobs j ON j.id = r.job_id
          WHERE r.picked_up_at IS NULL
@@ -644,6 +671,34 @@ export function linkRunRequestInvocation(
   db.prepare(
     "UPDATE cron_run_requests SET invocation_id = $inv WHERE id = $id",
   ).run({ $id: requestId, $inv: invocationId });
+}
+
+export interface RunRequestStatusRow {
+  picked_up_at: string | null;
+  invocation_id: number | null;
+}
+
+// `cron run` polls this after queueing a request for a live daemon.
+export function getRunRequest(
+  db: Database,
+  requestId: number,
+): RunRequestStatusRow | null {
+  const row = db
+    .query(
+      "SELECT picked_up_at, invocation_id FROM cron_run_requests WHERE id = $id",
+    )
+    .get({ $id: requestId }) as RunRequestStatusRow | undefined;
+  return row ?? null;
+}
+
+export function getInvocationLogPath(
+  db: Database,
+  invocationId: number,
+): string | null {
+  const row = db
+    .query("SELECT log_path FROM cron_invocations WHERE id = $id")
+    .get({ $id: invocationId }) as { log_path: string } | undefined;
+  return row?.log_path ?? null;
 }
 
 // --- v2 daemon: heartbeat ---
