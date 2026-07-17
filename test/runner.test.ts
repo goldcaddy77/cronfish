@@ -11,6 +11,14 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildClaudeArgs } from "../src/runner.ts";
+import {
+  getJobIdBySlug,
+  getRunRequest,
+  insertRunRequest,
+  openDb,
+  upsertJob,
+} from "../src/db.ts";
+import { loadJob } from "../src/jobs.ts";
 
 const RUNNER = new URL("../src/runner.ts", import.meta.url).pathname;
 
@@ -21,13 +29,17 @@ interface SpawnResult {
   durationMs: number;
 }
 
-function spawnRunner(root: string, jobPath: string): SpawnResult {
+function spawnRunner(
+  root: string,
+  jobPath: string,
+  extraEnv: Record<string, string> = {},
+): SpawnResult {
   const t0 = Date.now();
   const proc = Bun.spawnSync(["bun", RUNNER, jobPath], {
     stdout: "pipe",
     stderr: "pipe",
     cwd: root,
-    env: { ...process.env, CRONFISH_CONSUMER_ROOT: root },
+    env: { ...process.env, CRONFISH_CONSUMER_ROOT: root, ...extraEnv },
   });
   return {
     code: proc.exitCode ?? 0,
@@ -215,6 +227,61 @@ export default async function run() {
     await proc.exited;
     expect(existsSync(lp)).toBe(false);
   }, 15_000);
+
+  test("daemon env: links the run request, records scheduled_for, stamps last_run", () => {
+    const job = writeJob(
+      root,
+      "linked.ts",
+      `export const config = {
+  schedule: "manual",
+  enabled: true,
+  timeout: 30,
+};
+export default async function run() {
+  console.log("[linked] ran");
+}
+`,
+    );
+    // The daemon seeds the job row + run request before spawning the runner.
+    const cronDir = join(root, "cron");
+    const seed = openDb(root);
+    upsertJob(seed, loadJob(job, undefined, cronDir));
+    const jobId = getJobIdBySlug(seed, "linked-ts")!;
+    const reqId = insertRunRequest(seed, jobId);
+    seed.close();
+
+    const scheduledFor = "2026-07-17T12:00:00.000Z";
+    const r = spawnRunner(root, job, {
+      CRONFISH_TRIGGER: "manual",
+      CRONFISH_RUN_REQUEST_ID: String(reqId),
+      CRONFISH_SCHEDULED_FOR: scheduledFor,
+    });
+    expect(r.code).toBe(0);
+
+    const db = openDb(root);
+    const req = getRunRequest(db, reqId)!;
+    expect(req.invocation_id).not.toBeNull();
+    const inv = db
+      .query(
+        "SELECT trigger, scheduled_for, status FROM cron_invocations WHERE id = $id",
+      )
+      .get({ $id: req.invocation_id }) as {
+      trigger: string;
+      scheduled_for: string | null;
+      status: string;
+    };
+    expect(inv.trigger).toBe("manual");
+    expect(inv.scheduled_for).toBe(scheduledFor);
+    expect(inv.status).toBe("ok");
+    const jobRow = db
+      .query(
+        "SELECT last_run_at, last_status FROM cron_jobs WHERE slug = 'linked-ts'",
+      )
+      .get() as { last_run_at: string | null; last_status: string | null };
+    expect(jobRow.last_run_at).not.toBeNull();
+    expect(jobRow.last_status).toBe("ok");
+    db.close();
+  }, 20_000);
 
   test("runs a .sh job and captures stdout to the log", () => {
     const sentinel = join(root, "ran.txt");

@@ -25,8 +25,10 @@ import {
   finishInvocation,
   getJobIdBySlug,
   getPreviousFinishedStatus,
+  linkRunRequestInvocation,
   openDb,
   setInvocationAlert,
+  setJobLastRun,
   startInvocation,
   upsertJob,
   type AlertLedgerStatus,
@@ -444,10 +446,42 @@ function tryStartInvocation(
     upsertJob(db, job);
     const jobId = getJobIdBySlug(db, job.slug);
     if (jobId === null) return null;
-    return startInvocation(db, jobId, trigger, logPath);
+    // Daemon context, both optional: the planned fire time (lateness
+    // reporting) and the `cron run` request this invocation fulfills.
+    const scheduledFor = process.env.CRONFISH_SCHEDULED_FOR || undefined;
+    const id = startInvocation(db, jobId, trigger, logPath, { scheduledFor });
+    const reqId = process.env.CRONFISH_RUN_REQUEST_ID;
+    if (reqId && /^\d+$/.test(reqId)) {
+      try {
+        linkRunRequestInvocation(db, parseInt(reqId, 10), id);
+      } catch (e) {
+        warn(`linkRunRequestInvocation failed: ${(e as Error).message}`);
+      }
+    }
+    return id;
   } catch (e) {
     warn(`startInvocation failed: ${(e as Error).message}`);
     return null;
+  }
+}
+
+// Stamp cron_jobs.last_run_at/last_status at finish. The daemon's
+// schedule-change rule (next = max(now, last_run + new_interval)) reads
+// last_run_at, so the runner — the one place that knows how a run ended —
+// maintains it. Failure-safe like every ledger write.
+function trySetJobLastRun(
+  db: Database | null,
+  jobSlug: string,
+  startedAtIso: string,
+  status: InvocationStatus,
+): void {
+  if (!db) return;
+  try {
+    const jobId = getJobIdBySlug(db, jobSlug);
+    if (jobId === null) return;
+    setJobLastRun(db, jobId, startedAtIso, status);
+  } catch (e) {
+    warn(`setJobLastRun failed: ${(e as Error).message}`);
   }
 }
 
@@ -820,6 +854,7 @@ async function main(): Promise<void> {
           : "fail";
     const resultRow = await tryParseResult(logFile, lastResult.code);
     tryFinishInvocation(db, invocationId, status, lastResult.code, resultRow);
+    trySetJobLastRun(db, job.slug, new Date(start).toISOString(), status);
     await maybeFireAlert({
       db,
       job,
