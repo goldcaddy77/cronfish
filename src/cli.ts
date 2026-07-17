@@ -25,6 +25,11 @@ import {
 } from "./oneTime.ts";
 import { defaultBundlePrefix } from "./config.ts";
 import { platform } from "./platform/index.ts";
+import {
+  RESERVED_LABEL_SUFFIXES,
+  installDaemon,
+  uninstallDaemon,
+} from "./platform/daemon-launchd.ts";
 import { loadState, rememberPrefix } from "./state.ts";
 import {
   dbPath,
@@ -347,6 +352,16 @@ function loadRunnerNames(): Set<string> {
 
 function cmdSync(): void {
   const p = platform();
+  // Daemon guard: with a live daemon, per-job plists are retired — creating
+  // them would double-fire every job. Sync then only updates the DB metadata
+  // (the daemon's mtime scan re-syncs cron/ every tick anyway) and removes
+  // any lingering per-job plists.
+  const daemonHb = liveHeartbeat();
+  if (daemonHb) {
+    console.log(
+      `[cronfish] daemon LIVE (pid ${daemonHb.pid}) — daemon mode: skipping per-job plist install (the daemon picks up cron/ edits automatically); updating ledger metadata only`,
+    );
+  }
   const { jobs, errors } = discoverJobs(CRON_DIR);
   // "sync"-class sentinel filenames written this run. Anything still on disk
   // from a prior sync that ISN'T in here gets reaped at the end (self-heal).
@@ -381,9 +396,10 @@ function cmdSync(): void {
     }
     // launchd enforces a ~10s floor between relaunches (its implicit
     // ThrottleInterval). A faster `schedule:` silently fires no quicker than
-    // every 10s, so warn rather than let it look like it works.
+    // every 10s, so warn rather than let it look like it works. Moot in
+    // daemon mode — the 1s tick loop handles sub-10s schedules fine.
     const d = safeDispatch(j.schedule);
-    if (d.kind === "seconds" && d.value < 10) {
+    if (!daemonHb && d.kind === "seconds" && d.value < 10) {
       console.error(
         `[cronfish] WARN ${j.slug}: schedule ${d.value}s is below launchd's ~10s relaunch floor — it will fire no faster than every 10s`,
       );
@@ -425,32 +441,41 @@ function cmdSync(): void {
   }
 
   // Walk every historical prefix and bootout label-suffixes no longer desired
-  // under the current prefix. This is the stale-prefix fix.
+  // under the current prefix. This is the stale-prefix fix. The reserved
+  // daemon/ui labels are never per-job plists — leave them alone under the
+  // current prefix. In daemon mode NOTHING per-job is desired, so any
+  // lingering per-job plist gets removed here (double-fire protection).
   for (const prefix of state.seen_prefixes) {
     for (const labelSuffix of p.listInstalled(prefix)) {
-      const stillDesired = prefix === PREFIX && desiredLabels.has(labelSuffix);
+      if (prefix === PREFIX && RESERVED_LABEL_SUFFIXES.has(labelSuffix)) {
+        continue;
+      }
+      const stillDesired =
+        !daemonHb && prefix === PREFIX && desiredLabels.has(labelSuffix);
       if (stillDesired) continue;
       console.log(`[cronfish] bootout ${prefix}.${labelSuffix}`);
       p.uninstall(prefix, labelSuffix);
     }
   }
 
-  for (const [slug, job] of desired) {
-    try {
-      const r = p.install(job, {
-        bundlePrefix: PREFIX,
-        consumerRoot: CONSUMER_ROOT,
-        bunPath: BUN_PATH,
-      });
-      console.log(
-        r.changed
-          ? `[cronfish] bootstrap ${slug}`
-          : `[cronfish] up-to-date ${slug}`,
-      );
-    } catch (e) {
-      console.error(
-        `[cronfish] install ${slug} failed: ${(e as Error).message}`,
-      );
+  if (!daemonHb) {
+    for (const [slug, job] of desired) {
+      try {
+        const r = p.install(job, {
+          bundlePrefix: PREFIX,
+          consumerRoot: CONSUMER_ROOT,
+          bunPath: BUN_PATH,
+        });
+        console.log(
+          r.changed
+            ? `[cronfish] bootstrap ${slug}`
+            : `[cronfish] up-to-date ${slug}`,
+        );
+      } catch (e) {
+        console.error(
+          `[cronfish] install ${slug} failed: ${(e as Error).message}`,
+        );
+      }
     }
   }
 
@@ -601,6 +626,15 @@ function peekHeartbeat(): DaemonHeartbeatRow | null {
   }
 }
 
+// The daemon-mode guard shared by sync / watchdog: the heartbeat, but only
+// when it's fresh enough to prove a live daemon.
+function liveHeartbeat(): DaemonHeartbeatRow | null {
+  const hb = peekHeartbeat();
+  if (!hb) return null;
+  const ageMs = Date.now() - Date.parse(hb.last_tick_at);
+  return ageMs <= DAEMON_FRESH_MS ? hb : null;
+}
+
 function printDaemonLiveness(): void {
   const hb = peekHeartbeat();
   if (!hb) {
@@ -722,10 +756,32 @@ async function cmdRun(slug: string): Promise<void> {
 // --- daemon + reporting verbs ---
 
 async function cmdDaemon(): Promise<void> {
-  // Foreground tick loop. `cronfish daemon install` (launchd KeepAlive) is a
-  // later step — it will wrap exactly this entry point.
+  // Foreground tick loop. `cronfish daemon install` (launchd KeepAlive)
+  // wraps exactly this entry point.
   const { runDaemon } = await import("./daemon.ts");
   await runDaemon({ consumerRoot: CONSUMER_ROOT });
+}
+
+// The hot swap (docs/v2-daemon.md §Migration): retire every per-job plist,
+// verify none remain, load the one daemon plist, confirm its heartbeat.
+async function cmdDaemonInstall(): Promise<void> {
+  const r = await installDaemon({
+    bundlePrefix: PREFIX,
+    consumerRoot: CONSUMER_ROOT,
+    bunPath: BUN_PATH,
+    readHeartbeat: peekHeartbeat,
+  });
+  console.log(
+    r.changed
+      ? `[cronfish] daemon installed: ${r.label}`
+      : `[cronfish] daemon already up-to-date: ${r.label}`,
+  );
+  console.log(`           plist: ${r.plistPath}`);
+  console.log(`           log:   ${r.logPath}`);
+}
+
+function cmdDaemonUninstall(): void {
+  uninstallDaemon({ bundlePrefix: PREFIX });
 }
 
 // "--since 7d" style windows: N + s/m/h/d, anchored at now.
@@ -1007,6 +1063,16 @@ function cmdUiStatus(): void {
 }
 
 async function cmdWatchdog(): Promise<void> {
+  // Daemon guard: a live daemon runs missed-run detection in-process (same
+  // decision logic, same dedup table) — the standalone verb firing too would
+  // double-alert. Kept working for v1 consumers with no daemon.
+  const hb = liveHeartbeat();
+  if (hb) {
+    console.log(
+      `[cronfish] daemon LIVE (pid ${hb.pid}) — the daemon owns missed-run detection; standalone watchdog skipped`,
+    );
+    return;
+  }
   const { runWatchdog } = await import("./watchdog.ts");
   const decisions = await runWatchdog({ consumerRoot: CONSUMER_ROOT });
   let fired = 0;
@@ -1300,6 +1366,8 @@ usage:
   cronfish errors [--clear] [slug]    list error sentinels (cron/.errors/); --clear removes them
   cronfish run <slug>                 run now — queues through a live daemon, else spawns the runner directly
   cronfish daemon                     run the v2 scheduler daemon in the foreground (1s tick loop)
+  cronfish daemon install             hot-swap: retire per-job plists, install the KeepAlive daemon plist
+  cronfish daemon uninstall           bootout + remove the daemon plist (per-job plists NOT restored — run sync)
   cronfish history [slug] [--limit N] [--since 7d]   run timeline: started, trigger, status, duration, result
   cronfish stats [--since 30d]        per-job rollup: runs, success %, avg/p95 duration, last status
   cronfish watchdog                   check enabled jobs for missed schedules → fire alerts
@@ -1402,9 +1470,22 @@ async function main(): Promise<void> {
       if (!rest[0]) throw new Error("usage: cronfish run <slug>");
       await cmdRun(rest[0]);
       return;
-    case "daemon":
+    case "daemon": {
+      const sub = rest[0];
+      if (sub === "install") {
+        await cmdDaemonInstall();
+        return;
+      }
+      if (sub === "uninstall") {
+        cmdDaemonUninstall();
+        return;
+      }
+      if (sub !== undefined) {
+        throw new Error("usage: cronfish daemon [install|uninstall]");
+      }
       await cmdDaemon();
       return;
+    }
     case "history":
       cmdHistory(rest);
       return;

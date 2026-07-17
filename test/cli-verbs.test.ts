@@ -11,6 +11,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { beatDaemonHeartbeat, openDb } from "../src/db.ts";
 
 const CLI = new URL("../src/cli.ts", import.meta.url).pathname;
 
@@ -396,6 +397,49 @@ export default async function run() {}
     expect(clr.code).toBe(0);
     expect(clr.out).toContain("cleared 1 sentinel");
     expect(errorFiles(ctx)).toHaveLength(0);
+  });
+
+  // Write a fresh daemon heartbeat into the consumer db so the CLI's
+  // liveness guard (last tick ≤ 10s old) sees a running daemon.
+  function seedLiveHeartbeat(ctx: Ctx): void {
+    const db = openDb(ctx.root);
+    beatDaemonHeartbeat(db, {
+      pid: 999,
+      startedAt: new Date().toISOString(),
+      version: "test",
+    });
+    db.close();
+  }
+
+  test("sync with a live daemon writes NO per-job plists and retires stale ones", () => {
+    writeJob(ctx, "hello.md", MD_ENABLED);
+    seedLiveHeartbeat(ctx);
+    // A leftover per-job plist from v1 must be retired; the reserved ui
+    // plist must survive.
+    const agents = join(ctx.home, "Library", "LaunchAgents");
+    writeFileSync(join(agents, "com.test.cronfish.stale-md.plist"), "<plist/>");
+    writeFileSync(join(agents, "com.test.cronfish.ui.plist"), "<plist/>");
+    mkdirSync(join(ctx.root, "tmp", ".cronfish"), { recursive: true });
+    writeFileSync(
+      join(ctx.root, "tmp", ".cronfish", "state.json"),
+      JSON.stringify({ seen_prefixes: ["com.test.cronfish"] }),
+    );
+
+    const r = runCli(ctx, ["sync"]);
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("daemon LIVE");
+    expect(r.out).not.toContain("bootstrap hello-md");
+    const plists = listPlists(ctx);
+    expect(plists).not.toContain("com.test.cronfish.hello-md.plist");
+    expect(plists).not.toContain("com.test.cronfish.stale-md.plist");
+    expect(plists).toContain("com.test.cronfish.ui.plist");
+  });
+
+  test("watchdog with a live daemon defers to in-daemon detection and exits 0", () => {
+    seedLiveHeartbeat(ctx);
+    const r = runCli(ctx, ["watchdog"]);
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("daemon owns missed-run detection");
   });
 
   test("sub-10s schedule warns about launchd's relaunch floor", () => {
