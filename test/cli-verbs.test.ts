@@ -435,6 +435,31 @@ export default async function run() {}
     expect(plists).toContain("com.test.cronfish.ui.plist");
   });
 
+  test("sync with the daemon plist installed but a STALE heartbeat still stays in daemon mode", () => {
+    writeJob(ctx, "hello.md", MD_ENABLED);
+    // Heartbeat exists but is old — daemon mid-restart (KeepAlive gap) or
+    // wedged. The installed daemon plist alone must keep sync from
+    // reinstalling per-job plists (that would double-fire on recovery).
+    const db = openDb(ctx.root);
+    beatDaemonHeartbeat(db, {
+      pid: 999,
+      startedAt: new Date().toISOString(),
+      version: "test",
+    });
+    db.prepare("UPDATE cron_daemon_heartbeat SET last_tick_at = $t").run({
+      $t: new Date(Date.now() - 60_000).toISOString(),
+    });
+    db.close();
+    const agents = join(ctx.home, "Library", "LaunchAgents");
+    writeFileSync(join(agents, "com.test.cronfish.daemon.plist"), "<plist/>");
+
+    const r = runCli(ctx, ["sync"]);
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("daemon plist installed but heartbeat NOT fresh");
+    expect(r.out).not.toContain("bootstrap hello-md");
+    expect(listPlists(ctx)).not.toContain("com.test.cronfish.hello-md.plist");
+  });
+
   test("watchdog with a live daemon defers to in-daemon detection and exits 0", () => {
     seedLiveHeartbeat(ctx);
     const r = runCli(ctx, ["watchdog"]);

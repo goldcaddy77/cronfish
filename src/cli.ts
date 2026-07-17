@@ -352,14 +352,22 @@ function loadRunnerNames(): Set<string> {
 
 function cmdSync(): void {
   const p = platform();
-  // Daemon guard: with a live daemon, per-job plists are retired — creating
+  // Daemon guard: in daemon mode, per-job plists are retired — creating
   // them would double-fire every job. Sync then only updates the DB metadata
-  // (the daemon's mtime scan re-syncs cron/ every tick anyway) and removes
-  // any lingering per-job plists.
+  // (the daemon's file scan re-syncs cron/ every tick anyway) and removes
+  // any lingering per-job plists. The guard gates on the daemon PLIST being
+  // installed OR a fresh heartbeat — never heartbeat alone: a momentarily
+  // stale heartbeat (blocking alert send, KeepAlive restart gap) with the
+  // daemon still installed must NOT flip sync back to per-job plists.
   const daemonHb = liveHeartbeat();
+  const daemonMode = daemonHb !== null || daemonPlistInstalled();
   if (daemonHb) {
     console.log(
       `[cronfish] daemon LIVE (pid ${daemonHb.pid}) — daemon mode: skipping per-job plist install (the daemon picks up cron/ edits automatically); updating ledger metadata only`,
+    );
+  } else if (daemonMode) {
+    console.log(
+      `[cronfish] daemon plist installed but heartbeat NOT fresh — staying in daemon mode (no per-job plists; a restart gap must not double-fire). Check \`cronfish status\` / the daemon log if this persists.`,
     );
   }
   const { jobs, errors } = discoverJobs(CRON_DIR);
@@ -399,7 +407,7 @@ function cmdSync(): void {
     // every 10s, so warn rather than let it look like it works. Moot in
     // daemon mode — the 1s tick loop handles sub-10s schedules fine.
     const d = safeDispatch(j.schedule);
-    if (!daemonHb && d.kind === "seconds" && d.value < 10) {
+    if (!daemonMode && d.kind === "seconds" && d.value < 10) {
       console.error(
         `[cronfish] WARN ${j.slug}: schedule ${d.value}s is below launchd's ~10s relaunch floor — it will fire no faster than every 10s`,
       );
@@ -451,14 +459,14 @@ function cmdSync(): void {
         continue;
       }
       const stillDesired =
-        !daemonHb && prefix === PREFIX && desiredLabels.has(labelSuffix);
+        !daemonMode && prefix === PREFIX && desiredLabels.has(labelSuffix);
       if (stillDesired) continue;
       console.log(`[cronfish] bootout ${prefix}.${labelSuffix}`);
       p.uninstall(prefix, labelSuffix);
     }
   }
 
-  if (!daemonHb) {
+  if (!daemonMode) {
     for (const [slug, job] of desired) {
       try {
         const r = p.install(job, {
@@ -623,6 +631,18 @@ function peekHeartbeat(): DaemonHeartbeatRow | null {
     return null; // pre-v6 db — no heartbeat table yet
   } finally {
     db.close();
+  }
+}
+
+// Daemon-mode signal #2: the daemon plist sitting in LaunchAgents. A stale
+// heartbeat alone must never flip sync back to per-job plists — the daemon
+// may just be mid-restart (KeepAlive gap) or wedged on a blocking alert
+// send, and reinstalling per-job plists then would double-fire every job.
+function daemonPlistInstalled(): boolean {
+  try {
+    return platform().listInstalled(PREFIX).includes("daemon");
+  } catch {
+    return false;
   }
 }
 
