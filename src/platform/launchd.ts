@@ -27,7 +27,7 @@ const RUNNER_TS = resolve(import.meta.dir, "..", "runner.ts");
 
 // PATH candidates baked into every plist so `/usr/bin/env bun` works under
 // launchd's minimal default PATH. Resolved bun dir gets prepended at sync.
-const DEFAULT_PATH_DIRS = [
+export const DEFAULT_PATH_DIRS = [
   "/opt/homebrew/bin",
   "/usr/local/bin",
   "/usr/bin",
@@ -164,7 +164,7 @@ function scheduleBlock(d: Dispatched): string {
   throw new Error(`schedule kind "${d.kind}" should not produce a plist`);
 }
 
-function findBunDir(bunPathOverride?: string): string | null {
+export function findBunDir(bunPathOverride?: string): string | null {
   // Resolve `bun` once at sync time; bake its directory into the plist's PATH.
   // Priority: explicit bun_path → $BUN_INSTALL/bin → common install dirs → PATH.
   if (bunPathOverride) {
