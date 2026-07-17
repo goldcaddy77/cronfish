@@ -1,11 +1,16 @@
 import { describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { Database } from "bun:sqlite";
 import {
   beatDaemonHeartbeat,
   claimPendingRunRequests,
+  clearRunRequestClaim,
   finishInvocation,
   getDaemonHeartbeat,
   getJobIdBySlug,
+  getRunRequest,
   insertRunRequest,
   jobStats,
   linkRunRequestInvocation,
@@ -13,6 +18,8 @@ import {
   listRunHistory,
   markDeleted,
   migrate,
+  openDb,
+  RUN_REQUEST_EXPIRY_MS,
   setJobLastRun,
   setJobNextRun,
   startInvocation,
@@ -174,6 +181,48 @@ describe("migration ladder", () => {
       }),
     ).toThrow();
   });
+
+  test("v6 backfills last_run_at from run history (else the hot swap fires every interval job at once)", () => {
+    const db = new Database(":memory:");
+    db.exec("PRAGMA foreign_keys = ON");
+    migrate(db, 5);
+
+    db.exec(`
+      INSERT INTO cron_jobs (slug, kind, schedule, enabled, last_synced_at)
+        VALUES ('hourly-md', 'md', '1h', 1, '2026-01-01T00:00:00.000Z');
+      INSERT INTO cron_jobs (slug, kind, schedule, enabled, last_synced_at)
+        VALUES ('never-ran-md', 'md', '1h', 1, '2026-01-01T00:00:00.000Z');
+      INSERT INTO cron_invocations (job_id, started_at, finished_at, status, exit_code, trigger, log_path)
+        VALUES (1, '2026-01-01T09:00:00.000Z', '2026-01-01T09:00:01.000Z', 'ok', 0, 'schedule', '/tmp/a.log');
+      INSERT INTO cron_invocations (job_id, started_at, finished_at, status, exit_code, trigger, log_path)
+        VALUES (1, '2026-01-01T10:00:00.000Z', '2026-01-01T10:00:01.000Z', 'ok', 0, 'schedule', '/tmp/b.log');
+    `);
+
+    migrate(db);
+    const rows = db
+      .query("SELECT slug, last_run_at FROM cron_jobs ORDER BY slug")
+      .all() as { slug: string; last_run_at: string | null }[];
+    expect(rows).toEqual([
+      { slug: "hourly-md", last_run_at: "2026-01-01T10:00:00.000Z" },
+      { slug: "never-ran-md", last_run_at: null },
+    ]);
+  });
+});
+
+describe("openDb pragmas", () => {
+  test("sets busy_timeout so concurrent writers retry instead of failing instantly", () => {
+    const root = mkdtempSync(join(tmpdir(), "cronfish-db-"));
+    try {
+      const db = openDb(root);
+      const row = db.query("PRAGMA busy_timeout").get() as {
+        timeout: number;
+      };
+      expect(row.timeout).toBe(5000);
+      db.close();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("job scheduler state", () => {
@@ -273,6 +322,54 @@ describe("run requests", () => {
     };
     expect(row.picked_up_at).not.toBeNull();
     expect(row.invocation_id).toBe(invId);
+  });
+
+  test("requests older than the expiry window are stamped expired and never claimed", () => {
+    const db = freshDb();
+    upsertJob(db, meta({ slug: "a-md" }));
+    const jobId = getJobIdBySlug(db, "a-md")!;
+    const reqId = insertRunRequest(db, jobId);
+    // Age the request past the window.
+    const old = new Date(
+      Date.now() - RUN_REQUEST_EXPIRY_MS - 60_000,
+    ).toISOString();
+    db.prepare(
+      "UPDATE cron_run_requests SET requested_at = $t WHERE id = $id",
+    ).run({ $t: old, $id: reqId });
+
+    expect(claimPendingRunRequests(db)).toEqual([]);
+    const row = db
+      .query(
+        "SELECT picked_up_at, expired_at FROM cron_run_requests WHERE id = $id",
+      )
+      .get({ $id: reqId }) as {
+      picked_up_at: string | null;
+      expired_at: string | null;
+    };
+    expect(row.picked_up_at).toBeNull();
+    expect(row.expired_at).not.toBeNull();
+    // Stays expired — later claims never resurrect it.
+    expect(claimPendingRunRequests(db)).toEqual([]);
+  });
+
+  test("clearRunRequestClaim releases an unlinked claim for retry, never a linked one", () => {
+    const db = freshDb();
+    upsertJob(db, meta({ slug: "a-md" }));
+    const jobId = getJobIdBySlug(db, "a-md")!;
+    const reqId = insertRunRequest(db, jobId);
+
+    // Claim, then release (the spawn-failure path) → claimable again.
+    expect(claimPendingRunRequests(db)).toHaveLength(1);
+    clearRunRequestClaim(db, reqId);
+    expect(getRunRequest(db, reqId)!.picked_up_at).toBeNull();
+    const reclaimed = claimPendingRunRequests(db);
+    expect(reclaimed.map((r) => r.id)).toEqual([reqId]);
+
+    // Linked to an invocation → the claim is final.
+    const invId = startInvocation(db, jobId, "manual", "/tmp/a.log");
+    linkRunRequestInvocation(db, reqId, invId);
+    clearRunRequestClaim(db, reqId);
+    expect(getRunRequest(db, reqId)!.picked_up_at).not.toBeNull();
   });
 });
 
@@ -388,5 +485,31 @@ describe("reporting queries", () => {
     expect(a.runs).toBe(1);
     expect(a.ok).toBe(0);
     expect(a.success_rate).toBe(0);
+  });
+
+  test("jobStats shows a zero-run job (the silently-dead kind) instead of hiding it", () => {
+    const db = freshDb();
+    seedHistory(db);
+    upsertJob(db, meta({ slug: "dead-md" }));
+
+    const stats = jobStats(db);
+    const dead = stats.find((s) => s.slug === "dead-md")!;
+    expect(dead).toBeDefined();
+    expect(dead.runs).toBe(0);
+    expect(dead.ok).toBe(0);
+    expect(dead.success_rate).toBeNull();
+    expect(dead.avg_duration_ms).toBeNull();
+    expect(dead.p95_duration_ms).toBeNull();
+    expect(dead.last_run_at).toBeNull();
+
+    // The since window must not resurrect INNER JOIN semantics: a job whose
+    // runs all predate the window still shows runs=0.
+    const windowed = jobStats(db, { sinceIso: "2027-01-01T00:00:00.000Z" });
+    const a = windowed.find((s) => s.slug === "a-md")!;
+    expect(a.runs).toBe(0);
+
+    // Deleted jobs stay out of the health rollup.
+    markDeleted(db, ["a-md", "b-md"]); // dead-md gone from disk
+    expect(jobStats(db).map((s) => s.slug)).toEqual(["a-md", "b-md"]);
   });
 });

@@ -35,6 +35,10 @@ export function openDb(consumerRoot: string): Database {
   const db = new Database(path);
   db.exec("PRAGMA journal_mode = WAL");
   db.exec("PRAGMA foreign_keys = ON");
+  // The daemon, runner children, and CLI verbs all hit this file concurrently.
+  // Without a busy timeout a writer collision surfaces as an instant
+  // SQLITE_BUSY error; 5s of retry absorbs normal contention.
+  db.exec("PRAGMA busy_timeout = 5000");
   migrate(db);
   return db;
 }
@@ -146,6 +150,9 @@ const MIGRATIONS: Migration[] = [
     add("last_status", "last_status TEXT");
     add("file_path", "file_path TEXT");
     add("file_mtime", "file_mtime TEXT");
+    // Change detection is size+mtime — mtime alone misses an mtime-preserving
+    // replacement (`cp -p`).
+    add("file_size", "file_size INTEGER");
     add(
       "schedule_kind",
       "schedule_kind TEXT CHECK (schedule_kind IN ('interval','cron','once','manual'))",
@@ -228,6 +235,18 @@ const MIGRATIONS: Migration[] = [
       WHERE finished_at IS NOT NULL AND duration_ms IS NULL
     `);
 
+    // Backfill last_run_at from run history. Without this, every interval
+    // job's schedule-change rule (next = max(now, last_run + interval)) sees
+    // last_run = NULL right after the hot swap → all jobs fire at once.
+    db.exec(`
+      UPDATE cron_jobs
+      SET last_run_at = (
+        SELECT MAX(started_at) FROM cron_invocations i
+        WHERE i.job_id = cron_jobs.id
+      )
+      WHERE last_run_at IS NULL
+    `);
+
     // Manual-run queue the daemon drains ("the daemon is THE runner") and the
     // single-row heartbeat it upserts every tick.
     db.exec(`
@@ -237,6 +256,7 @@ const MIGRATIONS: Migration[] = [
         trigger       TEXT NOT NULL DEFAULT 'manual' CHECK (trigger IN ('manual')),
         requested_at  TEXT NOT NULL,
         picked_up_at  TEXT,
+        expired_at    TEXT,
         invocation_id INTEGER REFERENCES cron_invocations(id)
       );
       CREATE INDEX IF NOT EXISTS idx_run_requests_pending
@@ -283,28 +303,36 @@ function scheduleAsText(schedule: JobMeta["schedule"]): string {
   return String(schedule);
 }
 
-// `fileMtimeIso` is the job file's mtime, when the caller has it (the
-// daemon's mtime scan) — omitted, the stored value is left untouched.
+// `fileMtimeIso`/`fileSizeBytes` are the job file's stat, when the caller has
+// it (the daemon's change scan) — omitted, the stored values are left
+// untouched.
 export function upsertJob(
   db: Database,
   job: JobMeta,
   fileMtimeIso?: string,
+  fileSizeBytes?: number,
 ): void {
   // schedule_kind mirrors the schedule text; `manual` in scheduleAsText
   // covers the schedule-less case, so a parse failure just stores NULL.
+  // One-time jobs (run_at, no schedule) are 'once' — a next_run_at with no
+  // recurrence — NOT 'manual', or the daemon would never dispatch them.
   let kind: ScheduleKind | null = null;
-  try {
-    kind = scheduleKind(scheduleAsText(job.schedule));
-  } catch {}
+  if (job.oneTime) {
+    kind = "once";
+  } else {
+    try {
+      kind = scheduleKind(scheduleAsText(job.schedule));
+    } catch {}
+  }
   const stmt = db.prepare(`
     INSERT INTO cron_jobs (
       slug, kind, schedule, enabled, timeout_s, retries, concurrency,
       model, description, last_synced_at, deleted_at, state, schedule_kind,
-      file_path, file_mtime
+      file_path, file_mtime, file_size
     ) VALUES (
       $slug, $kind, $schedule, $enabled, $timeout_s, $retries, $concurrency,
       $model, $description, $now, NULL, $state, $schedule_kind,
-      $file_path, $file_mtime
+      $file_path, $file_mtime, $file_size
     )
     ON CONFLICT(slug) DO UPDATE SET
       kind = excluded.kind,
@@ -320,7 +348,8 @@ export function upsertJob(
       state = excluded.state,
       schedule_kind = excluded.schedule_kind,
       file_path = excluded.file_path,
-      file_mtime = COALESCE(excluded.file_mtime, cron_jobs.file_mtime)
+      file_mtime = COALESCE(excluded.file_mtime, cron_jobs.file_mtime),
+      file_size = COALESCE(excluded.file_size, cron_jobs.file_size)
   `);
   stmt.run({
     $slug: job.slug,
@@ -337,6 +366,7 @@ export function upsertJob(
     $schedule_kind: kind,
     $file_path: job.path,
     $file_mtime: fileMtimeIso ?? null,
+    $file_size: fileSizeBytes ?? null,
   });
 }
 
@@ -404,6 +434,9 @@ export function finishInvocation(
   status: InvocationStatus,
   exitCode: number | null,
   result?: InvocationResultRow,
+  // Final 1-based attempt count actually used (retries) — omitted, the value
+  // recorded at start (default 1) is left untouched.
+  attempt?: number,
 ): void {
   // duration_ms is materialized at finish time so reporting never does TEXT
   // date math at query time.
@@ -420,6 +453,7 @@ export function finishInvocation(
          status = $status,
          exit_code = $exit_code,
          duration_ms = $duration_ms,
+         attempt = COALESCE($attempt, attempt),
          result_summary = $result_summary,
          result_ok = $result_ok,
          result_json = $result_json,
@@ -429,6 +463,7 @@ export function finishInvocation(
     $id: invocationId,
     $now: now,
     $duration_ms: durationMs,
+    $attempt: attempt ?? null,
     $status: status,
     $exit_code: exitCode,
     $result_summary: result?.summary ?? null,
@@ -576,6 +611,7 @@ export interface JobSyncStateRow {
   schedule: string;
   schedule_kind: ScheduleKind | null;
   file_mtime: string | null;
+  file_size: number | null;
   next_run_at: string | null;
   last_run_at: string | null;
 }
@@ -586,7 +622,7 @@ export interface JobSyncStateRow {
 export function listJobSyncState(db: Database): JobSyncStateRow[] {
   return db
     .query(
-      `SELECT id, slug, state, schedule, schedule_kind, file_mtime,
+      `SELECT id, slug, state, schedule, schedule_kind, file_mtime, file_size,
               next_run_at, last_run_at
        FROM cron_jobs
        WHERE state IS NULL OR state != 'deleted'`,
@@ -638,27 +674,53 @@ export function insertRunRequest(db: Database, jobId: number): number {
   return Number(res.lastInsertRowid);
 }
 
+// A pending request this old at claim time is stale — the requester's
+// `cron run` poll gave up long ago (daemon down / wedged in between). Firing
+// it now would be a surprise run; mark it expired instead.
+export const RUN_REQUEST_EXPIRY_MS = 5 * 60_000;
+
 // Claim every pending request atomically: mark picked_up_at, return the
 // claimed rows. A second drain in the same tick (or a racing process) gets
-// nothing — picked_up_at is the claim.
-export function claimPendingRunRequests(db: Database): RunRequestRow[] {
+// nothing — picked_up_at is the claim. Requests older than
+// RUN_REQUEST_EXPIRY_MS are stamped expired_at and never spawned.
+export function claimPendingRunRequests(
+  db: Database,
+  nowIsoStr?: string,
+): RunRequestRow[] {
+  const now = nowIsoStr ?? nowIso();
   return db.transaction(() => {
+    const cutoff = new Date(
+      Date.parse(now) - RUN_REQUEST_EXPIRY_MS,
+    ).toISOString();
+    db.prepare(
+      `UPDATE cron_run_requests SET expired_at = $now
+       WHERE picked_up_at IS NULL AND expired_at IS NULL AND requested_at < $cutoff`,
+    ).run({ $now: now, $cutoff: cutoff });
     const rows = db
       .query(
         `SELECT r.id, r.job_id, j.slug, r.trigger, r.requested_at, j.file_path
          FROM cron_run_requests r
          JOIN cron_jobs j ON j.id = r.job_id
-         WHERE r.picked_up_at IS NULL
+         WHERE r.picked_up_at IS NULL AND r.expired_at IS NULL
          ORDER BY r.requested_at ASC, r.id ASC`,
       )
       .all() as RunRequestRow[];
     const claim = db.prepare(
       "UPDATE cron_run_requests SET picked_up_at = $now WHERE id = $id",
     );
-    const now = nowIso();
     for (const r of rows) claim.run({ $id: r.id, $now: now });
     return rows;
   })();
+}
+
+// Undo a claim whose spawn failed, so the next tick retries it. Guarded on
+// invocation_id IS NULL — once the runner linked an invocation, the claim is
+// final.
+export function clearRunRequestClaim(db: Database, requestId: number): void {
+  db.prepare(
+    `UPDATE cron_run_requests SET picked_up_at = NULL
+     WHERE id = $id AND invocation_id IS NULL`,
+  ).run({ $id: requestId });
 }
 
 // Tie a claimed request to the invocation it produced — the audit link from
@@ -805,6 +867,8 @@ export interface JobStatsRow {
 }
 
 // Per-job health rollup over a window — backs the upcoming `cron stats` CLI.
+// LEFT JOIN so a job with ZERO runs (the silently-dead kind) still shows a
+// row with runs=0 instead of vanishing; deleted jobs are excluded.
 // Aggregates run in SQL over duration_ms (never TEXT date math); p95 is
 // nearest-rank over the sorted durations, computed here because SQLite has
 // no percentile function.
@@ -825,8 +889,9 @@ export function jobStats(
               COALESCE(j.last_run_at, MAX(i.started_at)) AS last_run_at,
               j.last_status
        FROM cron_jobs j
-       JOIN cron_invocations i ON i.job_id = j.id
-       WHERE ($since IS NULL OR i.started_at >= $since)
+       LEFT JOIN cron_invocations i
+         ON i.job_id = j.id AND ($since IS NULL OR i.started_at >= $since)
+       WHERE j.state IS NULL OR j.state != 'deleted'
        GROUP BY j.id
        ORDER BY j.slug ASC`,
     )

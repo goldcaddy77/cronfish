@@ -491,10 +491,11 @@ function tryFinishInvocation(
   status: InvocationStatus,
   exitCode: number | null,
   result?: InvocationResultRow,
+  attempt?: number,
 ): void {
   if (!db || invocationId === null) return;
   try {
-    finishInvocation(db, invocationId, status, exitCode, result);
+    finishInvocation(db, invocationId, status, exitCode, result, attempt);
   } catch (e) {
     warn(`finishInvocation failed: ${(e as Error).message}`);
   }
@@ -815,6 +816,9 @@ async function main(): Promise<void> {
   const start = Date.now();
   let lastResult: SpawnResult = { code: 1, timedOut: false };
   let crashed = false;
+  // 1-based count of attempts actually made — recorded on the invocation row
+  // at finish so `cron history` shows real retry data, not a constant 1.
+  let attemptsUsed = 1;
   try {
     for (let attempt = 0; attempt <= retries; attempt++) {
       if (attempt > 0) {
@@ -825,6 +829,7 @@ async function main(): Promise<void> {
         );
         await Bun.sleep(delay * 1000);
       }
+      attemptsUsed = attempt + 1;
       lastResult = await execOnce(job, fd, timeoutS);
       if (lastResult.code === 0) break;
     }
@@ -853,7 +858,14 @@ async function main(): Promise<void> {
           ? "ok"
           : "fail";
     const resultRow = await tryParseResult(logFile, lastResult.code);
-    tryFinishInvocation(db, invocationId, status, lastResult.code, resultRow);
+    tryFinishInvocation(
+      db,
+      invocationId,
+      status,
+      lastResult.code,
+      resultRow,
+      attemptsUsed,
+    );
     trySetJobLastRun(db, job.slug, new Date(start).toISOString(), status);
     await maybeFireAlert({
       db,
