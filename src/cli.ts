@@ -26,7 +26,20 @@ import {
 import { defaultBundlePrefix } from "./config.ts";
 import { platform } from "./platform/index.ts";
 import { loadState, rememberPrefix } from "./state.ts";
-import { dbPath, markDeleted, openDb, upsertJob } from "./db.ts";
+import {
+  dbPath,
+  getDaemonHeartbeat,
+  getInvocationLogPath,
+  getJobIdBySlug,
+  getRunRequest,
+  insertRunRequest,
+  jobStats,
+  listRunHistory,
+  markDeleted,
+  openDb,
+  upsertJob,
+  type DaemonHeartbeatRow,
+} from "./db.ts";
 import {
   formatBytes,
   pruneLogs,
@@ -564,11 +577,49 @@ function cmdDelete(slug: string, yes: boolean): void {
   console.log(`[cronfish] deleted ${slug} (plist + job file)`);
 }
 
+// A daemon is "live" when its last tick is at most this old. 1 Hz ticks make
+// anything past 10s a wedge or a dead process.
+const DAEMON_FRESH_MS = 10_000;
+
+// Read-only heartbeat peek — never creates .cronfish/ or migrates (status on
+// a fresh consumer must stay side-effect free, same as loadLastResults).
+function peekHeartbeat(): DaemonHeartbeatRow | null {
+  const path = dbPath(CONSUMER_ROOT);
+  if (!existsSync(path)) return null;
+  let db: Database;
+  try {
+    db = new Database(path, { readonly: true });
+  } catch {
+    return null;
+  }
+  try {
+    return getDaemonHeartbeat(db);
+  } catch {
+    return null; // pre-v6 db — no heartbeat table yet
+  } finally {
+    db.close();
+  }
+}
+
+function printDaemonLiveness(): void {
+  const hb = peekHeartbeat();
+  if (!hb) {
+    console.log("[cronfish] daemon: not running (no heartbeat)");
+    return;
+  }
+  const ageMs = Date.now() - Date.parse(hb.last_tick_at);
+  const live = ageMs <= DAEMON_FRESH_MS;
+  console.log(
+    `[cronfish] daemon: ${live ? "LIVE" : "STALE"} pid=${hb.pid} last tick ${relativeTime(hb.last_tick_at)} (tick #${hb.tick_count}${hb.version ? `, v${hb.version}` : ""})`,
+  );
+}
+
 function cmdStatus(slug?: string): void {
   const p = platform();
   const { jobs } = discoverJobs(CRON_DIR);
   const targets = slug ? jobs.filter((j) => j.slug === slug) : jobs;
   if (!slug) {
+    printDaemonLiveness();
     cmdList();
     return;
   }
@@ -591,11 +642,69 @@ function cmdStatus(slug?: string): void {
   }
 }
 
+// How long `cron run` waits for a live daemon to pick the request up and
+// link the invocation before handing back a "still queued" message.
+const RUN_POLL_TOTAL_MS = 15_000;
+const RUN_POLL_STEP_MS = 300;
+
+// Queue the run through a live daemon ("the daemon is THE runner"). Returns
+// false when there is no fresh heartbeat — caller falls back to the v1
+// direct-spawn path so nothing breaks pre-migration.
+async function tryRunViaDaemon(slug: string, path: string): Promise<boolean> {
+  let db: Database;
+  try {
+    db = openDb(CONSUMER_ROOT);
+  } catch {
+    return false;
+  }
+  try {
+    const hb = getDaemonHeartbeat(db);
+    const fresh =
+      hb !== null && Date.now() - Date.parse(hb.last_tick_at) <= DAEMON_FRESH_MS;
+    if (!fresh) return false;
+    let jobId = getJobIdBySlug(db, slug);
+    if (jobId === null) {
+      // Brand-new file the daemon hasn't ticked over yet — seed the row.
+      upsertJob(db, loadJob(path, slug, CRON_DIR));
+      jobId = getJobIdBySlug(db, slug);
+    }
+    if (jobId === null) return false;
+    const reqId = insertRunRequest(db, jobId);
+    console.log(
+      `[cronfish] run request #${reqId} queued for daemon (pid ${hb!.pid})`,
+    );
+    const deadline = Date.now() + RUN_POLL_TOTAL_MS;
+    while (Date.now() < deadline) {
+      await Bun.sleep(RUN_POLL_STEP_MS);
+      const req = getRunRequest(db, reqId);
+      if (req?.invocation_id) {
+        const logPath = getInvocationLogPath(db, req.invocation_id);
+        console.log(`[cronfish] invocation ${req.invocation_id} started`);
+        if (logPath) console.log(`[cronfish] log: ${logPath}`);
+        return true;
+      }
+    }
+    console.log(
+      `[cronfish] request #${reqId} queued but not yet linked — check \`cronfish history ${slug}\``,
+    );
+    return true;
+  } finally {
+    db.close();
+  }
+}
+
 async function cmdRun(slug: string): Promise<void> {
   const path = findJobFile(CRON_DIR, slug);
   if (!path) throw new Error(`no job file for slug "${slug}"`);
   // Validate before spawning.
   loadJob(path, undefined, CRON_DIR);
+  try {
+    if (await tryRunViaDaemon(slug, path)) return;
+  } catch (e) {
+    console.error(
+      `[cronfish] daemon run path failed (${(e as Error).message}) — falling back to direct spawn`,
+    );
+  }
   const runnerTs = new URL("./runner.ts", import.meta.url).pathname;
   const proc = Bun.spawn(["bun", runnerTs, path], {
     stdout: "inherit",
@@ -608,6 +717,164 @@ async function cmdRun(slug: string): Promise<void> {
     },
   });
   process.exit(await proc.exited);
+}
+
+// --- daemon + reporting verbs ---
+
+async function cmdDaemon(): Promise<void> {
+  // Foreground tick loop. `cronfish daemon install` (launchd KeepAlive) is a
+  // later step — it will wrap exactly this entry point.
+  const { runDaemon } = await import("./daemon.ts");
+  await runDaemon({ consumerRoot: CONSUMER_ROOT });
+}
+
+// "--since 7d" style windows: N + s/m/h/d, anchored at now.
+function parseSince(spec: string): string {
+  const m = spec.match(/^(\d+)([smhd])$/);
+  if (!m) {
+    throw new Error(
+      `--since must look like 30m, 12h, or 7d — got "${spec}"`,
+    );
+  }
+  const mult = { s: 1_000, m: 60_000, h: 3_600_000, d: 86_400_000 }[
+    m[2] as "s" | "m" | "h" | "d"
+  ];
+  return new Date(Date.now() - parseInt(m[1]!, 10) * mult).toISOString();
+}
+
+function fmtDuration(ms: number | null): string {
+  if (ms === null) return "—";
+  if (ms < 1_000) return `${ms}ms`;
+  if (ms < 60_000) return `${(ms / 1_000).toFixed(1)}s`;
+  const min = Math.floor(ms / 60_000);
+  const sec = Math.round((ms % 60_000) / 1_000);
+  return `${min}m${String(sec).padStart(2, "0")}s`;
+}
+
+function fmtStamp(iso: string | null): string {
+  if (!iso) return "—";
+  return iso.replace("T", " ").slice(0, 19);
+}
+
+interface ReportFlags {
+  slug?: string;
+  limit?: number;
+  sinceIso?: string;
+}
+
+function parseReportArgs(rest: string[], usage: string): ReportFlags {
+  const out: ReportFlags = {};
+  for (let i = 0; i < rest.length; i++) {
+    const a = rest[i]!;
+    if (a === "--limit" || a.startsWith("--limit=")) {
+      const v = a.includes("=") ? a.slice("--limit=".length) : rest[++i];
+      if (!v || !/^\d+$/.test(v)) throw new Error(usage);
+      out.limit = parseInt(v, 10);
+    } else if (a === "--since" || a.startsWith("--since=")) {
+      const v = a.includes("=") ? a.slice("--since=".length) : rest[++i];
+      if (!v) throw new Error(usage);
+      out.sinceIso = parseSince(v);
+    } else if (a.startsWith("-")) {
+      throw new Error(usage);
+    } else if (out.slug === undefined) {
+      out.slug = a;
+    } else {
+      throw new Error(usage);
+    }
+  }
+  return out;
+}
+
+const HISTORY_USAGE =
+  "usage: cronfish history [slug] [--limit N] [--since 7d]";
+
+function cmdHistory(rest: string[]): void {
+  const flags = parseReportArgs(rest, HISTORY_USAGE);
+  const db = openDb(CONSUMER_ROOT);
+  try {
+    const rows = listRunHistory(db, {
+      slug: flags.slug,
+      limit: flags.limit,
+      sinceIso: flags.sinceIso,
+    });
+    if (rows.length === 0) {
+      console.log("(no runs recorded)");
+      return;
+    }
+    const cols = Math.max(80, Number(process.stdout.columns) || 120);
+    const resultBudget = Math.max(20, cols - 90);
+    console.log(
+      ["started", "slug", "trigger", "status", "duration", "attempt", "result"].join(
+        "\t",
+      ),
+    );
+    for (const r of rows) {
+      console.log(
+        [
+          fmtStamp(r.started_at),
+          r.slug,
+          r.trigger,
+          r.status,
+          fmtDuration(r.duration_ms),
+          String(r.attempt),
+          r.result_summary ? truncate(r.result_summary, resultBudget) : "—",
+        ].join("\t"),
+      );
+    }
+  } finally {
+    db.close();
+  }
+}
+
+const STATS_USAGE = "usage: cronfish stats [--since 30d]";
+
+function cmdStats(rest: string[]): void {
+  const flags = parseReportArgs(rest, STATS_USAGE);
+  if (flags.slug !== undefined || flags.limit !== undefined) {
+    throw new Error(STATS_USAGE);
+  }
+  const db = openDb(CONSUMER_ROOT);
+  try {
+    const rows = jobStats(db, { sinceIso: flags.sinceIso });
+    if (rows.length === 0) {
+      console.log("(no runs recorded)");
+      return;
+    }
+    console.log(
+      [
+        "job",
+        "runs",
+        "ok",
+        "fail",
+        "timeout",
+        "success",
+        "avg",
+        "p95",
+        "last run",
+        "last status",
+      ].join("\t"),
+    );
+    for (const r of rows) {
+      console.log(
+        [
+          r.slug,
+          String(r.runs),
+          String(r.ok),
+          String(r.fail),
+          String(r.timeout),
+          r.success_rate === null
+            ? "—"
+            : `${Math.round(r.success_rate * 100)}%`,
+          fmtDuration(r.avg_duration_ms === null ? null : Math.round(r.avg_duration_ms)),
+          fmtDuration(r.p95_duration_ms),
+          relativeTime(r.last_run_at),
+          r.last_status ?? "—",
+        ].join("\t"),
+      );
+    }
+  } finally {
+    db.close();
+  }
 }
 
 interface UiOptions {
@@ -1031,7 +1298,10 @@ usage:
   cronfish delete <slug> --yes        bootout + remove plist + job file
   cronfish status [slug]              all jobs (no arg) or one slug's launchctl + log tail
   cronfish errors [--clear] [slug]    list error sentinels (cron/.errors/); --clear removes them
-  cronfish run <slug>                 invoke runner directly (no launchd)
+  cronfish run <slug>                 run now — queues through a live daemon, else spawns the runner directly
+  cronfish daemon                     run the v2 scheduler daemon in the foreground (1s tick loop)
+  cronfish history [slug] [--limit N] [--since 7d]   run timeline: started, trigger, status, duration, result
+  cronfish stats [--since 30d]        per-job rollup: runs, success %, avg/p95 duration, last status
   cronfish watchdog                   check enabled jobs for missed schedules → fire alerts
   cronfish alerts test [adapter]      send a test alert via the named (or default) adapter
   cronfish ui [--port N] [--host ADDR] [--no-open]  local web dashboard (default 127.0.0.1:4747)
@@ -1131,6 +1401,15 @@ async function main(): Promise<void> {
     case "run":
       if (!rest[0]) throw new Error("usage: cronfish run <slug>");
       await cmdRun(rest[0]);
+      return;
+    case "daemon":
+      await cmdDaemon();
+      return;
+    case "history":
+      cmdHistory(rest);
+      return;
+    case "stats":
+      cmdStats(rest);
       return;
     case "watchdog":
       await cmdWatchdog();
