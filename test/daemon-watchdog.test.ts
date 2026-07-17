@@ -93,10 +93,11 @@ describe("daemon checkMissedRuns", () => {
     expect(readFileSync(sentinel, "utf-8").trim()).toBe("demo-md");
   });
 
-  test("expected fire fell in a daemon-down window → no false alert", async () => {
+  test("expected fire fell in a daemon-down window → no false alert (inside the post-restart grace)", async () => {
     seedOverdueJob();
     // Daemon (re)started 2 minutes ago; the miss (25m ago) predates it —
-    // catch-up dispatch handles it, the watchdog must stay quiet.
+    // catch-up dispatch gets a grace window (10m for a 5m job) from startup
+    // to make the run happen, so the watchdog stays quiet for now.
     ctx.startedAt = minutesAgo(2).toISOString();
 
     const decisions = await checkMissedRuns(ctx, new Date());
@@ -104,5 +105,26 @@ describe("daemon checkMissedRuns", () => {
       "skipped-down-window",
     );
     expect(existsSync(sentinel)).toBe(false);
+  });
+
+  test("pre-restart miss still unresolved past the post-restart grace → alert fires (restarts delay, never mute)", async () => {
+    seedOverdueJob();
+    // Miss (25m ago) predates liveSince (15m ago), but the daemon has now
+    // been live for 15m — past the 10m grace — and the run still never
+    // happened. A restart must not permanently mute this fault.
+    ctx.startedAt = minutesAgo(15).toISOString();
+
+    const decisions = await checkMissedRuns(ctx, new Date());
+    expect(decisions.find((d) => d.slug === "demo-md")?.outcome).toBe("fired");
+    expect(readFileSync(sentinel, "utf-8").trim()).toBe("demo-md");
+
+    // A SECOND restart re-runs the check with a fresh liveSince — the dedup
+    // row (not the down-window skip) is what keeps it quiet now.
+    ctx.startedAt = minutesAgo(20).toISOString();
+    const again = await checkMissedRuns(ctx, new Date());
+    expect(again.find((d) => d.slug === "demo-md")?.outcome).toBe(
+      "skipped-already-fired",
+    );
+    expect(readFileSync(sentinel, "utf-8").trim()).toBe("demo-md");
   });
 });
