@@ -28,6 +28,7 @@ import {
 } from "./db.ts";
 import { loadJob, slugFromPath, walkJobFiles } from "./jobs.ts";
 import { computeNextRun } from "./next-run.ts";
+import { runWatchdog, type WatchdogDecision } from "./watchdog.ts";
 import pkg from "../package.json" with { type: "json" };
 
 // A due job older than this at dispatch time is a post-downtime catch-up run
@@ -199,6 +200,40 @@ function drainRunRequests(ctx: DaemonCtx): void {
   }
 }
 
+// --- 4. In-daemon missed-run detection (the folded-in watchdog) ---
+//
+// Low-frequency phase (every MISSED_CHECK_EVERY_TICKS ticks): a job whose
+// expected fire time is more than grace past due WHILE the daemon was live
+// the whole window means something is wrong below the scheduler (runner
+// failing to spawn, job never succeeding) → fire the existing missed-run
+// alert path, deduped via cron_missed_alerts exactly like the standalone
+// `cronfish watchdog`. Misses whose expected time predates this process's
+// startedAt are downtime gaps — the catch-up dispatch owns those, no alert.
+export const MISSED_CHECK_EVERY_TICKS = 60;
+
+export async function checkMissedRuns(
+  ctx: DaemonCtx,
+  now: Date,
+): Promise<WatchdogDecision[]> {
+  const decisions = await runWatchdog({
+    consumerRoot: ctx.consumerRoot,
+    now,
+    db: ctx.db,
+    liveSince: new Date(ctx.startedAt),
+  });
+  for (const d of decisions) {
+    if (d.outcome === "fired") {
+      warn(ctx, `missed-run alert fired: ${d.slug} (expected ${d.expected_at})`);
+    } else if (d.outcome === "fire-failed") {
+      warn(
+        ctx,
+        `missed-run alert FAILED: ${d.slug}: ${d.error ?? "unknown"} (expected ${d.expected_at})`,
+      );
+    }
+  }
+  return decisions;
+}
+
 // One full tick. Every phase is fenced — an error in one job's sync or
 // dispatch logs to stderr and the loop keeps going.
 export function tickOnce(ctx: DaemonCtx, now: Date): void {
@@ -292,9 +327,17 @@ export async function runDaemon(opts: { consumerRoot: string }): Promise<void> {
   console.error(
     `[daemon] cronfish ${pkg.version} pid=${ctx.pid} consumer=${consumerRoot} tick=${TICK_MS}ms`,
   );
+  let ticks = 0;
   while (running) {
     const t0 = Date.now();
     tickOnce(ctx, new Date());
+    if (++ticks % MISSED_CHECK_EVERY_TICKS === 0) {
+      try {
+        await checkMissedRuns(ctx, new Date());
+      } catch (e) {
+        console.error(`[daemon] missed-run check: ${(e as Error).message}`);
+      }
+    }
     const elapsed = Date.now() - t0;
     if (elapsed > TICK_MS) {
       console.error(`[daemon] slow tick: ${elapsed}ms`);

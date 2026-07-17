@@ -37,7 +37,7 @@ export interface WatchdogDecision {
   slug: string;
   outcome: "skipped-cold" | "skipped-manual" | "skipped-on-time" |
            "skipped-already-fired" | "skipped-no-adapter" |
-           "fired" | "fire-failed";
+           "skipped-down-window" | "fired" | "fire-failed";
   expected_at?: string;
   grace_s?: number;
   error?: string;
@@ -46,6 +46,14 @@ export interface WatchdogDecision {
 export interface WatchdogInput {
   consumerRoot: string;
   now?: Date;
+  // Reuse an already-open ledger (the in-daemon caller passes its own db);
+  // left open on return. Omitted → open + close the consumer db as before.
+  db?: Database;
+  // Daemon mode: only a miss whose expected fire time falls INSIDE the
+  // daemon's own uptime is a real fault (runner failing to spawn, etc.).
+  // Anything earlier is a downtime gap the catch-up dispatch already covers
+  // → skipped-down-window, no alert.
+  liveSince?: Date;
 }
 
 export async function runWatchdog(
@@ -56,7 +64,8 @@ export async function runWatchdog(
   const { jobs } = discoverJobs(cronDir);
   const jobBySlug = new Map(jobs.map((j) => [j.slug, j]));
 
-  const db = openDb(input.consumerRoot);
+  const ownDb = input.db === undefined;
+  const db = input.db ?? openDb(input.consumerRoot);
   const cfg = loadConsumerAlertsConfig(input.consumerRoot);
   const registry = buildRegistry(cfg.alerts);
   const decisions: WatchdogDecision[] = [];
@@ -79,6 +88,14 @@ export async function runWatchdog(
       const expected = nextFireAfter(job.schedule, lastOkDate);
       if (!expected) {
         decisions.push({ slug: row.slug, outcome: "skipped-manual" });
+        continue;
+      }
+      if (input.liveSince && expected < input.liveSince) {
+        decisions.push({
+          slug: row.slug,
+          outcome: "skipped-down-window",
+          expected_at: expected.toISOString(),
+        });
         continue;
       }
       const intervalS = intervalSecondsAt(job.schedule, expected) ?? 60;
@@ -143,9 +160,11 @@ export async function runWatchdog(
       }
     }
   } finally {
-    try {
-      db.close();
-    } catch {}
+    if (ownDb) {
+      try {
+        db.close();
+      } catch {}
+    }
   }
   return decisions;
 }
@@ -167,6 +186,7 @@ export interface DecisionInput {
   lastMissedFiredAt: string | null;
   missedAfter?: string;
   adapterConfigured: boolean;
+  liveSince?: Date; // see WatchdogInput.liveSince
 }
 
 export function decideWatchdog(input: DecisionInput): {
@@ -181,6 +201,9 @@ export function decideWatchdog(input: DecisionInput): {
   const lastOkDate = new Date(input.lastOk);
   const expected = nextFireAfter(input.schedule, lastOkDate);
   if (!expected) return { outcome: "skipped-manual" };
+  if (input.liveSince && expected < input.liveSince) {
+    return { outcome: "skipped-down-window", expected };
+  }
   const intervalS = intervalSecondsAt(input.schedule, expected) ?? 60;
   const overrideS = parseMissedAfter(input.missedAfter);
   const graceS = overrideS ?? Math.max(2 * intervalS, DEFAULT_GRACE_FLOOR_S);
