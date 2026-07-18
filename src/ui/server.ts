@@ -5,7 +5,11 @@
 
 import { existsSync, statSync } from "node:fs";
 import { extname, join, normalize, resolve } from "node:path";
-import { openDb } from "../db.ts";
+import {
+  getDaemonHeartbeat,
+  openDb,
+  type DaemonHeartbeatRow,
+} from "../db.ts";
 import { dispatchSchedule } from "../schedule.ts";
 
 export interface UiServerOptions {
@@ -27,11 +31,28 @@ interface JobRow {
   description: string | null;
   last_synced_at: string;
   deleted_at: string | null;
+  // v2 daemon scheduler columns (NULL on a pre-v6 row until the next sync).
+  state: string | null;
+  schedule_kind: string | null;
+  next_run_at: string | null;
 }
 
 function filenameFromSlug(slug: string): string {
   // slug encodes the kind as `-<ext>` — reverse it to get the on-disk name.
   return slug.replace(/-(md|ts|sh|py)$/, ".$1");
+}
+
+// The daemon's next_run_at is authoritative when present; the legacy
+// client-side interval estimate below is only a fallback for rows the daemon
+// hasn't scheduled (pre-v6 dbs, launchd-mode consumers). One-shot ('once')
+// and manual jobs never get an estimate — a NULL there means "won't fire".
+function jobNextRun(
+  j: Pick<JobRow, "schedule" | "schedule_kind" | "next_run_at">,
+  lastStartedAt: string | null,
+): string | null {
+  if (j.next_run_at) return j.next_run_at;
+  if (j.schedule_kind === "once" || j.schedule_kind === "manual") return null;
+  return nextRunIso(j.schedule, lastStartedAt);
 }
 
 function nextRunIso(
@@ -269,7 +290,7 @@ function listJobs(consumerRoot: string): unknown {
     return jobs.map((j) => ({
       ...j,
       filename: filenameFromSlug(j.slug),
-      next_run: nextRunIso(j.schedule, j.last_started_at),
+      next_run: jobNextRun(j, j.last_started_at),
     }));
   } finally {
     db.close();
@@ -294,7 +315,7 @@ function getJob(consumerRoot: string, slug: string): unknown {
     return {
       ...job,
       filename: filenameFromSlug(job.slug),
-      next_run: nextRunIso(job.schedule, lastInv?.started_at ?? null),
+      next_run: jobNextRun(job, lastInv?.started_at ?? null),
     };
   } finally {
     db.close();
@@ -399,6 +420,28 @@ function getInvocation(consumerRoot: string, id: number): unknown {
   }
 }
 
+// A daemon is "live" when its last tick is at most this old — mirrors
+// cli.ts's DAEMON_FRESH_MS (1 Hz ticks; anything past 10s is a wedge or a
+// dead process).
+const DAEMON_FRESH_MS = 10_000;
+
+export function daemonStatus(consumerRoot: string): {
+  live: boolean;
+  heartbeat: DaemonHeartbeatRow | null;
+  now: string;
+} {
+  const db = openDb(consumerRoot);
+  try {
+    const heartbeat = getDaemonHeartbeat(db);
+    const live =
+      !!heartbeat &&
+      Date.now() - Date.parse(heartbeat.last_tick_at) <= DAEMON_FRESH_MS;
+    return { live, heartbeat, now: new Date().toISOString() };
+  } finally {
+    db.close();
+  }
+}
+
 export async function startUiServer(opts: UiServerOptions): Promise<string> {
   const hostname = opts.hostname ?? "127.0.0.1";
   const server = Bun.serve({
@@ -409,6 +452,10 @@ export async function startUiServer(opts: UiServerOptions): Promise<string> {
       const { pathname } = url;
 
       // --- API ---
+      if (pathname === "/api/daemon" && req.method === "GET") {
+        return json(daemonStatus(opts.consumerRoot));
+      }
+
       if (pathname === "/api/jobs" && req.method === "GET") {
         return json(listJobs(opts.consumerRoot));
       }

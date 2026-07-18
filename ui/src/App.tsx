@@ -1,5 +1,6 @@
 import { Link, Route, Switch } from "wouter";
 import { Separator } from "@/components/ui/separator";
+import { DaemonBanner } from "@/components/DaemonBanner";
 import { JobsPage } from "./pages/Jobs";
 import { InvocationsPage } from "./pages/Invocations";
 import { AllInvocationsPage } from "./pages/AllInvocations";
@@ -40,6 +41,10 @@ export default function App(): React.ReactElement {
           </div>
         </div>
       </header>
+
+      <div className="mx-auto w-full max-w-6xl px-6 pt-4">
+        <DaemonBanner />
+      </div>
 
       <main className="mx-auto w-full max-w-6xl flex-1 min-h-0 px-6 py-6">
         <Switch>

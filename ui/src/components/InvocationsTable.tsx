@@ -9,9 +9,34 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+import { Badge } from "@/components/ui/badge";
 import { StatusBadge } from "@/components/StatusBadge";
 import type { Invocation } from "@/lib/api";
 import { fmtAbsolute, fmtDuration, fmtRelative } from "@/lib/fmt";
+
+// 'catchup' (the coalesced post-downtime run) gets a distinct color so a
+// machine that slept through its schedule is visible at a glance.
+const TRIGGER_CLS: Record<Invocation["trigger"], string | undefined> = {
+  schedule: undefined,
+  manual:
+    "border-[color-mix(in_oklch,var(--info)_40%,transparent)] bg-[color-mix(in_oklch,var(--info)_12%,transparent)] text-[var(--info)]",
+  retry:
+    "border-[color-mix(in_oklch,var(--warning)_45%,transparent)] bg-[color-mix(in_oklch,var(--warning)_15%,transparent)] text-[var(--warning)]",
+  catchup:
+    "border-[color-mix(in_oklch,var(--catchup,#9333ea)_40%,transparent)] bg-[color-mix(in_oklch,var(--catchup,#9333ea)_12%,transparent)] text-[var(--catchup,#9333ea)]",
+};
+
+function TriggerBadge({
+  trigger,
+}: {
+  trigger: Invocation["trigger"];
+}): React.ReactElement {
+  return (
+    <Badge variant="outline" className={TRIGGER_CLS[trigger]}>
+      {trigger}
+    </Badge>
+  );
+}
 
 function OkIndicator({ ok }: { ok: 0 | 1 | null }): React.ReactElement {
   if (ok === 1)
@@ -179,7 +204,9 @@ export function InvocationsTable({
                     <TableCell colSpan={cols} className="bg-muted/30 p-0">
                       <div className="space-y-3 px-4 py-3">
                         <div className="flex flex-wrap items-center gap-3 text-xs text-muted-foreground">
-                          <span>trigger: {inv.trigger}</span>
+                          <span className="inline-flex items-center gap-1">
+                            trigger: <TriggerBadge trigger={inv.trigger} />
+                          </span>
                           <span>exit: {inv.exit_code ?? "—"}</span>
                           <Link
                             to={`/invocations/${inv.id}`}

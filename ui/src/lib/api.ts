@@ -7,12 +7,18 @@ export type InvocationStatus =
   | "timeout"
   | "crashed";
 
+export type JobState = "active" | "disabled" | "deleted";
+
 export interface Job {
   id: number;
   slug: string;
   kind: "md" | "ts" | "sh" | "py";
   schedule: string;
   enabled: 0 | 1;
+  // v2 daemon scheduler fields (null on rows a v2 sync hasn't touched yet).
+  state: JobState | null;
+  schedule_kind: "interval" | "cron" | "once" | "manual" | null;
+  next_run_at: string | null;
   timeout_s: number | null;
   retries: number;
   concurrency: "skip" | "queue";
@@ -37,13 +43,25 @@ export interface Invocation {
   finished_at: string | null;
   status: InvocationStatus;
   exit_code: number | null;
-  trigger: "schedule" | "manual" | "retry";
+  trigger: "schedule" | "manual" | "retry" | "catchup";
   duration_ms: number | null;
   slug?: string;
   result_summary: string | null;
   result_ok: 0 | 1 | null;
   result_json: string | null;
   result_truncated: 0 | 1;
+}
+
+export interface DaemonStatus {
+  live: boolean;
+  heartbeat: {
+    pid: number;
+    started_at: string;
+    last_tick_at: string;
+    version: string | null;
+    tick_count: number;
+  } | null;
+  now: string;
 }
 
 async function fetchJson<T>(path: string): Promise<T> {

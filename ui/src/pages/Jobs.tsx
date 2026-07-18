@@ -71,7 +71,13 @@ export function JobsPage(): React.ReactElement {
               </TableCell>
             </TableRow>
           )}
-          {data?.map((j) => (
+          {data?.map((j) => {
+            // The daemon's `state` is authoritative; the legacy
+            // enabled/deleted_at pair backs it up on pre-v2 rows.
+            const state =
+              j.state ??
+              (j.deleted_at ? "deleted" : j.enabled ? "active" : "disabled");
+            return (
             <TableRow
               key={j.slug}
               onClick={() => navigate(`/jobs/${encodeURIComponent(j.slug)}`)}
@@ -80,7 +86,7 @@ export function JobsPage(): React.ReactElement {
               <TableCell>
                 <span className="font-mono text-sm">{j.filename}</span>
                 <span className="ml-2 inline-flex gap-1 align-middle">
-                  {!j.enabled && (
+                  {state === "disabled" && (
                     <Badge
                       variant="secondary"
                       className="text-muted-foreground"
@@ -88,7 +94,9 @@ export function JobsPage(): React.ReactElement {
                       disabled
                     </Badge>
                   )}
-                  {j.deleted_at && <Badge variant="outline">deleted</Badge>}
+                  {state === "deleted" && (
+                    <Badge variant="outline">deleted</Badge>
+                  )}
                 </span>
               </TableCell>
               <TableCell className="max-w-sm truncate text-muted-foreground">
@@ -109,7 +117,7 @@ export function JobsPage(): React.ReactElement {
                 {fmtRelative(j.last_started_at)}
               </TableCell>
               <TableCell className="text-muted-foreground">
-                {j.enabled ? (
+                {state === "active" ? (
                   fmtRelative(j.next_run)
                 ) : (
                   <span className="text-muted-foreground/60">—</span>
@@ -119,7 +127,8 @@ export function JobsPage(): React.ReactElement {
                 {fmtDuration(j.last_duration_ms)}
               </TableCell>
             </TableRow>
-          ))}
+            );
+          })}
         </TableBody>
       </Table>
     </div>
