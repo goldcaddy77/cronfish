@@ -1,3 +1,10 @@
+## [0.16.1](https://github.com/goldcaddy77/cronfish/compare/v0.16.0...v0.16.1) (2026-07-18)
+
+
+### Bug Fixes
+
+* **launchd:** kickstart daemon after bootstrap — RunAtLoad alone can pend forever ([9500483](https://github.com/goldcaddy77/cronfish/commit/9500483781185a07172553c8585ae5125bffa185))
+
 # [0.16.0](https://github.com/goldcaddy77/cronfish/compare/v0.15.1...v0.16.0) (2026-07-18)
 
 
