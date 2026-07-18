@@ -218,8 +218,10 @@ export interface InstallDaemonResult {
 //   1. enumerate this consumer's per-job plists
 //   2. bootout + remove each
 //   3. verify none remain loaded (throws — never run both modes at once)
-//   4. write + bootstrap the daemon plist (skipped when already up-to-date)
-//   5. verify the daemon heartbeat within ~15s (throws on timeout)
+//   4. write + bootstrap the daemon plist (skipped when already up-to-date),
+//      then kickstart — RunAtLoad alone can pend forever (see below)
+//   5. verify the daemon heartbeat within ~15s (throws on timeout, with the
+//      tail of the daemon log inlined)
 // Idempotent: re-running with the daemon installed re-verifies and returns
 // changed=false without a reload.
 export async function installDaemon(
@@ -277,6 +279,18 @@ export async function installDaemon(
     log(`[cronfish] daemon install 4/5: bootstrapped ${label}`);
   }
 
+  // Kickstart — force an immediate spawn. On macOS (seen live on 25.2/Darwin,
+  // gui domain) launchd can register a bootstrapped agent but never spawn it
+  // despite RunAtLoad=true (`launchctl print` shows "pended nondemand spawn =
+  // speculative", runs = 0) — the daemon sits idle and the heartbeat wait
+  // below times out with the per-job plists already retired. Plain kickstart
+  // (NO -k) is correct on every path: the re-render branch above already
+  // bootout'd the old process before bootstrap (so there is no stale process
+  // to kill), and on the no-op branch the healthy running daemon must NOT be
+  // killed — plain kickstart is a harmless no-op there but rescues a
+  // loaded-but-pended one.
+  io.exec(["launchctl", "kickstart", `${io.guiDomain}/${label}`]);
+
   // Phase 5 — heartbeat. After a (re)load the tick must be from the NEW
   // process (last_tick_at after the bootstrap); on a no-op re-install any
   // fresh tick proves liveness.
@@ -300,12 +314,26 @@ export async function installDaemon(
     await sleep(Math.min(HEARTBEAT_POLL_MS, waitMs));
   }
   if (!live) {
+    const tail = tailLines(logPath, 5);
     throw new Error(
-      `daemon install: no live heartbeat within ${Math.round(waitMs / 1000)}s — check ${logPath}`,
+      `daemon install: no live heartbeat within ${Math.round(waitMs / 1000)}s — check ${logPath}${tail ? `\nlast daemon log lines:\n${tail}` : ""}`,
     );
   }
 
   return { label, plistPath, logPath, removedPerJob: perJob, changed };
+}
+
+// Last `n` lines of a file, "" when missing/unreadable — used to inline the
+// daemon log into the heartbeat-timeout error for faster diagnosis.
+function tailLines(path: string, n: number): string {
+  try {
+    if (!existsSync(path)) return "";
+    const text = readFileSync(path, "utf-8").trimEnd();
+    if (!text) return "";
+    return text.split("\n").slice(-n).join("\n");
+  } catch {
+    return "";
+  }
 }
 
 export interface UninstallDaemonOpts {

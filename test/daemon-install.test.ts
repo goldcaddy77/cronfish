@@ -24,9 +24,14 @@ const PREFIX = "com.test.cronfish";
 
 // Stubbed launchctl: a loaded-label set driven by bootstrap/bootout, plus a
 // call log so tests can assert ordering (teardown strictly before load).
+// Models the real macOS wedge (seen live on Darwin 25.2): bootstrap REGISTERS
+// a label but does not spawn it despite RunAtLoad — only kickstart moves it
+// to `running`. The heartbeat stub keys off `running`, so installDaemon only
+// passes if it kickstarts after bootstrap.
 interface FakeLaunchd {
   io: DaemonServiceIo;
   loaded: Set<string>;
+  running: Set<string>;
   calls: string[][];
 }
 
@@ -41,6 +46,7 @@ function fakeLaunchd(
   opts: { bootoutFails?: boolean } = {},
 ): FakeLaunchd {
   const loaded = new Set<string>();
+  const running = new Set<string>();
   const calls: string[][] = [];
   const io: DaemonServiceIo = {
     launchAgentsDir: dir,
@@ -55,24 +61,35 @@ function fakeLaunchd(
           : { code: 113, out: "", err: "not found" };
       }
       if (verb === "bootout") {
-        if (!opts.bootoutFails) loaded.delete(label);
+        if (!opts.bootoutFails) {
+          loaded.delete(label);
+          running.delete(label);
+        }
         return { code: 0, out: "", err: "" };
       }
       if (verb === "bootstrap") {
+        // Registers only — the RunAtLoad spawn stays pended (the real bug).
         loaded.add(labelFromArg(target === "gui/501" ? cmd[3]! : target));
+        return { code: 0, out: "", err: "" };
+      }
+      if (verb === "kickstart") {
+        if (!loaded.has(label)) {
+          return { code: 113, out: "", err: "not found" };
+        }
+        running.add(label);
         return { code: 0, out: "", err: "" };
       }
       return { code: 0, out: "", err: "" };
     },
   };
-  return { io, loaded, calls };
+  return { io, loaded, running, calls };
 }
 
-// Heartbeat stub tied to the fake launchctl: once the daemon label is
-// loaded, the "daemon" ticks — a fresh heartbeat appears.
+// Heartbeat stub tied to the fake launchctl: only a RUNNING daemon ticks —
+// a bootstrapped-but-pended one never produces a heartbeat.
 function heartbeatFrom(fake: FakeLaunchd): () => HeartbeatPeek | null {
   return () =>
-    fake.loaded.has(daemonLabel(PREFIX))
+    fake.running.has(daemonLabel(PREFIX))
       ? { pid: 999, last_tick_at: new Date().toISOString() }
       : null;
 }
@@ -168,6 +185,16 @@ describe("installDaemon — hot swap", () => {
       .filter((i) => i >= 0)
       .pop()!;
     expect(bootstrapIdx).toBeGreaterThan(lastJobBootout);
+    // Kickstart fires AFTER bootstrap (before the heartbeat wait — the fake
+    // only ticks a RUNNING daemon, so a live heartbeat proves the order).
+    const kickstartIdx = fake.calls.findIndex((c) => c[1] === "kickstart");
+    expect(kickstartIdx).toBeGreaterThan(bootstrapIdx);
+    expect(fake.calls[kickstartIdx]).toEqual([
+      "launchctl",
+      "kickstart",
+      `gui/501/${PREFIX}.daemon`,
+    ]);
+    expect(fake.running.has(`${PREFIX}.daemon`)).toBe(true);
     // Daemon plist content is the render output.
     expect(readFileSync(r.plistPath, "utf-8")).toContain(
       "<key>KeepAlive</key>",
@@ -196,6 +223,14 @@ describe("installDaemon — hot swap", () => {
     const callsAfter = fake.calls.slice(callsBefore);
     expect(callsAfter.some((c) => c[1] === "bootstrap")).toBe(false);
     expect(callsAfter.some((c) => c[1] === "bootout")).toBe(false);
+    // Plain kickstart (no -k) still fires — a no-op on the healthy running
+    // daemon, but it rescues a loaded-but-pended one without killing anything.
+    const kick = callsAfter.find((c) => c[1] === "kickstart");
+    expect(kick).toEqual([
+      "launchctl",
+      "kickstart",
+      `gui/501/${PREFIX}.daemon`,
+    ]);
   });
 
   test("refuses to load the daemon when a per-job plist survives teardown", async () => {
@@ -215,8 +250,16 @@ describe("installDaemon — hot swap", () => {
     expect(existsSync(join(agents, `${PREFIX}.daemon.plist`))).toBe(false);
   });
 
-  test("throws when no heartbeat appears within the wait window", async () => {
+  test("throws when no heartbeat appears within the wait window, inlining the daemon log tail", async () => {
     const fake = fakeLaunchd(agents);
+    // Seed a daemon log so the timeout error carries its last lines.
+    const logDir = join(root, ".cronfish", "logs", "daemon");
+    mkdirSync(logDir, { recursive: true });
+    writeFileSync(
+      join(logDir, "daemon.log"),
+      "line one\nerror: db locked\n",
+      "utf-8",
+    );
     await expect(
       installDaemon({
         bundlePrefix: PREFIX,
@@ -227,7 +270,7 @@ describe("installDaemon — hot swap", () => {
         sleep: noSleep,
         log,
       }),
-    ).rejects.toThrow(/no live heartbeat/);
+    ).rejects.toThrow(/no live heartbeat[\s\S]*error: db locked/);
   });
 });
 
