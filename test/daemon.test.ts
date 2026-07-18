@@ -1,9 +1,11 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   rmSync,
   utimesSync,
   writeFileSync,
@@ -505,6 +507,221 @@ describe("daemon mutual exclusion", () => {
     expect(r.ok).toBe(true);
     expect(readFileSync(lock, "utf-8").trim()).toBe("4242");
     expect(existsSync(lock)).toBe(true);
+  });
+});
+
+describe("daemon tickOnce — one-time loss recovery (A1)", () => {
+  function oneTimeJob(runAtIso: string, extra = ""): string {
+    return `---\nrun_at: "${runAtIso}"\n${extra}---\n\nSay hi once.\n`;
+  }
+
+  function writeOneTime(name: string, content: string): string {
+    mkdirSync(join(harness.cronDir, "one-time"), { recursive: true });
+    return writeJob(join("one-time", name), content);
+  }
+
+  // A fresh ctx over the same db + files = a daemon restart after a crash.
+  function restartedCtx(): DaemonCtx {
+    return { ...harness.ctx, parked: undefined, dispatchedOnce: undefined };
+  }
+
+  test("spawn failure restores next_run_at so the next tick retries", () => {
+    writeOneTime("boom.md", oneTimeJob(at(1).toISOString()));
+    tickOnce(harness.ctx, T0);
+    expect(jobRow(harness.db, "one-time/boom-md").next_run_at).toBe(
+      at(1).toISOString(),
+    );
+
+    let failNext = true;
+    const realSpawn = harness.ctx.spawn;
+    harness.ctx.spawn = (req) => {
+      if (failNext) {
+        failNext = false;
+        throw new Error("spawn exploded");
+      }
+      realSpawn(req);
+    };
+
+    tickOnce(harness.ctx, at(1)); // spawn throws → next_run_at restored
+    expect(harness.spawns).toHaveLength(0);
+    expect(jobRow(harness.db, "one-time/boom-md").next_run_at).toBe(
+      at(1).toISOString(),
+    );
+
+    tickOnce(harness.ctx, at(1, 1)); // retried and succeeds — exactly once
+    expect(harness.spawns).toHaveLength(1);
+    expect(harness.spawns[0]!.slug).toBe("one-time/boom-md");
+    expect(jobRow(harness.db, "one-time/boom-md").next_run_at).toBeNull();
+    tickOnce(harness.ctx, at(2));
+    expect(harness.spawns).toHaveLength(1);
+  });
+
+  test("crash between advance and spawn: restart rescues the NULLed one-shot", () => {
+    writeOneTime("crash.md", oneTimeJob(at(1).toISOString()));
+    tickOnce(harness.ctx, T0);
+    // Simulate the crash window: next_run_at NULLed but nothing spawned.
+    harness.db
+      .prepare(
+        "UPDATE cron_jobs SET next_run_at = NULL WHERE slug = 'one-time/crash-md'",
+      )
+      .run();
+
+    // Restarted daemon (empty dispatchedOnce): the once-repair restores
+    // next_run_at from the file's run_at, and the same tick dispatches it.
+    const ctx2 = restartedCtx();
+    tickOnce(ctx2, at(2));
+    expect(harness.spawns).toHaveLength(1);
+    expect(harness.spawns[0]!.slug).toBe("one-time/crash-md");
+    expect(jobRow(harness.db, "one-time/crash-md").next_run_at).toBeNull();
+
+    // Post-dispatch NULL is now the "runner owns it" state — no churn.
+    tickOnce(ctx2, at(2, 1));
+    tickOnce(ctx2, at(3));
+    expect(harness.spawns).toHaveLength(1);
+  });
+
+  test("crash-window loss past run_at+grace: sentinel written, parked, never runs", () => {
+    const logs: string[] = [];
+    harness.ctx.log = (m) => logs.push(m);
+    writeOneTime("gone.md", oneTimeJob(at(1).toISOString()));
+    tickOnce(harness.ctx, T0);
+    harness.db
+      .prepare(
+        "UPDATE cron_jobs SET next_run_at = NULL WHERE slug = 'one-time/gone-md'",
+      )
+      .run();
+
+    // Restart 30 min later — default grace is 5 min, so the slot is lost.
+    const ctx2 = restartedCtx();
+    ctx2.log = (m) => logs.push(m);
+    tickOnce(ctx2, at(30));
+    expect(harness.spawns).toHaveLength(0);
+    expect(jobRow(harness.db, "one-time/gone-md").next_run_at).toBeNull();
+    const errDir = join(harness.cronDir, ".errors");
+    expect(existsSync(errDir)).toBe(true);
+    const sentinels = readdirSync(errDir);
+    expect(sentinels.length).toBe(1);
+    expect(sentinels[0]).toContain("one-time_gone-md");
+
+    // Parked: subsequent ticks stay silent — one warn, no re-parse spam.
+    const warnsBefore = logs.filter((l) => l.includes("grace")).length;
+    tickOnce(ctx2, at(30, 1));
+    tickOnce(ctx2, at(31));
+    expect(logs.filter((l) => l.includes("grace")).length).toBe(warnsBefore);
+    expect(harness.spawns).toHaveLength(0);
+  });
+});
+
+describe("daemon tickOnce — unreadable cron dir (A2)", () => {
+  test("readdir failure skips the whole sync — no mass tombstone, no re-fire stampede", () => {
+    if (process.getuid?.() === 0) return; // chmod 000 is no barrier to root
+    writeJob("a.md", mdJob("5m"));
+    writeJob("b.md", mdJob("1h"));
+    tickOnce(harness.ctx, T0);
+    expect(harness.spawns).toHaveLength(2);
+
+    chmodSync(harness.cronDir, 0o000);
+    try {
+      tickOnce(harness.ctx, at(0, 1));
+    } finally {
+      chmodSync(harness.cronDir, 0o755);
+    }
+    // Nothing deleted, schedules intact.
+    expect(jobRow(harness.db, "a-md").state).toBe("active");
+    expect(jobRow(harness.db, "b-md").state).toBe("active");
+    expect(jobRow(harness.db, "a-md").next_run_at).toBe(at(5).toISOString());
+
+    // Readable again: no re-upsert-as-new stampede — nothing is due.
+    tickOnce(harness.ctx, at(0, 2));
+    expect(harness.spawns).toHaveLength(2);
+  });
+
+  test("genuinely missing cron dir (ENOENT) still tombstones normally", () => {
+    writeJob("a.md", mdJob("5m"));
+    tickOnce(harness.ctx, T0);
+    rmSync(harness.cronDir, { recursive: true, force: true });
+    tickOnce(harness.ctx, at(0, 1));
+    expect(jobRow(harness.db, "a-md").state).toBe("deleted");
+  });
+});
+
+describe("daemon tickOnce — run request with missing file (A5)", () => {
+  test("claimed request whose job file is gone gets expired, not stuck in-flight", () => {
+    writeJob("hello.md", mdJob("1h"));
+    tickOnce(harness.ctx, T0);
+    expect(harness.spawns).toHaveLength(1);
+
+    const jobId = getJobIdBySlug(harness.db, "hello-md")!;
+    const reqId = insertRunRequest(harness.db, jobId);
+    // Ledger row loses its file_path (e.g. legacy row) — unspawnable.
+    harness.db
+      .prepare("UPDATE cron_jobs SET file_path = NULL WHERE id = $id")
+      .run({ $id: jobId });
+
+    tickOnce(harness.ctx, at(0, 1));
+    expect(harness.spawns).toHaveLength(1); // never spawned
+    const req = getRunRequest(harness.db, reqId)!;
+    expect(req.picked_up_at).not.toBeNull();
+    expect(req.expired_at).not.toBeNull(); // terminal, visibly dead
+  });
+});
+
+describe("daemon mutual exclusion — stale-lock hardening (A3/A4)", () => {
+  test("pid-reuse: alive holder with no matching heartbeat and an old lock is taken over", () => {
+    const lock = daemonLockPath(harness.root);
+    mkdirSync(join(harness.root, ".cronfish"), { recursive: true });
+    // process.pid is alive but has never beaten this db's heartbeat — a
+    // recycled pid, not a daemon. Age the lock past the stale window.
+    writeFileSync(lock, String(process.pid), "utf-8");
+    const old = new Date(Date.now() - 10 * 60_000);
+    utimesSync(lock, old, old);
+
+    const r = acquireDaemonExclusivity(harness.db, harness.root, 4242);
+    expect(r.ok).toBe(true);
+    expect(readFileSync(lock, "utf-8").trim()).toBe("4242");
+    // Atomic takeover leaves no temp droppings.
+    const leftovers = readdirSync(join(harness.root, ".cronfish")).filter(
+      (f) => f.endsWith(".tmp"),
+    );
+    expect(leftovers).toHaveLength(0);
+  });
+
+  test("alive holder that IS ticking (heartbeat pid matches, recent) refuses even with an old lock", () => {
+    const lock = daemonLockPath(harness.root);
+    mkdirSync(join(harness.root, ".cronfish"), { recursive: true });
+    writeFileSync(lock, String(process.pid), "utf-8");
+    const old = new Date(Date.now() - 10 * 60_000);
+    utimesSync(lock, old, old);
+    // Tick 60s old: stale for the phase-1 fresh check (10s) but well inside
+    // the 120s "still a ticking daemon" window for the lock cross-check.
+    beatDaemonHeartbeat(harness.db, {
+      pid: process.pid,
+      startedAt: new Date().toISOString(),
+    });
+    harness.db
+      .prepare("UPDATE cron_daemon_heartbeat SET last_tick_at = $t")
+      .run({ $t: new Date(Date.now() - 60_000).toISOString() });
+
+    const r = acquireDaemonExclusivity(harness.db, harness.root, 4242);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toContain(`pid ${process.pid}`);
+  });
+
+  test("a young lock from an alive pid refuses — a just-started daemon has not beaten yet", () => {
+    const lock = daemonLockPath(harness.root);
+    mkdirSync(join(harness.root, ".cronfish"), { recursive: true });
+    writeFileSync(lock, String(process.pid), "utf-8"); // fresh mtime
+    const r = acquireDaemonExclusivity(harness.db, harness.root, 4242);
+    expect(r.ok).toBe(false);
+  });
+
+  test("EPERM-guarded pid (pid 1) counts as ALIVE, not dead", () => {
+    const lock = daemonLockPath(harness.root);
+    mkdirSync(join(harness.root, ".cronfish"), { recursive: true });
+    writeFileSync(lock, "1", "utf-8"); // launchd/init — kill(1,0) → EPERM
+    const r = acquireDaemonExclusivity(harness.db, harness.root, 4242);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toContain("pid 1");
   });
 });
 

@@ -16,8 +16,10 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  renameSync,
   rmSync,
   statSync,
+  writeFileSync,
   writeSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
@@ -26,6 +28,7 @@ import {
   beatDaemonHeartbeat,
   claimPendingRunRequests,
   clearRunRequestClaim,
+  expireRunRequest,
   getDaemonHeartbeat,
   listDueJobs,
   listJobSyncState,
@@ -38,6 +41,7 @@ import {
 } from "./db.ts";
 import { loadJob, slugFromPath, walkJobFiles } from "./jobs.ts";
 import { computeNextRun } from "./next-run.ts";
+import { DEFAULT_GRACE_SECONDS, writeSentinel } from "./oneTime.ts";
 import { runWatchdog, type WatchdogDecision } from "./watchdog.ts";
 import pkg from "../package.json" with { type: "json" };
 
@@ -75,10 +79,20 @@ export interface DaemonCtx {
   // cleared when the job file changes. Lazily created; per-process only
   // (a restart re-warns once, which is fine).
   parked?: Map<number, string>;
+  // One-shot job ids THIS process successfully spawned. While a slug is in
+  // here its next_run_at=NULL is the normal "runner owns it now" state, not
+  // a lost dispatch — syncFiles' once-repair must leave it alone. In-memory
+  // on purpose: after a daemon crash the set is empty, which is exactly the
+  // window where a NULLed-but-never-spawned one-shot needs rescuing.
+  dispatchedOnce?: Set<number>;
 }
 
 function parkedMap(ctx: DaemonCtx): Map<number, string> {
   return (ctx.parked ??= new Map());
+}
+
+function dispatchedOnceSet(ctx: DaemonCtx): Set<number> {
+  return (ctx.dispatchedOnce ??= new Set());
 }
 
 function warn(ctx: DaemonCtx, msg: string): void {
@@ -96,10 +110,27 @@ function warn(ctx: DaemonCtx, msg: string): void {
 // next_run_at = run_at, NULL once executed_at is stamped. Files gone from
 // disk → state='deleted' (row kept forever, never runs).
 function syncFiles(ctx: DaemonCtx, now: Date): void {
-  const files = walkJobFiles(ctx.cronDir);
+  // strict scan: an UNREADABLE cron dir (EACCES/EIO/EMFILE — anything but
+  // ENOENT) must not masquerade as "zero job files". If it did, markDeleted
+  // below would tombstone EVERY job, and the next successful scan would
+  // re-upsert them all as never-run → every interval job fires at once. On
+  // scan failure we skip the whole sync (including markDeleted) this tick
+  // and retry next tick. A genuinely missing or empty dir still returns []
+  // and deletes normally — legit mass removal converges as before.
+  let files: string[];
+  try {
+    files = walkJobFiles(ctx.cronDir, { strict: true });
+  } catch (e) {
+    warn(
+      ctx,
+      `job scan failed — skipping file sync this tick (nothing marked deleted): ${(e as Error).message}`,
+    );
+    return;
+  }
   const stored = new Map<string, JobSyncStateRow>();
   for (const row of listJobSyncState(ctx.db)) stored.set(row.slug, row);
   const parked = parkedMap(ctx);
+  const dispatchedOnce = dispatchedOnceSet(ctx);
 
   const presentSlugs: string[] = [];
   for (const path of files) {
@@ -129,13 +160,26 @@ function syncFiles(ctx: DaemonCtx, now: Date): void {
       prev.schedule_kind !== "manual" &&
       prev.schedule_kind !== "once" &&
       !parked.has(prev.id);
-    if (!changed && !unscheduled) continue;
+    // A once row at NULL whose file is still on disk and that THIS process
+    // did not successfully spawn is a lost dispatch (crash between the
+    // pre-spawn advance and the spawn, or a restore that never landed) —
+    // the once-repair below rescues it. Executed jobs never trip this: the
+    // runner's executed_at stamp changes the file → `changed` path.
+    const onceUnscheduled =
+      !!prev &&
+      prev.state === "active" &&
+      prev.schedule_kind === "once" &&
+      prev.next_run_at === null &&
+      !parked.has(prev.id) &&
+      !dispatchedOnce.has(prev.id);
+    if (!changed && !unscheduled && !onceUnscheduled) continue;
     try {
       if (changed) {
         const meta = loadJob(path, slug, ctx.cronDir);
         upsertJob(ctx.db, meta, mtimeIso, sizeBytes);
         const jobId = requireJobId(ctx.db, slug);
         parked.delete(jobId); // an edit is the un-park signal
+        dispatchedOnce.delete(jobId); // an edit resets the one-shot ledger
         let next: Date | null;
         if (meta.oneTime) {
           // One-shot: next_run = run_at exactly once. Already-executed (or
@@ -156,6 +200,8 @@ function syncFiles(ctx: DaemonCtx, now: Date): void {
             : null;
         }
         setJobNextRun(ctx.db, jobId, next ? next.toISOString() : null);
+      } else if (prev!.schedule_kind === "once") {
+        repairLostOnce(ctx, prev!, path, slug, now);
       } else {
         // unscheduled: recompute from the stored schedule, no re-parse.
         try {
@@ -185,6 +231,58 @@ function syncFiles(ctx: DaemonCtx, now: Date): void {
   markDeleted(ctx.db, presentSlugs);
 }
 
+// The once-repair (see onceUnscheduled above). Re-parses the still-present
+// file: executed_at absent + run_at within grace → restore next_run_at from
+// run_at so the next tick re-dispatches (the runner's flock + executed_at
+// guard + runtime grace check make a duplicate spawn harmless). run_at +
+// grace already passed → the occurrence is unrecoverable: write a
+// cron/.errors/ sentinel so the loss is visible and park the row (any file
+// edit un-parks). All outcomes park or reschedule, so this re-parses a given
+// row at most once, not at 1 Hz.
+function repairLostOnce(
+  ctx: DaemonCtx,
+  prev: JobSyncStateRow,
+  path: string,
+  slug: string,
+  now: Date,
+): void {
+  const parked = parkedMap(ctx);
+  try {
+    const meta = loadJob(path, slug, ctx.cronDir);
+    if (meta.executedAt || !meta.enabled || meta.runAtMs === undefined) {
+      // Executed/disabled with an unchanged file — nothing to restore; park
+      // so we stop re-parsing every tick.
+      parked.set(prev.id, "one-time job has nothing to restore");
+      return;
+    }
+    const graceMs = (meta.graceSeconds ?? DEFAULT_GRACE_SECONDS) * 1_000;
+    const runAtIso = new Date(meta.runAtMs).toISOString();
+    if (now.getTime() > meta.runAtMs + graceMs) {
+      const reason = `one-time dispatch lost (daemon crash or spawn failure) and run_at ${runAtIso} + grace already passed — job will NOT run`;
+      try {
+        writeSentinel(ctx.cronDir, slug, reason, "sync");
+      } catch {}
+      parked.set(prev.id, reason);
+      warn(
+        ctx,
+        `sync ${slug}: ${reason} — sentinel written, parked until the file is edited`,
+      );
+      return;
+    }
+    setJobNextRun(ctx.db, prev.id, runAtIso);
+    warn(
+      ctx,
+      `sync ${slug}: lost one-time dispatch — next_run_at restored to ${runAtIso} for retry`,
+    );
+  } catch (e) {
+    parked.set(prev.id, (e as Error).message);
+    warn(
+      ctx,
+      `sync ${slug}: once-repair failed: ${(e as Error).message} — parked until the file is edited`,
+    );
+  }
+}
+
 function requireJobId(db: Database, slug: string): number {
   const row = db
     .query("SELECT id FROM cron_jobs WHERE slug = $slug")
@@ -204,8 +302,14 @@ function dispatchDue(ctx: DaemonCtx, now: Date): void {
     // next_run is advanced BEFORE spawning — the deliberate at-most-once
     // trade-off: a crash between the advance and the spawn DROPS this slot
     // (the run simply doesn't happen and next_run points at the future).
-    // That's preferred over advance-after-spawn, which can double-fire; the
-    // in-daemon missed-run check catches a dropped slot and alerts.
+    // That's preferred over advance-after-spawn, which can double-fire. For
+    // interval jobs the in-daemon missed-run check catches a persistently
+    // dropped schedule and alerts; it can NOT see one-shot jobs (they sync
+    // with schedule text "manual", which the watchdog skips), so those get
+    // two dedicated nets instead: a spawn failure restores next_run_at right
+    // here in the catch below, and a crash in the advance→spawn window is
+    // rescued by syncFiles' once-repair (repairLostOnce), which re-schedules
+    // any NULLed-but-never-spawned one-shot from its file's run_at.
     let nextIso: string | null = null;
     let scheduleErr: string | null = null;
     if (job.schedule_kind === "once") {
@@ -263,8 +367,32 @@ function dispatchDue(ctx: DaemonCtx, now: Date): void {
         trigger,
         scheduledFor: job.next_run_at,
       });
+      if (job.schedule_kind === "once") {
+        // The runner owns this one-shot now — tell the once-repair to leave
+        // its next_run_at=NULL alone (flock + executed_at guard re-fires).
+        dispatchedOnceSet(ctx).add(job.id);
+      }
     } catch (e) {
       warn(ctx, `dispatch ${job.slug}: ${(e as Error).message}`);
+      if (job.schedule_kind === "once") {
+        // A lost spawn must not silently consume the job's ONLY occurrence:
+        // put next_run_at back so the next tick retries (mirrors the
+        // DB-error path's "row stays due" semantics). The runner's own
+        // flock, executed_at guard, and runtime grace check make a
+        // duplicate or late retry harmless.
+        try {
+          setJobNextRun(ctx.db, job.id, job.next_run_at);
+          warn(
+            ctx,
+            `dispatch ${job.slug}: one-time next_run_at restored for retry`,
+          );
+        } catch (e2) {
+          warn(
+            ctx,
+            `dispatch ${job.slug}: one-time restore failed (once-repair will rescue it): ${(e2 as Error).message}`,
+          );
+        }
+      }
     }
   }
 }
@@ -280,7 +408,17 @@ function drainRunRequests(ctx: DaemonCtx, now: Date): void {
   for (const req of claimPendingRunRequests(ctx.db, now.toISOString())) {
     try {
       if (!req.file_path) {
-        warn(ctx, `run request #${req.id} (${req.slug}): job file gone — skipped`);
+        // Terminal: without the expired_at stamp this claimed request would
+        // look in-flight forever (picked_up_at set, no invocation ever).
+        warn(ctx, `run request #${req.id} (${req.slug}): job file gone — expired`);
+        try {
+          expireRunRequest(ctx.db, req.id);
+        } catch (e2) {
+          warn(
+            ctx,
+            `run request #${req.id}: expire failed: ${(e2 as Error).message}`,
+          );
+        }
         continue;
       }
       ctx.spawn({
@@ -421,8 +559,27 @@ function isPidAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
     return true;
+  } catch (e) {
+    // EPERM means the pid EXISTS but belongs to another user — that IS a
+    // live process (benign on a single-user machine, but correct is correct).
+    return (e as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+// A lock holder that hasn't produced a heartbeat tick this long is not a
+// ticking daemon (1 Hz ticks; even a freshly started daemon beats within
+// ~1s — 120s is generous slack for slow ticks). Used both to spot a wedged
+// daemon and to detect pid reuse: a hard-crashed daemon's lock pid can be
+// recycled by an unrelated live process, and without this cross-check every
+// KeepAlive respawn would refuse forever.
+export const LOCK_HOLDER_STALE_MS = 120_000;
+
+// NaN = readable but garbage content; null = unreadable (vanished mid-race).
+function lockHolderPid(lockFile: string): number | null {
+  try {
+    return parseInt(readFileSync(lockFile, "utf-8").trim(), 10);
   } catch {
-    return false;
+    return null;
   }
 }
 
@@ -455,34 +612,83 @@ export function acquireDaemonExclusivity(
     // heartbeat table unreadable → fall through to the lock file
   }
 
-  // 2. Exclusive lock file (atomic O_EXCL, stale-lock takeover if pid dead).
+  // 2. Exclusive lock file (atomic O_EXCL, stale-lock takeover via atomic
+  // rename + read-back verify). Two racing starters can both conclude a
+  // lock is stale; naive rm + O_EXCL lets B's rm delete A's FRESH lock
+  // (TOCTOU → two daemons). Instead: every acquisition path re-reads the
+  // lock after writing it and only the process the file names wins; a
+  // takeover writes a temp file and renames it over the lock, so the last
+  // rename decides and everyone else sees a pid that isn't theirs and
+  // refuses.
   const lockFile = daemonLockPath(consumerRoot);
   mkdirSync(dirname(lockFile), { recursive: true });
   for (let attempt = 0; attempt < 3; attempt++) {
+    let created = false;
     try {
       const fd = openSync(lockFile, "wx");
       writeSync(fd, String(pid));
       closeSync(fd);
-      return { ok: true };
+      created = true;
     } catch {
-      let holder = Number.NaN;
+      // lock exists (or the create raced) — examine the holder below.
+    }
+    if (created) {
+      // Read-back verify: a concurrent stale-takeover rename can clobber a
+      // lock created moments ago. Whoever the file names after the dust
+      // settles is the daemon; a mismatch means we lost the race.
+      if (lockHolderPid(lockFile) === pid) return { ok: true };
+      return {
+        ok: false,
+        reason: `lost daemon lock race for ${lockFile}`,
+      };
+    }
+
+    const holder = lockHolderPid(lockFile);
+    if (holder === null) continue; // vanished between open and read — retry
+    if (!Number.isNaN(holder) && holder !== pid && isPidAlive(holder)) {
+      // An alive pid is NOT proof of a live daemon: after a hard crash the
+      // lock survives, and the OS can recycle the pid for an unrelated
+      // process — refusing on pid-aliveness alone wedges every KeepAlive
+      // respawn forever. Cross-check the heartbeat: only a holder that is
+      // actually ticking blocks startup. A young lock also blocks — a
+      // just-started daemon holds the lock briefly before its first beat.
+      let hb: ReturnType<typeof getDaemonHeartbeat> = null;
       try {
-        holder = parseInt(readFileSync(lockFile, "utf-8").trim(), 10);
+        hb = getDaemonHeartbeat(db);
+      } catch {}
+      const holderTicking =
+        !!hb &&
+        hb.pid === holder &&
+        now.getTime() - Date.parse(hb.last_tick_at) <= LOCK_HOLDER_STALE_MS;
+      let lockAgeMs: number;
+      try {
+        lockAgeMs = now.getTime() - statSync(lockFile).mtimeMs;
       } catch {
-        // lock vanished between open and read — retry the create
-        continue;
+        continue; // lock vanished — retry the create
       }
-      if (!Number.isNaN(holder) && holder !== pid && isPidAlive(holder)) {
+      if (holderTicking || lockAgeMs <= LOCK_HOLDER_STALE_MS) {
         return {
           ok: false,
           reason: `daemon lock ${lockFile} held by live pid ${holder}`,
         };
       }
-      // Stale (dead pid / garbage) — take it over.
-      try {
-        rmSync(lockFile);
-      } catch {}
+      // Alive pid, no matching heartbeat, old lock → pid reuse or a wedged
+      // corpse. Fall through to the takeover.
     }
+    // Stale (dead pid / garbage / pid-reuse impostor) — take it over
+    // atomically: temp file + rename, then the shared read-back verify.
+    const tmp = `${lockFile}.${pid}.tmp`;
+    try {
+      writeFileSync(tmp, String(pid), "utf-8");
+      renameSync(tmp, lockFile);
+    } catch {
+      try {
+        rmSync(tmp);
+      } catch {}
+      continue;
+    }
+    if (lockHolderPid(lockFile) === pid) return { ok: true };
+    return { ok: false, reason: `lost daemon lock race for ${lockFile}` };
   }
   return { ok: false, reason: `could not acquire daemon lock ${lockFile}` };
 }

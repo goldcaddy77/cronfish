@@ -474,13 +474,29 @@ export function loadJob(
 // folder of crons without the README getting parsed as a job.
 // Exported for the daemon's mtime scan, which stats files first and only
 // parses the changed ones (discoverJobs parses everything).
-export function walkJobFiles(cronDir: string): string[] {
+//
+// `strict` distinguishes "unreadable" from "readable and empty": a readdir
+// failure other than ENOENT (EACCES, EIO, EMFILE, …) THROWS instead of
+// silently returning fewer files. The daemon's sync must not mistake an
+// unreadable dir for a mass job removal — that would tombstone every job
+// and re-fire them all as never-run on the next successful scan. ENOENT
+// (dir genuinely gone) still reads as empty in both modes, so deliberate
+// removal converges normally.
+export function walkJobFiles(
+  cronDir: string,
+  opts?: { strict?: boolean },
+): string[] {
   const out: string[] = [];
   const visit = (dir: string): void => {
     let entries: string[];
     try {
       entries = readdirSync(dir);
-    } catch {
+    } catch (e) {
+      if (opts?.strict && (e as NodeJS.ErrnoException).code !== "ENOENT") {
+        throw new Error(
+          `unreadable job dir ${dir}: ${(e as Error).message}`,
+        );
+      }
       return;
     }
     for (const name of entries) {

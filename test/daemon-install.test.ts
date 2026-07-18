@@ -11,10 +11,12 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  TAIL_READ_BYTES,
   daemonLabel,
   installDaemon,
   listPerJobLabels,
   renderDaemonPlist,
+  tailLines,
   uninstallDaemon,
   type DaemonServiceIo,
   type HeartbeatPeek,
@@ -270,7 +272,34 @@ describe("installDaemon — hot swap", () => {
         sleep: noSleep,
         log,
       }),
-    ).rejects.toThrow(/no live heartbeat[\s\S]*error: db locked/);
+    ).rejects.toThrow(
+      /no live heartbeat[\s\S]*error: db locked[\s\S]*per-job plists were already retired[\s\S]*cronfish sync/,
+    );
+  });
+});
+
+describe("tailLines", () => {
+  test("reads only the final TAIL_READ_BYTES of a large log", () => {
+    const logDir = join(root, ".cronfish", "logs", "daemon");
+    mkdirSync(logDir, { recursive: true });
+    const logPath = join(logDir, "daemon.log");
+    // ~1MB of filler followed by the lines that matter.
+    const filler = `${"x".repeat(99)}\n`.repeat(10_000);
+    writeFileSync(logPath, `${filler}penultimate line\nfinal line\n`, "utf-8");
+    const tail = tailLines(logPath, 2);
+    expect(tail).toBe("penultimate line\nfinal line");
+    // A tail longer than the byte window is bounded by TAIL_READ_BYTES.
+    const big = tailLines(logPath, 1_000_000);
+    expect(Buffer.byteLength(big, "utf-8")).toBeLessThanOrEqual(
+      TAIL_READ_BYTES,
+    );
+  });
+
+  test("missing or empty file → empty string", () => {
+    expect(tailLines(join(root, "nope.log"), 5)).toBe("");
+    const p = join(root, "empty.log");
+    writeFileSync(p, "", "utf-8");
+    expect(tailLines(p, 5)).toBe("");
   });
 });
 

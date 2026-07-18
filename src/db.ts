@@ -713,6 +713,16 @@ export function claimPendingRunRequests(
   })();
 }
 
+// Terminally expire a request that can never spawn (e.g. the job's file is
+// gone) — without the stamp a claimed-but-unspawnable request looks
+// in-flight forever to `cron run` status readers.
+export function expireRunRequest(db: Database, requestId: number): void {
+  db.prepare(
+    `UPDATE cron_run_requests SET expired_at = $now
+     WHERE id = $id AND expired_at IS NULL`,
+  ).run({ $id: requestId, $now: nowIso() });
+}
+
 // Undo a claim whose spawn failed, so the next tick retries it. Guarded on
 // invocation_id IS NULL — once the runner linked an invocation, the claim is
 // final.
@@ -738,6 +748,7 @@ export function linkRunRequestInvocation(
 export interface RunRequestStatusRow {
   picked_up_at: string | null;
   invocation_id: number | null;
+  expired_at: string | null;
 }
 
 // `cron run` polls this after queueing a request for a live daemon.
@@ -747,7 +758,7 @@ export function getRunRequest(
 ): RunRequestStatusRow | null {
   const row = db
     .query(
-      "SELECT picked_up_at, invocation_id FROM cron_run_requests WHERE id = $id",
+      "SELECT picked_up_at, invocation_id, expired_at FROM cron_run_requests WHERE id = $id",
     )
     .get({ $id: requestId }) as RunRequestStatusRow | undefined;
   return row ?? null;

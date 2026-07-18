@@ -10,9 +10,13 @@
 // tests drive the full sequence against stubs and a temp LaunchAgents dir.
 
 import {
+  closeSync,
   existsSync,
+  fstatSync,
   mkdirSync,
+  openSync,
   readFileSync,
+  readSync,
   readdirSync,
   rmSync,
   writeFileSync,
@@ -109,6 +113,14 @@ export interface DaemonPlistConfig {
   bunPath?: string;
 }
 
+// NOTE(log rotation): deliberately none. launchd opens StandardOut/ErrPath
+// itself at spawn and the process holds that fd for its lifetime — an
+// in-daemon rename would leave every writer appending to the old inode, so
+// the "rotated" file keeps growing invisibly and daemon.log stops updating
+// until the next respawn; copy-truncate depends on O_APPEND semantics we
+// don't control. Rather than hack around it, all reads of this log are
+// bounded instead (tailLines reads only the last TAIL_READ_BYTES) and
+// rotation is left to the operator/newsyslog if size ever matters.
 export function daemonLogPath(consumerRoot: string): string {
   return join(consumerRoot, ".cronfish", "logs", "daemon", "daemon.log");
 }
@@ -316,21 +328,35 @@ export async function installDaemon(
   if (!live) {
     const tail = tailLines(logPath, 5);
     throw new Error(
-      `daemon install: no live heartbeat within ${Math.round(waitMs / 1000)}s — check ${logPath}${tail ? `\nlast daemon log lines:\n${tail}` : ""}`,
+      `daemon install: no live heartbeat within ${Math.round(waitMs / 1000)}s — check ${logPath}${tail ? `\nlast daemon log lines:\n${tail}` : ""}\nper-job plists were already retired — run \`cronfish sync\` to restore v1 scheduling, or retry \`cronfish daemon install\``,
     );
   }
 
   return { label, plistPath, logPath, removedPerJob: perJob, changed };
 }
 
+// The daemon log is unrotated (see daemonLogPath) and can grow large — tail
+// reads must never slurp the whole file.
+export const TAIL_READ_BYTES = 8 * 1024;
+
 // Last `n` lines of a file, "" when missing/unreadable — used to inline the
-// daemon log into the heartbeat-timeout error for faster diagnosis.
-function tailLines(path: string, n: number): string {
+// daemon log into the heartbeat-timeout error for faster diagnosis. Reads
+// only the final TAIL_READ_BYTES, never the whole file.
+export function tailLines(path: string, n: number): string {
   try {
-    if (!existsSync(path)) return "";
-    const text = readFileSync(path, "utf-8").trimEnd();
-    if (!text) return "";
-    return text.split("\n").slice(-n).join("\n");
+    const fd = openSync(path, "r");
+    try {
+      const size = fstatSync(fd).size;
+      const readLen = Math.min(size, TAIL_READ_BYTES);
+      if (readLen === 0) return "";
+      const buf = Buffer.alloc(readLen);
+      const got = readSync(fd, buf, 0, readLen, size - readLen);
+      const text = buf.subarray(0, got).toString("utf-8").trimEnd();
+      if (!text) return "";
+      return text.split("\n").slice(-n).join("\n");
+    } finally {
+      closeSync(fd);
+    }
   } catch {
     return "";
   }
