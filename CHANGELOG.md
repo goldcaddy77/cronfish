@@ -1,3 +1,10 @@
+# [0.18.0](https://github.com/goldcaddy77/cronfish/compare/v0.17.0...v0.18.0) (2026-07-18)
+
+
+### Features
+
+* **daemon:** jitter the post-restore thundering herd ([8aaa0d0](https://github.com/goldcaddy77/cronfish/commit/8aaa0d04c7a7bc586b83029d19bb5e9978fa9329))
+
 # [0.17.0](https://github.com/goldcaddy77/cronfish/compare/v0.16.2...v0.17.0) (2026-07-18)
 
 
