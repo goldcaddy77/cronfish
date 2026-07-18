@@ -37,7 +37,7 @@ export interface WatchdogDecision {
   slug: string;
   outcome: "skipped-cold" | "skipped-manual" | "skipped-on-time" |
            "skipped-already-fired" | "skipped-no-adapter" |
-           "fired" | "fire-failed";
+           "skipped-down-window" | "fired" | "fire-failed";
   expected_at?: string;
   grace_s?: number;
   error?: string;
@@ -46,6 +46,14 @@ export interface WatchdogDecision {
 export interface WatchdogInput {
   consumerRoot: string;
   now?: Date;
+  // Reuse an already-open ledger (the in-daemon caller passes its own db);
+  // left open on return. Omitted → open + close the consumer db as before.
+  db?: Database;
+  // Daemon mode: a miss whose expected fire time predates the daemon's own
+  // start is a downtime gap first — the catch-up dispatch gets one grace
+  // window (measured from liveSince) to make the run happen. Past that the
+  // miss alerts like any other: a restart delays detection, never mutes it.
+  liveSince?: Date;
 }
 
 export async function runWatchdog(
@@ -56,7 +64,8 @@ export async function runWatchdog(
   const { jobs } = discoverJobs(cronDir);
   const jobBySlug = new Map(jobs.map((j) => [j.slug, j]));
 
-  const db = openDb(input.consumerRoot);
+  const ownDb = input.db === undefined;
+  const db = input.db ?? openDb(input.consumerRoot);
   const cfg = loadConsumerAlertsConfig(input.consumerRoot);
   const registry = buildRegistry(cfg.alerts);
   const decisions: WatchdogDecision[] = [];
@@ -84,11 +93,18 @@ export async function runWatchdog(
       const intervalS = intervalSecondsAt(job.schedule, expected) ?? 60;
       const overrideS = parseMissedAfter(job.missed_after);
       const graceS = overrideS ?? Math.max(2 * intervalS, DEFAULT_GRACE_FLOOR_S);
-      const deadline = new Date(expected.getTime() + graceS * 1000);
+      // A miss whose expected time predates liveSince started as a downtime
+      // gap — but it must NOT be muted forever (a daemon restart would
+      // otherwise re-mute a real fault every time). liveSince becomes the
+      // effective expected time: catch-up dispatch gets one grace window
+      // after startup to make the run happen; past that, it's a real miss.
+      const inDownWindow = !!input.liveSince && expected < input.liveSince;
+      const effectiveExpected = inDownWindow ? input.liveSince! : expected;
+      const deadline = new Date(effectiveExpected.getTime() + graceS * 1000);
       if (now < deadline) {
         decisions.push({
           slug: row.slug,
-          outcome: "skipped-on-time",
+          outcome: inDownWindow ? "skipped-down-window" : "skipped-on-time",
           expected_at: expected.toISOString(),
           grace_s: graceS,
         });
@@ -143,9 +159,11 @@ export async function runWatchdog(
       }
     }
   } finally {
-    try {
-      db.close();
-    } catch {}
+    if (ownDb) {
+      try {
+        db.close();
+      } catch {}
+    }
   }
   return decisions;
 }
@@ -167,6 +185,7 @@ export interface DecisionInput {
   lastMissedFiredAt: string | null;
   missedAfter?: string;
   adapterConfigured: boolean;
+  liveSince?: Date; // see WatchdogInput.liveSince
 }
 
 export function decideWatchdog(input: DecisionInput): {
@@ -184,9 +203,18 @@ export function decideWatchdog(input: DecisionInput): {
   const intervalS = intervalSecondsAt(input.schedule, expected) ?? 60;
   const overrideS = parseMissedAfter(input.missedAfter);
   const graceS = overrideS ?? Math.max(2 * intervalS, DEFAULT_GRACE_FLOOR_S);
-  const deadline = new Date(expected.getTime() + graceS * 1000);
+  // See runWatchdog: liveSince is the effective expected time for misses
+  // that predate the daemon's start — one grace window after startup, then
+  // a pre-restart fault alerts instead of being muted by every restart.
+  const inDownWindow = !!input.liveSince && expected < input.liveSince;
+  const effectiveExpected = inDownWindow ? input.liveSince! : expected;
+  const deadline = new Date(effectiveExpected.getTime() + graceS * 1000);
   if (input.now < deadline) {
-    return { outcome: "skipped-on-time", expected, grace_s: graceS };
+    return {
+      outcome: inDownWindow ? "skipped-down-window" : "skipped-on-time",
+      expected,
+      grace_s: graceS,
+    };
   }
   if (
     input.lastMissedFiredAt &&

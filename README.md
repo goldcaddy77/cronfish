@@ -289,7 +289,12 @@ cronfish disable <slug>             flip disabled, then sync
 cronfish delete <slug> --yes        bootout + remove plist + job file
 cronfish status [slug]              launchctl print + tail of latest log
 cronfish errors [--clear] [slug]    list error sentinels (cron/.errors/); --clear removes them
-cronfish run <slug>                 invoke runner directly (no launchd) — for testing
+cronfish run <slug>                 run now — queues through a live daemon, else spawns the runner directly
+cronfish daemon                     run the v2 scheduler daemon in the foreground (1s tick loop)
+cronfish daemon install             hot-swap: retire per-job plists, install the KeepAlive daemon plist
+cronfish daemon uninstall           bootout + remove the daemon plist (per-job plists NOT restored — run sync)
+cronfish history [slug] [--limit N] [--since 7d]   run timeline: started, trigger, status, duration, result
+cronfish stats [--since 30d]        per-job rollup: runs, success %, avg/p95 duration, last status
 cronfish watchdog                   detect missed schedules → fire alerts
 cronfish alerts test [adapter]      send a test alert via the named (or default) adapter
 cronfish ui [--port N] [--no-open]  local web dashboard (default 127.0.0.1:4747)
