@@ -1,3 +1,10 @@
+## [0.15.1](https://github.com/goldcaddy77/cronfish/compare/v0.15.0...v0.15.1) (2026-07-10)
+
+
+### Bug Fixes
+
+* **frontmatter:** make TS config-block parser comment-aware ([#24](https://github.com/goldcaddy77/cronfish/issues/24)) ([f7905fd](https://github.com/goldcaddy77/cronfish/commit/f7905fd7832fe1c8a33747015cddac97c231a73f))
+
 # [0.15.0](https://github.com/goldcaddy77/cronfish/compare/v0.14.0...v0.15.0) (2026-07-09)
 
 
