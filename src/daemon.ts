@@ -40,6 +40,8 @@ import {
   type JobSyncStateRow,
 } from "./db.ts";
 import { loadJob, slugFromPath, walkJobFiles } from "./jobs.ts";
+import { loadRetention } from "./config.ts";
+import { ledgerPruneTotal, pruneLedger, pruneLogs } from "./prune.ts";
 import { computeNextRun } from "./next-run.ts";
 import { DEFAULT_GRACE_SECONDS, writeSentinel } from "./oneTime.ts";
 import { runWatchdog, type WatchdogDecision } from "./watchdog.ts";
@@ -85,6 +87,9 @@ export interface DaemonCtx {
   // on purpose: after a daemon crash the set is empty, which is exactly the
   // window where a NULLed-but-never-spawned one-shot needs rescuing.
   dispatchedOnce?: Set<number>;
+  // UTC day (YYYY-MM-DD) the daily housekeeping last ran — the once-per-day
+  // gate. In-memory on purpose: a restart re-prunes once, which is idempotent.
+  lastHousekeepingDay?: string;
 }
 
 function parkedMap(ctx: DaemonCtx): Map<number, string> {
@@ -475,6 +480,40 @@ export async function checkMissedRuns(
   return decisions;
 }
 
+// --- 5. Daily housekeeping (auto-prune) ---
+//
+// Mirrors `cronfish sync`'s opt-in auto-prune: when .cronfish.json configures
+// retention, prune old per-run logs AND ledger rows once per UTC day. The
+// gate is a date-change check (simpler and directly testable with a fake
+// clock, vs counting 86 400 ticks whose count drifts across restarts). No
+// retention configured → no deletion, ever. The day is stamped BEFORE the
+// work so a throwing prune can't retry at 1 Hz.
+export function runHousekeeping(ctx: DaemonCtx, now: Date): void {
+  const day = now.toISOString().slice(0, 10);
+  if (ctx.lastHousekeepingDay === day) return;
+  ctx.lastHousekeepingDay = day;
+  const retention = loadRetention(ctx.consumerRoot);
+  if (!retention) return;
+  const logs = pruneLogs({
+    consumerRoot: ctx.consumerRoot,
+    global: retention.global,
+    perSlug: retention.perSlug,
+    nowMs: now.getTime(),
+  });
+  const ledger = pruneLedger({
+    db: ctx.db,
+    global: retention.global,
+    perSlug: retention.perSlug,
+    nowMs: now.getTime(),
+  });
+  if (logs.totalDeleted > 0 || ledgerPruneTotal(ledger) > 0) {
+    warn(
+      ctx,
+      `housekeeping: pruned ${logs.totalDeleted} log(s), ${ledger.invocations} invocation(s), ${ledger.runRequests} run request(s), ${ledger.missedAlerts} missed alert(s)`,
+    );
+  }
+}
+
 // One full tick. Every phase is fenced — an error in one job's sync or
 // dispatch logs to stderr and the loop keeps going.
 export function tickOnce(ctx: DaemonCtx, now: Date): void {
@@ -492,6 +531,11 @@ export function tickOnce(ctx: DaemonCtx, now: Date): void {
     drainRunRequests(ctx, now);
   } catch (e) {
     warn(ctx, `run requests: ${(e as Error).message}`);
+  }
+  try {
+    runHousekeeping(ctx, now);
+  } catch (e) {
+    warn(ctx, `housekeeping: ${(e as Error).message}`);
   }
   try {
     beatDaemonHeartbeat(ctx.db, {

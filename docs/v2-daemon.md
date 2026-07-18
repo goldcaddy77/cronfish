@@ -58,6 +58,14 @@ The daemon writes a heartbeat row to SQLite every tick. Missed-run alerting move
 old standalone watchdog folds in). External liveness — the only outside check needed — is a
 consumer-side monitor on that single heartbeat (the CAD-688 pattern in the agents repo).
 
+## Housekeeping
+
+Once per UTC day (a date-change check in the tick loop), the daemon runs the same opt-in
+retention prune that `cronfish sync` runs: old per-run logs AND old ledger rows
+(`cron_invocations`, `cron_run_requests`, `cron_missed_alerts`) beyond the configured
+`max_age_days` window are deleted. `cron_jobs` rows are never deleted, and a `running` row
+younger than 24h is always protected. No `retention` block in `.cronfish.json` → no deletion.
+
 ## Migration
 
 Single-user hot swap: unload all per-job plists, confirm none remain, install the one daemon

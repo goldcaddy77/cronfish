@@ -5,6 +5,7 @@
 
 import { existsSync, readFileSync } from "node:fs";
 import { basename, join } from "node:path";
+import type { SlugRetention } from "./prune.ts";
 
 export function defaultBundlePrefix(consumerRoot: string): string {
   return `com.cronfish.${basename(consumerRoot)}`;
@@ -25,5 +26,95 @@ export function loadBundlePrefix(consumerRoot: string): string {
     return (parsed.bundle_prefix ?? "").trim() || def;
   } catch {
     return def;
+  }
+}
+
+// --- Retention ---
+//
+// The `.cronfish.json` retention block gates BOTH log-file pruning and ledger
+// row pruning. The strict parser lives here (not cli.ts) because the daemon's
+// daily housekeeping needs the same config resolution without importing the
+// CLI.
+
+export interface RetentionConfig {
+  max_age_days?: number;
+  max_runs?: number;
+  per_slug?: Record<string, { max_age_days?: number; max_runs?: number }>;
+}
+
+function asRetentionInt(label: string, val: unknown): number | undefined {
+  if (val === undefined) return undefined;
+  if (typeof val !== "number" || !Number.isInteger(val) || val < 1) {
+    throw new Error(`.cronfish.json: ${label} must be a positive integer`);
+  }
+  return val;
+}
+
+export function parseRetention(raw: unknown): RetentionConfig | undefined {
+  if (raw === undefined) return undefined;
+  if (typeof raw !== "object" || raw === null) {
+    throw new Error(`.cronfish.json: retention must be an object`);
+  }
+  const r = raw as Record<string, unknown>;
+  const out: RetentionConfig = {
+    max_age_days: asRetentionInt("retention.max_age_days", r.max_age_days),
+    max_runs: asRetentionInt("retention.max_runs", r.max_runs),
+  };
+  if (r.per_slug !== undefined) {
+    if (typeof r.per_slug !== "object" || r.per_slug === null) {
+      throw new Error(`.cronfish.json: retention.per_slug must be an object`);
+    }
+    out.per_slug = {};
+    for (const [slug, v] of Object.entries(r.per_slug as object)) {
+      const o = (v ?? {}) as Record<string, unknown>;
+      out.per_slug[slug] = {
+        max_age_days: asRetentionInt(
+          `retention.per_slug.${slug}.max_age_days`,
+          o.max_age_days,
+        ),
+        max_runs: asRetentionInt(
+          `retention.per_slug.${slug}.max_runs`,
+          o.max_runs,
+        ),
+      };
+    }
+  }
+  return out;
+}
+
+// Translate the snake_case config block into the prune core's shape.
+export function retentionToPrune(r: RetentionConfig): {
+  global: SlugRetention;
+  perSlug: Record<string, SlugRetention>;
+} {
+  const global: SlugRetention = {
+    maxAgeDays: r.max_age_days,
+    maxRuns: r.max_runs,
+  };
+  const perSlug: Record<string, SlugRetention> = {};
+  for (const [slug, v] of Object.entries(r.per_slug ?? {})) {
+    perSlug[slug] = { maxAgeDays: v.max_age_days, maxRuns: v.max_runs };
+  }
+  return { global, perSlug };
+}
+
+// Tolerant retention read for the daemon's housekeeping (mirrors
+// loadBundlePrefix): null when no retention is configured or the file is
+// missing/unparseable — auto-prune is strictly opt-in, so any doubt means
+// "don't delete anything".
+export function loadRetention(consumerRoot: string): {
+  global: SlugRetention;
+  perSlug: Record<string, SlugRetention>;
+} | null {
+  const path = join(consumerRoot, ".cronfish.json");
+  if (!existsSync(path)) return null;
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf-8")) as {
+      retention?: unknown;
+    };
+    const retention = parseRetention(parsed.retention);
+    return retention ? retentionToPrune(retention) : null;
+  } catch {
+    return null;
   }
 }

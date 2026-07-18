@@ -350,6 +350,11 @@ cronfish alerts test slack_bot
 
 ## Always-on dashboard
 
+The dashboard is daemon-aware: a header badge shows the v2 scheduler's liveness (pid, version,
+uptime from its heartbeat, via `/api/daemon`) and turns into a loud banner when the daemon is dead
+or stale — a dead scheduler must never look like "all quiet". The jobs table shows the daemon's
+own `next_run_at`, and post-downtime `catchup` runs get their own badge in the run history.
+
 `cronfish ui` runs the dashboard in the foreground. To keep it up across reboots and crashes, install it as a launchd daemon:
 
 ```
@@ -378,10 +383,11 @@ cron/<slug>.{md,ts,sh}                              # job files (you write these
 
 `.cronfish/` is created automatically; add it to `.gitignore`.
 
-### Log retention
+### Retention (logs + ledger rows)
 
-Per-run logs accumulate forever — on an always-on machine that grows unbounded. `cronfish prune`
-deletes old ones:
+Per-run logs and ledger rows (`cron_invocations`, `cron_run_requests`, `cron_missed_alerts`)
+accumulate forever — on an always-on machine that grows unbounded. `cronfish prune` deletes old
+ones:
 
 ```
 cronfish prune                       # prune every slug per retention config
@@ -409,8 +415,13 @@ With no config and no flags, `prune` falls back to `max_age_days: 30`. Configure
 `max_age_days` deletes logs older than N days; `max_runs` keeps only the N newest per slug; set both
 and a log is pruned if it fails *either*. A `per_slug` entry fully replaces the global policy for
 that slug. Auto-prune on `sync` is opt-in: it runs only when `retention` is set, so an unconfigured
-repo never silently loses logs. The run ledger (`db.sqlite`) and the dashboard's `ui.log` are left
-untouched — only per-run log files are pruned.
+repo never silently loses history. The dashboard's `ui.log` is left untouched.
+
+`max_age_days` also ages out ledger **rows**: invocations, run requests, and missed-alert records
+older than the window are deleted (`max_runs` is log-file-only). Safety rails: a `running` row
+younger than 24h is never deleted (older `running` rows are crash debris and prune normally), and
+`cron_jobs` rows are never deleted — job history tombstones stay forever. The v2 daemon runs the
+same prune automatically once per day when `retention` is configured.
 
 ## Retries & concurrency
 

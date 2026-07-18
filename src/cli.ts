@@ -23,7 +23,12 @@ import {
   resolveOneTime,
   writeSentinel,
 } from "./oneTime.ts";
-import { defaultBundlePrefix } from "./config.ts";
+import {
+  defaultBundlePrefix,
+  parseRetention,
+  retentionToPrune,
+  type RetentionConfig,
+} from "./config.ts";
 import { platform } from "./platform/index.ts";
 import {
   RESERVED_LABEL_SUFFIXES,
@@ -47,7 +52,10 @@ import {
 } from "./db.ts";
 import {
   formatBytes,
+  ledgerPruneTotal,
+  pruneLedger,
   pruneLogs,
+  type LedgerPruneReport,
   type PruneReport,
   type SlugRetention,
 } from "./prune.ts";
@@ -64,12 +72,6 @@ const CRON_DIR = join(CONSUMER_ROOT, "cron");
 
 // --- Consumer config ---
 
-interface RetentionConfig {
-  max_age_days?: number;
-  max_runs?: number;
-  per_slug?: Record<string, { max_age_days?: number; max_runs?: number }>;
-}
-
 interface CronfishConfig {
   bundle_prefix: string;
   bun_path?: string;
@@ -80,46 +82,6 @@ interface CronfishConfig {
 // Auto-prune on sync does NOT use this — it only runs when retention is set
 // explicitly, so an unconfigured repo never silently loses logs.
 const DEFAULT_PRUNE_AGE_DAYS = 30;
-
-function asRetentionInt(label: string, val: unknown): number | undefined {
-  if (val === undefined) return undefined;
-  if (typeof val !== "number" || !Number.isInteger(val) || val < 1) {
-    throw new Error(`.cronfish.json: ${label} must be a positive integer`);
-  }
-  return val;
-}
-
-function parseRetention(raw: unknown): RetentionConfig | undefined {
-  if (raw === undefined) return undefined;
-  if (typeof raw !== "object" || raw === null) {
-    throw new Error(`.cronfish.json: retention must be an object`);
-  }
-  const r = raw as Record<string, unknown>;
-  const out: RetentionConfig = {
-    max_age_days: asRetentionInt("retention.max_age_days", r.max_age_days),
-    max_runs: asRetentionInt("retention.max_runs", r.max_runs),
-  };
-  if (r.per_slug !== undefined) {
-    if (typeof r.per_slug !== "object" || r.per_slug === null) {
-      throw new Error(`.cronfish.json: retention.per_slug must be an object`);
-    }
-    out.per_slug = {};
-    for (const [slug, v] of Object.entries(r.per_slug as object)) {
-      const o = (v ?? {}) as Record<string, unknown>;
-      out.per_slug[slug] = {
-        max_age_days: asRetentionInt(
-          `retention.per_slug.${slug}.max_age_days`,
-          o.max_age_days,
-        ),
-        max_runs: asRetentionInt(
-          `retention.per_slug.${slug}.max_runs`,
-          o.max_runs,
-        ),
-      };
-    }
-  }
-  return out;
-}
 
 function loadConfig(): CronfishConfig {
   const path = join(CONSUMER_ROOT, ".cronfish.json");
@@ -509,8 +471,9 @@ function cmdSync(): void {
     console.error(`[cronfish] ledger sync skipped: ${(e as Error).message}`);
   }
 
-  // Auto-prune logs — opt-in. Only runs when retention is configured, so an
-  // unconfigured repo never silently loses logs on sync. Failure-safe.
+  // Auto-prune logs + ledger rows — opt-in. Only runs when retention is
+  // configured, so an unconfigured repo never silently loses history on sync.
+  // Failure-safe.
   if (CONFIG.retention) {
     try {
       const { global, perSlug } = retentionToPruneInput();
@@ -520,6 +483,7 @@ function cmdSync(): void {
         perSlug,
       });
       if (report.totalDeleted > 0) printPruneReport(report, false);
+      printLedgerReport(pruneLedgerRows(global, perSlug), false);
     } catch (e) {
       console.error(`[cronfish] auto-prune skipped: ${(e as Error).message}`);
     }
@@ -1259,19 +1223,43 @@ function retentionToPruneInput(override?: SlugRetention): {
   global: SlugRetention;
   perSlug: Record<string, SlugRetention>;
 } {
-  const r = CONFIG.retention;
-  const global: SlugRetention = override ?? {
-    maxAgeDays: r?.max_age_days,
-    maxRuns: r?.max_runs,
-  };
-  const perSlug: Record<string, SlugRetention> = {};
   // CLI flag overrides win across every slug — ignore per_slug config then.
-  if (!override && r?.per_slug) {
-    for (const [slug, v] of Object.entries(r.per_slug)) {
-      perSlug[slug] = { maxAgeDays: v.max_age_days, maxRuns: v.max_runs };
-    }
+  if (override) return { global: override, perSlug: {} };
+  return retentionToPrune(CONFIG.retention ?? {});
+}
+
+// Ledger rows (invocations, run requests, missed alerts) age out on the same
+// window as logs. Failure-safe: a missing/locked db never breaks prune. A
+// consumer with no db yet has no rows to prune — never create one here.
+function pruneLedgerRows(
+  global: SlugRetention,
+  perSlug: Record<string, SlugRetention>,
+  opts: { onlySlug?: string; dryRun?: boolean } = {},
+): LedgerPruneReport | null {
+  if (!existsSync(dbPath(CONSUMER_ROOT))) return null;
+  const db = openDb(CONSUMER_ROOT);
+  try {
+    return pruneLedger({
+      db,
+      global,
+      perSlug,
+      onlySlug: opts.onlySlug,
+      dryRun: opts.dryRun,
+    });
+  } finally {
+    db.close();
   }
-  return { global, perSlug };
+}
+
+function printLedgerReport(
+  report: LedgerPruneReport | null,
+  dryRun: boolean,
+): void {
+  if (!report || ledgerPruneTotal(report) === 0) return;
+  const verb = dryRun ? "would prune" : "pruned";
+  console.log(
+    `[cronfish] ${verb} ledger rows: ${report.invocations} invocation(s), ${report.runRequests} run request(s), ${report.missedAlerts} missed alert(s)`,
+  );
 }
 
 function printPruneReport(report: PruneReport, dryRun: boolean): void {
@@ -1322,6 +1310,10 @@ function cmdPrune(
     dryRun: flags.dryRun,
   });
   printPruneReport(report, flags.dryRun);
+  printLedgerReport(
+    pruneLedgerRows(global, perSlug, { onlySlug: slug, dryRun: flags.dryRun }),
+    flags.dryRun,
+  );
 }
 
 function cmdInit(): void {
@@ -1376,8 +1368,8 @@ usage:
   cronfish init                       scaffold cron/hello.md + cron/touch.ts + cron/ping.sh
   cronfish list                       show every job + state
   cronfish next [slug] [N]            preview the next N fire times (default 5)
-  cronfish sync                       reconcile cron/ ↔ launchd (auto-prunes logs if retention is set)
-  cronfish prune [slug] [--dry-run]   delete old per-run logs per retention config
+  cronfish sync                       reconcile cron/ ↔ launchd (auto-prunes logs + ledger rows if retention is set)
+  cronfish prune [slug] [--dry-run]   delete old per-run logs + ledger rows per retention config
                   [--max-age-days N] [--max-runs N]   (override config; default max_age_days=30 if unset)
   cronfish enable <slug>              flip enabled, then sync
   cronfish disable <slug>             flip disabled, then sync

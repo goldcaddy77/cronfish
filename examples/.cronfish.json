@@ -8,6 +8,14 @@
     "public_url": "http://127.0.0.1:4747"
   },
 
+  "retention": {
+    "max_age_days": 30,
+    "max_runs": 100,
+    "per_slug": {
+      "noisy-job-md": { "max_runs": 20 }
+    }
+  },
+
   "alerts": {
     "on_failure": { "notify": "slack" },
     "default": "slack",
