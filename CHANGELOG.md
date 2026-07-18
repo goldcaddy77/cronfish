@@ -1,3 +1,10 @@
+## [0.16.2](https://github.com/goldcaddy77/cronfish/compare/v0.16.1...v0.16.2) (2026-07-18)
+
+
+### Bug Fixes
+
+* **daemon:** close once-job loss windows, sync stampede, lock races, stuck run requests ([3700a5f](https://github.com/goldcaddy77/cronfish/commit/3700a5fe5e34d9d96811c14518457682e0a5be51))
+
 ## [0.16.1](https://github.com/goldcaddy77/cronfish/compare/v0.16.0...v0.16.1) (2026-07-18)
 
 
