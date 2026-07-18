@@ -725,6 +725,91 @@ describe("daemon mutual exclusion — stale-lock hardening (A3/A4)", () => {
   });
 });
 
+describe("daemon tickOnce — post-restore thundering-herd jitter (CAD-700)", () => {
+  // Craft a restored-from-backup db: job rows whose next_run_at is stale in
+  // the past, plus an ancient heartbeat from the pre-restore daemon. Returns a
+  // fresh ctx (a new process — startupJitterApplied unset) over the same db.
+  function seedRestore(slugs: string[], staleNextRun: Date): DaemonCtx {
+    for (const s of slugs) writeJob(`${s}.md`, mdJob("5m"));
+    tickOnce(harness.ctx, T0); // create rows + first dispatch
+    harness.spawns.length = 0;
+    // Every job overdue by way more than the catch-up grace.
+    harness.db
+      .prepare("UPDATE cron_jobs SET next_run_at = $n WHERE state = 'active'")
+      .run({ $n: staleNextRun.toISOString() });
+    // Ancient heartbeat rode in with the backup (pre-restore pid, old tick).
+    beatDaemonHeartbeat(harness.db, {
+      pid: 111,
+      startedAt: at(-2000).toISOString(),
+    });
+    harness.db
+      .prepare("UPDATE cron_daemon_heartbeat SET last_tick_at = $t")
+      .run({ $t: at(-2000).toISOString() }); // ~33h before T0 → clearly stale
+    return { ...harness.ctx, startupJitterApplied: undefined };
+  }
+
+  test("restore: overdue interval jobs are staggered, not fired all at once", () => {
+    const slugs = ["a", "b", "c", "d"];
+    const ctx2 = seedRestore(slugs, at(-30)); // 30m overdue
+
+    // First tick after the "restore": only the single most-overdue job fires;
+    // the other three are pushed into the jitter window.
+    tickOnce(ctx2, at(0, 1));
+    expect(harness.spawns).toHaveLength(1);
+    expect(harness.spawns[0]!.trigger).toBe("catchup");
+
+    // The three deferred jobs sit at future next_run_ats inside the ~3-minute
+    // jitter window (the one that fired advanced to now+5m, outside it).
+    const deferred = slugs
+      .map((s) => Date.parse(jobRow(harness.db, `${s}-md`).next_run_at as string))
+      .map((t) => t - at(0, 1).getTime())
+      .filter((delta) => delta > 0 && delta <= 3 * 60_000)
+      .sort((x, y) => x - y);
+    expect(deferred).toHaveLength(3);
+    // Evenly spaced, strictly staggered — no two share a slot.
+    expect(new Set(deferred).size).toBe(3);
+
+    // Marching the clock forward drains them one at a time, never in a burst.
+    tickOnce(ctx2, at(3, 1)); // past the whole window
+    expect(harness.spawns.length).toBe(4);
+    // And no re-herd on the next tick.
+    tickOnce(ctx2, at(3, 2));
+    expect(harness.spawns.length).toBe(4);
+  });
+
+  test("a lone overdue job on cold start still fires immediately (no herd)", () => {
+    const ctx2 = seedRestore(["solo"], at(-30));
+    tickOnce(ctx2, at(0, 1));
+    expect(harness.spawns).toHaveLength(1);
+    expect(jobRow(harness.db, "solo-md").next_run_at).toBe(at(5, 1).toISOString());
+  });
+
+  test("a fresh heartbeat (quick restart) does NOT stagger — jobs fire at once", () => {
+    for (const s of ["a", "b", "c"]) writeJob(`${s}.md`, mdJob("5m"));
+    tickOnce(harness.ctx, T0);
+    harness.spawns.length = 0;
+    harness.db
+      .prepare("UPDATE cron_jobs SET next_run_at = $n WHERE state = 'active'")
+      .run({ $n: at(-30).toISOString() });
+    // Heartbeat only ~2s stale — a quick bounce, not a cold start.
+    beatDaemonHeartbeat(harness.db, { pid: 111, startedAt: T0.toISOString() });
+    harness.db
+      .prepare("UPDATE cron_daemon_heartbeat SET last_tick_at = $t")
+      .run({ $t: at(0, 1).toISOString() });
+    const ctx2 = { ...harness.ctx, startupJitterApplied: undefined };
+    tickOnce(ctx2, at(0, 3));
+    expect(harness.spawns.length).toBe(3); // all fire, no staggering
+  });
+
+  test("fresh db first-sight of many jobs is unaffected (next_run=now, not overdue)", () => {
+    for (const s of ["a", "b", "c", "d"]) writeJob(`${s}.md`, mdJob("5m"));
+    // Cold start (no heartbeat) but first-sight next_run=now is not overdue
+    // past the grace, so nothing is staggered — all dispatch on tick 1.
+    tickOnce(harness.ctx, T0);
+    expect(harness.spawns.length).toBe(4);
+  });
+});
+
 describe("daemon tickOnce — heartbeat", () => {
   test("beats every tick and counts ticks for the same process", () => {
     tickOnce(harness.ctx, T0);

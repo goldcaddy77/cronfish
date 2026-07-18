@@ -55,6 +55,27 @@ export const CATCHUP_GRACE_MS = 60_000;
 
 export const TICK_MS = 1_000;
 
+// --- Post-restore thundering-herd jitter ---
+//
+// A db restored from backup (or a fresh db over existing job files) starts
+// with every interval/cron job's next_run_at stale in the past — so the first
+// tick would dispatch every overdue catch-up run at once, hammering whatever
+// the jobs call (Ollama/claude/Linear/…). On a COLD start (absent heartbeat,
+// or one so old the daemon was clearly down a while) we spread that initial
+// wave of overdue catch-up dispatches across a few minutes instead.
+//
+// This fires at most once per process, on the first tick, and ONLY when the
+// heartbeat says this is a cold start with more than one overdue job — a quick
+// restart (fresh heartbeat) or a lone overdue job is left to dispatch normally.
+
+// A heartbeat older than this at startup (or absent) means the daemon was down
+// long enough for interval jobs to pile up — a herd worth staggering. Below
+// it, a quick restart's handful of just-missed jobs dispatch immediately.
+export const STARTUP_STALE_MS = 5 * 60_000;
+
+// The window the initial catch-up wave is spread across. "A few minutes."
+export const STARTUP_JITTER_MS = 3 * 60_000;
+
 export interface SpawnRequest {
   slug: string;
   jobPath: string;
@@ -90,6 +111,10 @@ export interface DaemonCtx {
   // UTC day (YYYY-MM-DD) the daily housekeeping last ran — the once-per-day
   // gate. In-memory on purpose: a restart re-prunes once, which is idempotent.
   lastHousekeepingDay?: string;
+  // Set on the first tick once the cold-start catch-up jitter has been
+  // considered (applied or not). In-memory on purpose: the herd only forms on
+  // the FIRST tick after a start, so a restart re-evaluating once is correct.
+  startupJitterApplied?: boolean;
 }
 
 function parkedMap(ctx: DaemonCtx): Map<number, string> {
@@ -402,6 +427,67 @@ function dispatchDue(ctx: DaemonCtx, now: Date): void {
   }
 }
 
+// --- 2b. Cold-start catch-up jitter (post-restore thundering-herd guard) ---
+//
+// Runs once, on the first tick, AFTER syncFiles (so restored/first-sight rows
+// have their next_run_at settled) and BEFORE dispatchDue (so the rewrite lands
+// before anything would fire). When the heartbeat proves a cold start and more
+// than one recurring job is already overdue past the catch-up grace, leave the
+// most-overdue one to fire this tick and push the rest out over STARTUP_JITTER_MS
+// so their catch-up runs trickle rather than stampede. The rewritten next_run_at
+// is persisted, so a re-restart mid-window can't re-form the herd.
+function jitterColdStartCatchup(ctx: DaemonCtx, now: Date): void {
+  if (ctx.startupJitterApplied) return;
+  ctx.startupJitterApplied = true; // strictly once, even if the checks below throw
+  if (!isColdStart(ctx, now)) return;
+
+  const overdue = listDueJobs(ctx.db, now.toISOString()).filter(
+    (j) =>
+      (j.schedule_kind === "interval" || j.schedule_kind === "cron") &&
+      now.getTime() - Date.parse(j.next_run_at) > CATCHUP_GRACE_MS,
+  );
+  if (overdue.length <= 1) return; // a lone catch-up isn't a herd
+
+  // Deterministic order: most-overdue first (oldest next_run_at), slug breaks
+  // ties. Index 0 keeps its past next_run_at and fires on this very tick; the
+  // rest get future slots evenly spaced across the jitter window.
+  overdue.sort(
+    (a, b) =>
+      Date.parse(a.next_run_at) - Date.parse(b.next_run_at) ||
+      (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0),
+  );
+  const n = overdue.length;
+  for (let i = 1; i < n; i++) {
+    const delayMs = Math.round((i * STARTUP_JITTER_MS) / n);
+    setJobNextRun(
+      ctx.db,
+      overdue[i]!.id,
+      new Date(now.getTime() + delayMs).toISOString(),
+    );
+  }
+  warn(
+    ctx,
+    `cold start (stale/absent heartbeat): staggering ${n} overdue catch-up job(s) over ${Math.round(STARTUP_JITTER_MS / 1000)}s to avoid a thundering herd`,
+  );
+}
+
+// A cold start = no heartbeat row at all (fresh db, or a restore that dropped
+// the table), or one whose last tick predates now by more than STARTUP_STALE_MS
+// (a restore carrying an ancient heartbeat, or genuinely long downtime). Our
+// own in-process heartbeat never counts — but on the first tick it hasn't been
+// beaten yet, so the row we read is always the prior instance's or absent.
+function isColdStart(ctx: DaemonCtx, now: Date): boolean {
+  let hb: ReturnType<typeof getDaemonHeartbeat>;
+  try {
+    hb = getDaemonHeartbeat(ctx.db);
+  } catch {
+    return false; // heartbeat unreadable → don't gamble on staggering
+  }
+  if (!hb) return true;
+  if (hb.pid === ctx.pid && hb.started_at === ctx.startedAt) return false;
+  return now.getTime() - Date.parse(hb.last_tick_at) > STARTUP_STALE_MS;
+}
+
 // --- 3. Drain `cron run` requests ---
 //
 // claimPendingRunRequests marks picked_up_at atomically, so a request is
@@ -521,6 +607,11 @@ export function tickOnce(ctx: DaemonCtx, now: Date): void {
     syncFiles(ctx, now);
   } catch (e) {
     warn(ctx, `file sync: ${(e as Error).message}`);
+  }
+  try {
+    jitterColdStartCatchup(ctx, now);
+  } catch (e) {
+    warn(ctx, `startup jitter: ${(e as Error).message}`);
   }
   try {
     dispatchDue(ctx, now);

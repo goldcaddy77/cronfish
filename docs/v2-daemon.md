@@ -26,6 +26,15 @@ alive" — the thing launchd is actually good at.
   scheduler down, and timeout = kill the child. 1s ticks also unlock sub-minute intervals.
 - **Self-healing**: after downtime, the first tick simply finds everything with `next_run` in the
   past and runs it — **coalesced to ONE catch-up run per job**, never N. No per-job override.
+- **Post-restore herd jitter** (`STARTUP_STALE_MS` / `STARTUP_JITTER_MS`): a db restored from
+  backup (or a fresh db over existing job files) starts with every recurring job's `next_run` stale
+  in the past — the naive first tick would dispatch all of them at once and hammer whatever the jobs
+  call. On a **cold start** (heartbeat absent, or its last tick older than `STARTUP_STALE_MS` → the
+  daemon was clearly down a while) the first tick leaves the single most-overdue recurring job to
+  fire immediately and spreads the rest of the overdue catch-up wave across `STARTUP_JITTER_MS` (a
+  few minutes). Fires once per process; a quick restart (fresh heartbeat) or a lone overdue job is
+  left to dispatch normally. The staggered `next_run`s are persisted, so a re-restart mid-window
+  can't re-form the herd.
 - **`croner`** computes next occurrences for cron expressions (DST-correct); interval schedules
   are plain arithmetic.
 
