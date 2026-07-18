@@ -1,3 +1,11 @@
+# [0.17.0](https://github.com/goldcaddy77/cronfish/compare/v0.16.2...v0.17.0) (2026-07-18)
+
+
+### Features
+
+* **prune:** age out ledger rows + daily daemon housekeeping ([c8c00e9](https://github.com/goldcaddy77/cronfish/commit/c8c00e9191750cb2a3fe92b9e9d890bcefea6d50))
+* **ui:** daemon-aware dashboard — liveness banner, real next_run, catchup badge ([c9f2cde](https://github.com/goldcaddy77/cronfish/commit/c9f2cde7ed3c104d3b8a1705fd45ebc176e93d10))
+
 ## [0.16.2](https://github.com/goldcaddy77/cronfish/compare/v0.16.1...v0.16.2) (2026-07-18)
 
 
