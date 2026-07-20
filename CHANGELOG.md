@@ -1,3 +1,10 @@
+# [0.19.0](https://github.com/goldcaddy77/cronfish/compare/v0.18.0...v0.19.0) (2026-07-20)
+
+
+### Features
+
+* **store:** add Bun.sql Postgres backend behind CronStore (scope 2) ([54979e3](https://github.com/goldcaddy77/cronfish/commit/54979e37d2a1220dbfe37af622869731ac55c81e))
+
 # [0.18.0](https://github.com/goldcaddy77/cronfish/compare/v0.17.0...v0.18.0) (2026-07-18)
 
 

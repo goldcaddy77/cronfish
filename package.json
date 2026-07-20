@@ -1,6 +1,6 @@
 {
   "name": "cronfish",
-  "version": "0.18.0",
+  "version": "0.19.0",
   "description": "A file-based job scheduler for macOS. Drop a script in a folder; launchd runs it on a schedule.",
   "type": "module",
   "bin": {
