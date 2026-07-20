@@ -26,5 +26,7 @@ export type {
   RunRequestStatusRow,
 } from "./interface.ts";
 export { RUN_REQUEST_EXPIRY_MS } from "./interface.ts";
-export { SqliteStore, openStore, tryOpenStore } from "./sqlite.ts";
+export { SqliteStore } from "./sqlite.ts";
+export { PostgresStore } from "./postgres.ts";
+export { openStore, tryOpenStore } from "./open.ts";
 export { dbPath, logsRoot } from "./paths.ts";

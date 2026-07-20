@@ -10,7 +10,7 @@ import {
   type CronStore,
 } from "../src/store/index.ts";
 import type { JobMeta } from "../src/jobs.ts";
-import { BACKENDS } from "./support/store-harness.ts";
+import { BACKENDS, type StoreKit } from "./support/store-harness.ts";
 
 function meta(overrides: Partial<JobMeta> & { slug: string }): JobMeta {
   return {
@@ -223,13 +223,13 @@ describe("openStore pragmas [sqlite]", () => {
 
 describe.each(BACKENDS)("cron store behavior [%s]", (_name, factory) => {
   let store: CronStore;
-  let db: Database;
+  let kit: StoreKit;
   let dispose: () => Promise<void>;
 
   beforeEach(async () => {
     const built = await factory();
     store = built.store;
-    db = built.raw!;
+    kit = built.kit;
     dispose = built.dispose;
   });
 
@@ -240,11 +240,12 @@ describe.each(BACKENDS)("cron store behavior [%s]", (_name, factory) => {
   describe("job scheduler state", () => {
     test("upsertJob writes state, schedule_kind, and file metadata", async () => {
       await store.upsertJob(meta({ slug: "a-md" }), "2026-07-17T00:00:00.000Z");
-      const row = db
-        .query(
-          "SELECT state, schedule_kind, file_path, file_mtime FROM cron_jobs WHERE slug = 'a-md'",
-        )
-        .get() as Record<string, string>;
+      const row = await kit.jobFields("a-md", [
+        "state",
+        "schedule_kind",
+        "file_path",
+        "file_mtime",
+      ]);
       expect(row).toEqual({
         state: "active",
         schedule_kind: "interval",
@@ -254,9 +255,7 @@ describe.each(BACKENDS)("cron store behavior [%s]", (_name, factory) => {
 
       // Re-sync without an mtime keeps the stored one; disabling flips state.
       await store.upsertJob(meta({ slug: "a-md", enabled: false }));
-      const row2 = db
-        .query("SELECT state, file_mtime FROM cron_jobs WHERE slug = 'a-md'")
-        .get() as Record<string, string>;
+      const row2 = await kit.jobFields("a-md", ["state", "file_mtime"]);
       expect(row2).toEqual({
         state: "disabled",
         file_mtime: "2026-07-17T00:00:00.000Z",
@@ -267,9 +266,7 @@ describe.each(BACKENDS)("cron store behavior [%s]", (_name, factory) => {
       await store.upsertJob(meta({ slug: "keep-md" }));
       await store.upsertJob(meta({ slug: "drop-md" }));
       await store.markDeleted(["keep-md"]);
-      const states = db
-        .query("SELECT slug, state FROM cron_jobs ORDER BY slug")
-        .all();
+      const states = await kit.listJobStates();
       expect(states).toEqual([
         { slug: "drop-md", state: "deleted" },
         { slug: "keep-md", state: "active" },
@@ -298,9 +295,7 @@ describe.each(BACKENDS)("cron store behavior [%s]", (_name, factory) => {
         "2026-07-17T12:00:00.000Z",
         "ok",
       );
-      const row = db
-        .query("SELECT last_run_at, last_status FROM cron_jobs WHERE slug = 'a-md'")
-        .get();
+      const row = await kit.jobFields("a-md", ["last_run_at", "last_status"]);
       expect(row).toEqual({
         last_run_at: "2026-07-17T12:00:00.000Z",
         last_status: "ok",
@@ -323,14 +318,10 @@ describe.each(BACKENDS)("cron store behavior [%s]", (_name, factory) => {
       // Claimed rows carry picked_up_at; linking ties them to the invocation.
       const invId = await store.startInvocation(aId, "manual", "/tmp/a.log");
       await store.linkRunRequestInvocation(claimed[0].id, invId);
-      const row = db
-        .query(
-          "SELECT picked_up_at, invocation_id FROM cron_run_requests WHERE id = $id",
-        )
-        .get({ $id: claimed[0].id }) as {
-        picked_up_at: string | null;
-        invocation_id: number | null;
-      };
+      const row = (await kit.runRequestFields(claimed[0].id, [
+        "picked_up_at",
+        "invocation_id",
+      ]))!;
       expect(row.picked_up_at).not.toBeNull();
       expect(row.invocation_id).toBe(invId);
     });
@@ -343,19 +334,13 @@ describe.each(BACKENDS)("cron store behavior [%s]", (_name, factory) => {
       const old = new Date(
         Date.now() - RUN_REQUEST_EXPIRY_MS - 60_000,
       ).toISOString();
-      db.prepare(
-        "UPDATE cron_run_requests SET requested_at = $t WHERE id = $id",
-      ).run({ $t: old, $id: reqId });
+      await kit.ageRunRequest(reqId, old);
 
       expect(await store.claimPendingRunRequests()).toEqual([]);
-      const row = db
-        .query(
-          "SELECT picked_up_at, expired_at FROM cron_run_requests WHERE id = $id",
-        )
-        .get({ $id: reqId }) as {
-        picked_up_at: string | null;
-        expired_at: string | null;
-      };
+      const row = (await kit.runRequestFields(reqId, [
+        "picked_up_at",
+        "expired_at",
+      ]))!;
       expect(row.picked_up_at).toBeNull();
       expect(row.expired_at).not.toBeNull();
       // Stays expired — later claims never resurrect it.
@@ -412,11 +397,11 @@ describe.each(BACKENDS)("cron store behavior [%s]", (_name, factory) => {
         scheduledFor: "2026-07-17T12:00:00.000Z",
       });
       await store.finishInvocation(invId, "ok", 0);
-      const row = db
-        .query(
-          "SELECT attempt, scheduled_for, duration_ms FROM cron_invocations WHERE id = $id",
-        )
-        .get({ $id: invId }) as {
+      const row = (await kit.invocationFields(invId, [
+        "attempt",
+        "scheduled_for",
+        "duration_ms",
+      ]))! as {
         attempt: number;
         scheduled_for: string;
         duration_ms: number;
@@ -433,10 +418,10 @@ describe.each(BACKENDS)("cron store behavior [%s]", (_name, factory) => {
       await store.upsertJob(meta({ slug: "b-md" }));
       const a = (await store.getJobIdBySlug("a-md"))!;
       const b = (await store.getJobIdBySlug("b-md"))!;
-      seedInvocation(db, a, { startedAt: "2026-07-15T00:00:00.000Z", status: "ok", durationMs: 100 });
-      seedInvocation(db, a, { startedAt: "2026-07-16T00:00:00.000Z", status: "ok", durationMs: 200 });
-      seedInvocation(db, a, { startedAt: "2026-07-17T00:00:00.000Z", status: "fail", durationMs: 300 });
-      seedInvocation(db, b, { startedAt: "2026-07-17T06:00:00.000Z", status: "timeout", durationMs: 5000 });
+      await kit.seedInvocation(a, { startedAt: "2026-07-15T00:00:00.000Z", status: "ok", durationMs: 100 });
+      await kit.seedInvocation(a, { startedAt: "2026-07-16T00:00:00.000Z", status: "ok", durationMs: 200 });
+      await kit.seedInvocation(a, { startedAt: "2026-07-17T00:00:00.000Z", status: "fail", durationMs: 300 });
+      await kit.seedInvocation(b, { startedAt: "2026-07-17T06:00:00.000Z", status: "timeout", durationMs: 5000 });
       await store.setJobLastRun(a, "2026-07-17T00:00:00.000Z", "fail");
       await store.setJobLastRun(b, "2026-07-17T06:00:00.000Z", "timeout");
     }

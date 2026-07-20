@@ -546,8 +546,12 @@ export class SqliteStore implements CronStore {
 }
 
 // Open (creating if needed) the consumer's ledger db, apply PRAGMAs in the
-// exact db.ts order, run migrations, and return a ready SqliteStore.
-export async function openStore(consumerRoot: string): Promise<SqliteStore> {
+// exact db.ts order, run migrations, and return a ready SqliteStore. This is
+// the SQLite-specific opener; store-agnostic dispatch (sqlite vs postgres) lives
+// in open.ts, which re-exports the public `openStore`/`tryOpenStore` names.
+export async function openSqliteStore(
+  consumerRoot: string,
+): Promise<SqliteStore> {
   const path = dbPath(consumerRoot);
   mkdirSync(dirname(path), { recursive: true });
   const db = new Database(path);
@@ -562,10 +566,11 @@ export async function openStore(consumerRoot: string): Promise<SqliteStore> {
   return store;
 }
 
-// Fail-soft open for read paths (CLI status/heartbeat peeks): returns null on a
-// missing file or any open failure instead of creating .cronfish/ or throwing.
-// A `readonly` handle never migrates — callers tolerate a pre-v6 schema.
-export async function tryOpenStore(
+// Fail-soft SQLite open for read paths (CLI status/heartbeat peeks): returns
+// null on a missing file or any open failure instead of creating .cronfish/ or
+// throwing. A `readonly` handle never migrates — callers tolerate a pre-v6
+// schema. Exactly today's behavior, preserved for the sqlite dispatch branch.
+export async function tryOpenSqliteStore(
   consumerRoot: string,
   opts: { readonly?: boolean } = {},
 ): Promise<CronStore | null> {
@@ -575,7 +580,7 @@ export async function tryOpenStore(
       const db = new Database(path, { readonly: true });
       return new SqliteStore(db);
     }
-    return await openStore(consumerRoot);
+    return await openSqliteStore(consumerRoot);
   } catch {
     return null;
   }

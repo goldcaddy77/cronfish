@@ -797,6 +797,20 @@ async function main(): Promise<void> {
     // The store method's sync bun:sqlite write executes synchronously before
     // this handler's process.exit — the returned promise is intentionally
     // unawaited (a signal handler can't yield to the event loop).
+    //
+    // DIALECT CAVEAT (Postgres, CAD-790): with an async PostgresStore this
+    // crash-status write is a network round-trip that will NOT complete before
+    // process.exit — the invocation row stays 'running'. There is currently NO
+    // repair path that reconciles an orphaned 'running' row to 'crashed' on
+    // restart: repairLostOnce (daemon.ts) only re-schedules lost one-time JOBS,
+    // and the watchdog only detects MISSED runs — neither touches a stuck
+    // 'running' invocation. prune.ts protects fresh 'running' rows and
+    // eventually DELETES stale ones (RUNNING_PROTECT_MS) but never re-statuses
+    // them. So under Postgres a SIGTERM'd run leaves a permanent 'running' row
+    // until it ages out of retention. Scope-3 cutover (CAD-790) must add a
+    // startup reconcile that flips daemon-supervised orphaned 'running' rows to
+    // 'crashed', OR make this handler await the write (SIGTERM has a grace
+    // period). Sync bun:sqlite is unaffected — the write lands before exit.
     void tryFinishInvocation(
       store,
       invocationId,
