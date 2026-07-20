@@ -11,7 +11,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { beatDaemonHeartbeat, openDb } from "../src/db.ts";
+import { openStore } from "../src/store/index.ts";
 
 const CLI = new URL("../src/cli.ts", import.meta.url).pathname;
 
@@ -401,19 +401,19 @@ export default async function run() {}
 
   // Write a fresh daemon heartbeat into the consumer db so the CLI's
   // liveness guard (last tick ≤ 10s old) sees a running daemon.
-  function seedLiveHeartbeat(ctx: Ctx): void {
-    const db = openDb(ctx.root);
-    beatDaemonHeartbeat(db, {
+  async function seedLiveHeartbeat(ctx: Ctx): Promise<void> {
+    const store = await openStore(ctx.root);
+    await store.beatDaemonHeartbeat({
       pid: 999,
       startedAt: new Date().toISOString(),
       version: "test",
     });
-    db.close();
+    await store.close();
   }
 
-  test("sync with a live daemon writes NO per-job plists and retires stale ones", () => {
+  test("sync with a live daemon writes NO per-job plists and retires stale ones", async () => {
     writeJob(ctx, "hello.md", MD_ENABLED);
-    seedLiveHeartbeat(ctx);
+    await seedLiveHeartbeat(ctx);
     // A leftover per-job plist from v1 must be retired; the reserved ui
     // plist must survive.
     const agents = join(ctx.home, "Library", "LaunchAgents");
@@ -435,21 +435,23 @@ export default async function run() {}
     expect(plists).toContain("com.test.cronfish.ui.plist");
   });
 
-  test("sync with the daemon plist installed but a STALE heartbeat still stays in daemon mode", () => {
+  test("sync with the daemon plist installed but a STALE heartbeat still stays in daemon mode", async () => {
     writeJob(ctx, "hello.md", MD_ENABLED);
     // Heartbeat exists but is old — daemon mid-restart (KeepAlive gap) or
     // wedged. The installed daemon plist alone must keep sync from
     // reinstalling per-job plists (that would double-fire on recovery).
-    const db = openDb(ctx.root);
-    beatDaemonHeartbeat(db, {
+    const store = await openStore(ctx.root);
+    await store.beatDaemonHeartbeat({
       pid: 999,
       startedAt: new Date().toISOString(),
       version: "test",
     });
-    db.prepare("UPDATE cron_daemon_heartbeat SET last_tick_at = $t").run({
+    store.rawHandleForTests().prepare(
+      "UPDATE cron_daemon_heartbeat SET last_tick_at = $t",
+    ).run({
       $t: new Date(Date.now() - 60_000).toISOString(),
     });
-    db.close();
+    await store.close();
     const agents = join(ctx.home, "Library", "LaunchAgents");
     writeFileSync(join(agents, "com.test.cronfish.daemon.plist"), "<plist/>");
 
@@ -460,8 +462,8 @@ export default async function run() {}
     expect(listPlists(ctx)).not.toContain("com.test.cronfish.hello-md.plist");
   });
 
-  test("watchdog with a live daemon defers to in-daemon detection and exits 0", () => {
-    seedLiveHeartbeat(ctx);
+  test("watchdog with a live daemon defers to in-daemon detection and exits 0", async () => {
+    await seedLiveHeartbeat(ctx);
     const r = runCli(ctx, ["watchdog"]);
     expect(r.code).toBe(0);
     expect(r.out).toContain("daemon owns missed-run detection");

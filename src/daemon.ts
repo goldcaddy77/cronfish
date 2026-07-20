@@ -23,25 +23,15 @@ import {
   writeSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
-import type { Database } from "bun:sqlite";
 import {
-  beatDaemonHeartbeat,
-  claimPendingRunRequests,
-  clearRunRequestClaim,
-  expireRunRequest,
-  getDaemonHeartbeat,
-  listDueJobs,
-  listJobSyncState,
-  markDeleted,
-  openDb,
-  setJobNextRun,
-  upsertJob,
+  openStore,
+  type CronStore,
   type InvocationTrigger,
   type JobSyncStateRow,
-} from "./db.ts";
+} from "./store/index.ts";
 import { loadJob, slugFromPath, walkJobFiles } from "./jobs.ts";
 import { loadRetention } from "./config.ts";
-import { ledgerPruneTotal, pruneLedger, pruneLogs } from "./prune.ts";
+import { ledgerPruneTotal, pruneLogs } from "./prune.ts";
 import { computeNextRun } from "./next-run.ts";
 import { DEFAULT_GRACE_SECONDS, writeSentinel } from "./oneTime.ts";
 import { runWatchdog, type WatchdogDecision } from "./watchdog.ts";
@@ -89,7 +79,7 @@ export interface SpawnRequest {
 export type SpawnFn = (req: SpawnRequest) => void;
 
 export interface DaemonCtx {
-  db: Database;
+  store: CronStore;
   consumerRoot: string;
   cronDir: string;
   spawn: SpawnFn;
@@ -139,7 +129,7 @@ function warn(ctx: DaemonCtx, msg: string): void {
 // One-time jobs (run_at, no schedule) map to schedule_kind='once' with
 // next_run_at = run_at, NULL once executed_at is stamped. Files gone from
 // disk → state='deleted' (row kept forever, never runs).
-function syncFiles(ctx: DaemonCtx, now: Date): void {
+async function syncFiles(ctx: DaemonCtx, now: Date): Promise<void> {
   // strict scan: an UNREADABLE cron dir (EACCES/EIO/EMFILE — anything but
   // ENOENT) must not masquerade as "zero job files". If it did, markDeleted
   // below would tombstone EVERY job, and the next successful scan would
@@ -158,7 +148,7 @@ function syncFiles(ctx: DaemonCtx, now: Date): void {
     return;
   }
   const stored = new Map<string, JobSyncStateRow>();
-  for (const row of listJobSyncState(ctx.db)) stored.set(row.slug, row);
+  for (const row of await ctx.store.listJobSyncState()) stored.set(row.slug, row);
   const parked = parkedMap(ctx);
   const dispatchedOnce = dispatchedOnceSet(ctx);
 
@@ -206,8 +196,8 @@ function syncFiles(ctx: DaemonCtx, now: Date): void {
     try {
       if (changed) {
         const meta = loadJob(path, slug, ctx.cronDir);
-        upsertJob(ctx.db, meta, mtimeIso, sizeBytes);
-        const jobId = requireJobId(ctx.db, slug);
+        await ctx.store.upsertJob(meta, mtimeIso, sizeBytes);
+        const jobId = await requireJobId(ctx.store, slug);
         parked.delete(jobId); // an edit is the un-park signal
         dispatchedOnce.delete(jobId); // an edit resets the one-shot ledger
         let next: Date | null;
@@ -229,9 +219,9 @@ function syncFiles(ctx: DaemonCtx, now: Date): void {
               )
             : null;
         }
-        setJobNextRun(ctx.db, jobId, next ? next.toISOString() : null);
+        await ctx.store.setJobNextRun(jobId, next ? next.toISOString() : null);
       } else if (prev!.schedule_kind === "once") {
-        repairLostOnce(ctx, prev!, path, slug, now);
+        await repairLostOnce(ctx, prev!, path, slug, now);
       } else {
         // unscheduled: recompute from the stored schedule, no re-parse.
         try {
@@ -240,7 +230,7 @@ function syncFiles(ctx: DaemonCtx, now: Date): void {
             prev!.last_run_at ? new Date(prev!.last_run_at) : null,
             now,
           );
-          setJobNextRun(ctx.db, prev!.id, next ? next.toISOString() : null);
+          await ctx.store.setJobNextRun(prev!.id, next ? next.toISOString() : null);
         } catch (e) {
           // Stored schedule no longer computes (e.g. cron expr with no
           // future occurrence). Park it — one warn, then quiet until edited.
@@ -258,7 +248,7 @@ function syncFiles(ctx: DaemonCtx, now: Date): void {
     }
   }
 
-  markDeleted(ctx.db, presentSlugs);
+  await ctx.store.markDeleted(presentSlugs);
 }
 
 // The once-repair (see onceUnscheduled above). Re-parses the still-present
@@ -269,13 +259,13 @@ function syncFiles(ctx: DaemonCtx, now: Date): void {
 // cron/.errors/ sentinel so the loss is visible and park the row (any file
 // edit un-parks). All outcomes park or reschedule, so this re-parses a given
 // row at most once, not at 1 Hz.
-function repairLostOnce(
+async function repairLostOnce(
   ctx: DaemonCtx,
   prev: JobSyncStateRow,
   path: string,
   slug: string,
   now: Date,
-): void {
+): Promise<void> {
   const parked = parkedMap(ctx);
   try {
     const meta = loadJob(path, slug, ctx.cronDir);
@@ -299,7 +289,7 @@ function repairLostOnce(
       );
       return;
     }
-    setJobNextRun(ctx.db, prev.id, runAtIso);
+    await ctx.store.setJobNextRun(prev.id, runAtIso);
     warn(
       ctx,
       `sync ${slug}: lost one-time dispatch — next_run_at restored to ${runAtIso} for retry`,
@@ -313,12 +303,10 @@ function repairLostOnce(
   }
 }
 
-function requireJobId(db: Database, slug: string): number {
-  const row = db
-    .query("SELECT id FROM cron_jobs WHERE slug = $slug")
-    .get({ $slug: slug }) as { id: number } | undefined;
-  if (!row) throw new Error(`job row missing after upsert: ${slug}`);
-  return row.id;
+async function requireJobId(store: CronStore, slug: string): Promise<number> {
+  const id = await store.getJobIdBySlug(slug);
+  if (id === null) throw new Error(`job row missing after upsert: ${slug}`);
+  return id;
 }
 
 // --- 2. Dispatch due jobs ---
@@ -326,9 +314,9 @@ function requireJobId(db: Database, slug: string): number {
 // next_run is advanced BEFORE spawning (computeNextRun from now, so N missed
 // occurrences collapse to exactly one overdue run) — a spawn failure can log
 // every interval but can never hot-loop at 1 Hz.
-function dispatchDue(ctx: DaemonCtx, now: Date): void {
+async function dispatchDue(ctx: DaemonCtx, now: Date): Promise<void> {
   const parked = parkedMap(ctx);
-  for (const job of listDueJobs(ctx.db, now.toISOString())) {
+  for (const job of await ctx.store.listDueJobs(now.toISOString())) {
     // next_run is advanced BEFORE spawning — the deliberate at-most-once
     // trade-off: a crash between the advance and the spawn DROPS this slot
     // (the run simply doesn't happen and next_run points at the future).
@@ -358,7 +346,7 @@ function dispatchDue(ctx: DaemonCtx, now: Date): void {
       }
     }
     try {
-      setJobNextRun(ctx.db, job.id, nextIso);
+      await ctx.store.setJobNextRun(job.id, nextIso);
     } catch (e) {
       // DB error ≠ schedule error: leave next_run_at untouched and do NOT
       // spawn — the row stays due and the next tick retries the whole step.
@@ -411,7 +399,7 @@ function dispatchDue(ctx: DaemonCtx, now: Date): void {
         // flock, executed_at guard, and runtime grace check make a
         // duplicate or late retry harmless.
         try {
-          setJobNextRun(ctx.db, job.id, job.next_run_at);
+          await ctx.store.setJobNextRun(job.id, job.next_run_at);
           warn(
             ctx,
             `dispatch ${job.slug}: one-time next_run_at restored for retry`,
@@ -436,12 +424,12 @@ function dispatchDue(ctx: DaemonCtx, now: Date): void {
 // most-overdue one to fire this tick and push the rest out over STARTUP_JITTER_MS
 // so their catch-up runs trickle rather than stampede. The rewritten next_run_at
 // is persisted, so a re-restart mid-window can't re-form the herd.
-function jitterColdStartCatchup(ctx: DaemonCtx, now: Date): void {
+async function jitterColdStartCatchup(ctx: DaemonCtx, now: Date): Promise<void> {
   if (ctx.startupJitterApplied) return;
   ctx.startupJitterApplied = true; // strictly once, even if the checks below throw
-  if (!isColdStart(ctx, now)) return;
+  if (!(await isColdStart(ctx, now))) return;
 
-  const overdue = listDueJobs(ctx.db, now.toISOString()).filter(
+  const overdue = (await ctx.store.listDueJobs(now.toISOString())).filter(
     (j) =>
       (j.schedule_kind === "interval" || j.schedule_kind === "cron") &&
       now.getTime() - Date.parse(j.next_run_at) > CATCHUP_GRACE_MS,
@@ -459,8 +447,7 @@ function jitterColdStartCatchup(ctx: DaemonCtx, now: Date): void {
   const n = overdue.length;
   for (let i = 1; i < n; i++) {
     const delayMs = Math.round((i * STARTUP_JITTER_MS) / n);
-    setJobNextRun(
-      ctx.db,
+    await ctx.store.setJobNextRun(
       overdue[i]!.id,
       new Date(now.getTime() + delayMs).toISOString(),
     );
@@ -476,10 +463,10 @@ function jitterColdStartCatchup(ctx: DaemonCtx, now: Date): void {
 // (a restore carrying an ancient heartbeat, or genuinely long downtime). Our
 // own in-process heartbeat never counts — but on the first tick it hasn't been
 // beaten yet, so the row we read is always the prior instance's or absent.
-function isColdStart(ctx: DaemonCtx, now: Date): boolean {
-  let hb: ReturnType<typeof getDaemonHeartbeat>;
+async function isColdStart(ctx: DaemonCtx, now: Date): Promise<boolean> {
+  let hb: Awaited<ReturnType<CronStore["getDaemonHeartbeat"]>>;
   try {
-    hb = getDaemonHeartbeat(ctx.db);
+    hb = await ctx.store.getDaemonHeartbeat();
   } catch {
     return false; // heartbeat unreadable → don't gamble on staggering
   }
@@ -495,15 +482,15 @@ function isColdStart(ctx: DaemonCtx, now: Date): boolean {
 // expired and never spawned). A spawn FAILURE releases the claim so the next
 // tick retries; the runner links the invocation row back via
 // CRONFISH_RUN_REQUEST_ID (it owns the invocation's creation).
-function drainRunRequests(ctx: DaemonCtx, now: Date): void {
-  for (const req of claimPendingRunRequests(ctx.db, now.toISOString())) {
+async function drainRunRequests(ctx: DaemonCtx, now: Date): Promise<void> {
+  for (const req of await ctx.store.claimPendingRunRequests(now.toISOString())) {
     try {
       if (!req.file_path) {
         // Terminal: without the expired_at stamp this claimed request would
         // look in-flight forever (picked_up_at set, no invocation ever).
         warn(ctx, `run request #${req.id} (${req.slug}): job file gone — expired`);
         try {
-          expireRunRequest(ctx.db, req.id);
+          await ctx.store.expireRunRequest(req.id);
         } catch (e2) {
           warn(
             ctx,
@@ -521,7 +508,7 @@ function drainRunRequests(ctx: DaemonCtx, now: Date): void {
     } catch (e) {
       warn(ctx, `run request #${req.id} (${req.slug}): ${(e as Error).message}`);
       try {
-        clearRunRequestClaim(ctx.db, req.id);
+        await ctx.store.clearRunRequestClaim(req.id);
       } catch (e2) {
         warn(
           ctx,
@@ -550,7 +537,7 @@ export async function checkMissedRuns(
   const decisions = await runWatchdog({
     consumerRoot: ctx.consumerRoot,
     now,
-    db: ctx.db,
+    store: ctx.store,
     liveSince: new Date(ctx.startedAt),
   });
   for (const d of decisions) {
@@ -574,7 +561,7 @@ export async function checkMissedRuns(
 // clock, vs counting 86 400 ticks whose count drifts across restarts). No
 // retention configured → no deletion, ever. The day is stamped BEFORE the
 // work so a throwing prune can't retry at 1 Hz.
-export function runHousekeeping(ctx: DaemonCtx, now: Date): void {
+export async function runHousekeeping(ctx: DaemonCtx, now: Date): Promise<void> {
   const day = now.toISOString().slice(0, 10);
   if (ctx.lastHousekeepingDay === day) return;
   ctx.lastHousekeepingDay = day;
@@ -586,8 +573,7 @@ export function runHousekeeping(ctx: DaemonCtx, now: Date): void {
     perSlug: retention.perSlug,
     nowMs: now.getTime(),
   });
-  const ledger = pruneLedger({
-    db: ctx.db,
+  const ledger = await ctx.store.pruneLedger({
     global: retention.global,
     perSlug: retention.perSlug,
     nowMs: now.getTime(),
@@ -602,34 +588,34 @@ export function runHousekeeping(ctx: DaemonCtx, now: Date): void {
 
 // One full tick. Every phase is fenced — an error in one job's sync or
 // dispatch logs to stderr and the loop keeps going.
-export function tickOnce(ctx: DaemonCtx, now: Date): void {
+export async function tickOnce(ctx: DaemonCtx, now: Date): Promise<void> {
   try {
-    syncFiles(ctx, now);
+    await syncFiles(ctx, now);
   } catch (e) {
     warn(ctx, `file sync: ${(e as Error).message}`);
   }
   try {
-    jitterColdStartCatchup(ctx, now);
+    await jitterColdStartCatchup(ctx, now);
   } catch (e) {
     warn(ctx, `startup jitter: ${(e as Error).message}`);
   }
   try {
-    dispatchDue(ctx, now);
+    await dispatchDue(ctx, now);
   } catch (e) {
     warn(ctx, `dispatch: ${(e as Error).message}`);
   }
   try {
-    drainRunRequests(ctx, now);
+    await drainRunRequests(ctx, now);
   } catch (e) {
     warn(ctx, `run requests: ${(e as Error).message}`);
   }
   try {
-    runHousekeeping(ctx, now);
+    await runHousekeeping(ctx, now);
   } catch (e) {
     warn(ctx, `housekeeping: ${(e as Error).message}`);
   }
   try {
-    beatDaemonHeartbeat(ctx.db, {
+    await ctx.store.beatDaemonHeartbeat({
       pid: ctx.pid,
       startedAt: ctx.startedAt,
       version: ctx.version,
@@ -722,16 +708,16 @@ export type ExclusivityResult =
   | { ok: true }
   | { ok: false; reason: string };
 
-export function acquireDaemonExclusivity(
-  db: Database,
+export async function acquireDaemonExclusivity(
+  store: CronStore,
   consumerRoot: string,
   pid: number,
   now: Date = new Date(),
-): ExclusivityResult {
+): Promise<ExclusivityResult> {
   // 1. Heartbeat check — a fresh tick from another LIVE pid means a daemon
   // is already running (stale heartbeats and dead pids don't block).
   try {
-    const hb = getDaemonHeartbeat(db);
+    const hb = await store.getDaemonHeartbeat();
     if (
       hb &&
       hb.pid !== pid &&
@@ -787,9 +773,9 @@ export function acquireDaemonExclusivity(
       // respawn forever. Cross-check the heartbeat: only a holder that is
       // actually ticking blocks startup. A young lock also blocks — a
       // just-started daemon holds the lock briefly before its first beat.
-      let hb: ReturnType<typeof getDaemonHeartbeat> = null;
+      let hb: Awaited<ReturnType<CronStore["getDaemonHeartbeat"]>> = null;
       try {
-        hb = getDaemonHeartbeat(db);
+        hb = await store.getDaemonHeartbeat();
       } catch {}
       const holderTicking =
         !!hb &&
@@ -841,17 +827,17 @@ export function releaseDaemonLock(consumerRoot: string, pid: number): void {
 // running (they hold their own locks and finish their own ledger rows).
 export async function runDaemon(opts: { consumerRoot: string }): Promise<void> {
   const consumerRoot = opts.consumerRoot;
-  const db = openDb(consumerRoot);
-  const excl = acquireDaemonExclusivity(db, consumerRoot, process.pid);
+  const store = await openStore(consumerRoot);
+  const excl = await acquireDaemonExclusivity(store, consumerRoot, process.pid);
   if (!excl.ok) {
     console.error(`[daemon] refusing to start: ${excl.reason}`);
     try {
-      db.close();
+      await store.close();
     } catch {}
     process.exit(1);
   }
   const ctx: DaemonCtx = {
-    db,
+    store,
     consumerRoot,
     cronDir: join(consumerRoot, "cron"),
     spawn: makeRunnerSpawn(consumerRoot),
@@ -882,7 +868,10 @@ export async function runDaemon(opts: { consumerRoot: string }): Promise<void> {
   let missedCheckInFlight = false;
   while (running) {
     const t0 = Date.now();
-    tickOnce(ctx, new Date());
+    // MUST await: today the tick runs to completion before the next sleep,
+    // serializing every ledger write on one connection. A fire-and-forget tick
+    // would let two ticks interleave and corrupt scheduler state.
+    await tickOnce(ctx, new Date());
     if (++ticks % MISSED_CHECK_EVERY_TICKS === 0 && !missedCheckInFlight) {
       missedCheckInFlight = true;
       checkMissedRuns(ctx, new Date())
@@ -901,6 +890,6 @@ export async function runDaemon(opts: { consumerRoot: string }): Promise<void> {
   }
   releaseDaemonLock(consumerRoot, process.pid);
   try {
-    db.close();
+    await store.close();
   } catch {}
 }

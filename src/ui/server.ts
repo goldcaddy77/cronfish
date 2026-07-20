@@ -5,11 +5,7 @@
 
 import { existsSync, statSync } from "node:fs";
 import { extname, join, normalize, resolve } from "node:path";
-import {
-  getDaemonHeartbeat,
-  openDb,
-  type DaemonHeartbeatRow,
-} from "../db.ts";
+import { openStore, type DaemonHeartbeatRow } from "../store/index.ts";
 import { dispatchSchedule } from "../schedule.ts";
 
 export interface UiServerOptions {
@@ -204,13 +200,10 @@ async function serveLog(
   invocationId: number,
   rangeHeader: string | null,
 ): Promise<Response> {
-  const db = openDb(consumerRoot);
+  const store = await openStore(consumerRoot);
   try {
-    const inv = db
-      .query("SELECT log_path FROM cron_invocations WHERE id = $id")
-      .get({ $id: invocationId }) as { log_path: string } | undefined;
-    if (!inv) return notFound("invocation not found");
-    const path = inv.log_path;
+    const path = await store.getInvocationLogPath(invocationId);
+    if (path === null) return notFound("invocation not found");
     if (!existsSync(path)) {
       return new Response("[log file missing]\n", {
         status: 200,
@@ -243,82 +236,37 @@ async function serveLog(
       },
     });
   } finally {
-    db.close();
+    await store.close();
   }
 }
 
-function listJobs(consumerRoot: string): unknown {
-  const db = openDb(consumerRoot);
+async function listJobs(consumerRoot: string): Promise<unknown> {
+  const store = await openStore(consumerRoot);
   try {
-    const jobs = db
-      .query<
-        JobRow & {
-          last_status: string | null;
-          last_started_at: string | null;
-          last_finished_at: string | null;
-          last_exit_code: number | null;
-          last_duration_ms: number | null;
-          last_invocation_id: number | null;
-        },
-        []
-      >(
-        `
-        SELECT j.*,
-               last.status         AS last_status,
-               last.started_at     AS last_started_at,
-               last.finished_at    AS last_finished_at,
-               last.exit_code      AS last_exit_code,
-               last.id             AS last_invocation_id,
-               CASE
-                 WHEN last.finished_at IS NULL THEN NULL
-                 ELSE CAST(
-                   (julianday(last.finished_at) - julianday(last.started_at)) * 86400000 AS INTEGER
-                 )
-               END AS last_duration_ms
-        FROM cron_jobs j
-        LEFT JOIN cron_invocations last
-          ON last.id = (
-            SELECT id FROM cron_invocations
-            WHERE job_id = j.id
-            ORDER BY started_at DESC
-            LIMIT 1
-          )
-        ORDER BY j.deleted_at IS NOT NULL, j.slug
-      `,
-      )
-      .all();
+    const jobs = await store.listJobsWithLastInvocation();
     return jobs.map((j) => ({
       ...j,
       filename: filenameFromSlug(j.slug),
       next_run: jobNextRun(j, j.last_started_at),
     }));
   } finally {
-    db.close();
+    await store.close();
   }
 }
 
-function getJob(consumerRoot: string, slug: string): unknown {
-  const db = openDb(consumerRoot);
+async function getJob(consumerRoot: string, slug: string): Promise<unknown> {
+  const store = await openStore(consumerRoot);
   try {
-    const job = db
-      .query<JobRow, [string]>("SELECT * FROM cron_jobs WHERE slug = ?")
-      .get(slug);
+    const job = await store.getJobBySlug(slug);
     if (!job) return null;
-    const lastInv = db
-      .query<{ started_at: string | null }, [string]>(
-        `SELECT i.started_at FROM cron_invocations i
-         JOIN cron_jobs j ON j.id = i.job_id
-         WHERE j.slug = ?
-         ORDER BY i.started_at DESC LIMIT 1`,
-      )
-      .get(slug);
+    const lastStartedAt = await store.getLastInvocationStartedAt(slug);
     return {
       ...job,
       filename: filenameFromSlug(job.slug),
-      next_run: jobNextRun(job, lastInv?.started_at ?? null),
+      next_run: jobNextRun(job, lastStartedAt),
     };
   } finally {
-    db.close();
+    await store.close();
   }
 }
 
@@ -332,91 +280,43 @@ function stripLogPath<T extends { log_path?: string }>(row: T): Omit<T, "log_pat
   return rest;
 }
 
-function listInvocations(
+async function listInvocations(
   consumerRoot: string,
   slug: string,
   limit: number,
-): unknown {
-  const db = openDb(consumerRoot);
+): Promise<unknown> {
+  const store = await openStore(consumerRoot);
   try {
-    const rows = db
-      .query<InvocationRow & { duration_ms: number | null }, [string, number]>(
-        `
-        SELECT i.*,
-          CASE
-            WHEN i.finished_at IS NULL THEN NULL
-            ELSE CAST(
-              (julianday(i.finished_at) - julianday(i.started_at)) * 86400000 AS INTEGER
-            )
-          END AS duration_ms
-        FROM cron_invocations i
-        JOIN cron_jobs j ON j.id = i.job_id
-        WHERE j.slug = ?
-        ORDER BY i.started_at DESC
-        LIMIT ?
-      `,
-      )
-      .all(slug, limit);
+    const rows = await store.listInvocationsForSlug(slug, limit);
     return rows.map(stripLogPath);
   } finally {
-    db.close();
+    await store.close();
   }
 }
 
-function listAllInvocations(consumerRoot: string, limit: number): unknown {
-  const db = openDb(consumerRoot);
+async function listAllInvocations(
+  consumerRoot: string,
+  limit: number,
+): Promise<unknown> {
+  const store = await openStore(consumerRoot);
   try {
-    const rows = db
-      .query<
-        InvocationRow & { slug: string; duration_ms: number | null },
-        [number]
-      >(
-        `
-        SELECT i.*, j.slug AS slug,
-          CASE
-            WHEN i.finished_at IS NULL THEN NULL
-            ELSE CAST(
-              (julianday(i.finished_at) - julianday(i.started_at)) * 86400000 AS INTEGER
-            )
-          END AS duration_ms
-        FROM cron_invocations i
-        JOIN cron_jobs j ON j.id = i.job_id
-        ORDER BY i.started_at DESC
-        LIMIT ?
-      `,
-      )
-      .all(limit);
+    const rows = await store.listAllInvocations(limit);
     return rows.map(stripLogPath);
   } finally {
-    db.close();
+    await store.close();
   }
 }
 
-function getInvocation(consumerRoot: string, id: number): unknown {
-  const db = openDb(consumerRoot);
+async function getInvocation(
+  consumerRoot: string,
+  id: number,
+): Promise<unknown> {
+  const store = await openStore(consumerRoot);
   try {
-    const row = db
-      .query<
-        InvocationRow & { slug: string; duration_ms: number | null },
-        [number]
-      >(
-        `
-        SELECT i.*, j.slug AS slug,
-          CASE
-            WHEN i.finished_at IS NULL THEN NULL
-            ELSE CAST(
-              (julianday(i.finished_at) - julianday(i.started_at)) * 86400000 AS INTEGER
-            )
-          END AS duration_ms
-        FROM cron_invocations i
-        JOIN cron_jobs j ON j.id = i.job_id
-        WHERE i.id = ?
-      `,
-      )
-      .get(id);
+    const row = await store.getInvocationWithDuration(id);
     return row ? stripLogPath(row) : null;
   } finally {
-    db.close();
+    await store.close();
   }
 }
 
@@ -425,20 +325,20 @@ function getInvocation(consumerRoot: string, id: number): unknown {
 // dead process).
 const DAEMON_FRESH_MS = 10_000;
 
-export function daemonStatus(consumerRoot: string): {
+export async function daemonStatus(consumerRoot: string): Promise<{
   live: boolean;
   heartbeat: DaemonHeartbeatRow | null;
   now: string;
-} {
-  const db = openDb(consumerRoot);
+}> {
+  const store = await openStore(consumerRoot);
   try {
-    const heartbeat = getDaemonHeartbeat(db);
+    const heartbeat = await store.getDaemonHeartbeat();
     const live =
       !!heartbeat &&
       Date.now() - Date.parse(heartbeat.last_tick_at) <= DAEMON_FRESH_MS;
     return { live, heartbeat, now: new Date().toISOString() };
   } finally {
-    db.close();
+    await store.close();
   }
 }
 
@@ -453,17 +353,17 @@ export async function startUiServer(opts: UiServerOptions): Promise<string> {
 
       // --- API ---
       if (pathname === "/api/daemon" && req.method === "GET") {
-        return json(daemonStatus(opts.consumerRoot));
+        return json(await daemonStatus(opts.consumerRoot));
       }
 
       if (pathname === "/api/jobs" && req.method === "GET") {
-        return json(listJobs(opts.consumerRoot));
+        return json(await listJobs(opts.consumerRoot));
       }
 
       const jobDetail = pathname.match(/^\/api\/jobs\/([^/]+)$/);
       if (jobDetail && req.method === "GET") {
         const slug = decodeURIComponent(jobDetail[1]);
-        const row = getJob(opts.consumerRoot, slug);
+        const row = await getJob(opts.consumerRoot, slug);
         return row ? json(row) : notFound("job not found");
       }
 
@@ -475,7 +375,7 @@ export async function startUiServer(opts: UiServerOptions): Promise<string> {
         if (Number.isNaN(limit) || limit <= 0 || limit > 1000) {
           return badRequest("limit must be 1..1000");
         }
-        return json(listInvocations(opts.consumerRoot, slug, limit));
+        return json(await listInvocations(opts.consumerRoot, slug, limit));
       }
 
       if (pathname === "/api/invocations" && req.method === "GET") {
@@ -484,13 +384,13 @@ export async function startUiServer(opts: UiServerOptions): Promise<string> {
         if (Number.isNaN(limit) || limit <= 0 || limit > 1000) {
           return badRequest("limit must be 1..1000");
         }
-        return json(listAllInvocations(opts.consumerRoot, limit));
+        return json(await listAllInvocations(opts.consumerRoot, limit));
       }
 
       const invDetail = pathname.match(/^\/api\/invocations\/(\d+)$/);
       if (invDetail && req.method === "GET") {
         const id = parseInt(invDetail[1], 10);
-        const row = getInvocation(opts.consumerRoot, id);
+        const row = await getInvocation(opts.consumerRoot, id);
         return row ? json(row) : notFound("invocation not found");
       }
 

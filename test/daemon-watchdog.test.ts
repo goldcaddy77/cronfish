@@ -8,12 +8,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { checkMissedRuns, type DaemonCtx } from "../src/daemon.ts";
-import {
-  getJobIdBySlug,
-  openDb,
-  startInvocation,
-  upsertJob,
-} from "../src/db.ts";
+import { openStore } from "../src/store/index.ts";
 
 let root: string;
 let sentinel: string;
@@ -25,28 +20,31 @@ function minutesAgo(m: number): Date {
 
 // A 5m job whose last success is 30 minutes old — well past the 10-minute
 // grace floor. expected next fire = lastOk + 5m = 25 minutes ago.
-function seedOverdueJob(): void {
+async function seedOverdueJob(): Promise<void> {
   writeFileSync(
     join(root, "cron", "demo.md"),
     `---\nschedule: "5m"\nenabled: true\n---\nhi`,
   );
-  const db = ctx.db;
-  upsertJob(db, {
+  const store = ctx.store;
+  await store.upsertJob({
     slug: "demo-md",
     path: join(root, "cron", "demo.md"),
     kind: "md",
     enabled: true,
     schedule: "5m",
   });
-  const jobId = getJobIdBySlug(db, "demo-md")!;
-  const inv = startInvocation(db, jobId, "schedule", "/log/1");
+  const jobId = (await store.getJobIdBySlug("demo-md"))!;
+  const inv = await store.startInvocation(jobId, "schedule", "/log/1");
   const lastOk = minutesAgo(30).toISOString();
-  db.prepare(
-    "UPDATE cron_invocations SET started_at = $s, finished_at = $s, status = 'ok', exit_code = 0 WHERE id = $id",
-  ).run({ $s: lastOk, $id: inv });
+  store
+    .rawHandleForTests()
+    .prepare(
+      "UPDATE cron_invocations SET started_at = $s, finished_at = $s, status = 'ok', exit_code = 0 WHERE id = $id",
+    )
+    .run({ $s: lastOk, $id: inv });
 }
 
-beforeEach(() => {
+beforeEach(async () => {
   root = mkdtempSync(join(tmpdir(), "cronfish-dwd-"));
   mkdirSync(join(root, "cron"), { recursive: true });
   sentinel = join(root, "sentinel.log");
@@ -59,9 +57,9 @@ beforeEach(() => {
       },
     }),
   );
-  const db = openDb(root);
+  const store = await openStore(root);
   ctx = {
-    db,
+    store,
     consumerRoot: root,
     cronDir: join(root, "cron"),
     spawn: () => {},
@@ -72,14 +70,14 @@ beforeEach(() => {
   };
 });
 
-afterEach(() => {
-  ctx.db.close();
+afterEach(async () => {
+  await ctx.store.close();
   rmSync(root, { recursive: true, force: true });
 });
 
 describe("daemon checkMissedRuns", () => {
   test("daemon live through the window → alert fired once, deduped after", async () => {
-    seedOverdueJob();
+    await seedOverdueJob();
 
     const first = await checkMissedRuns(ctx, new Date());
     expect(first.find((d) => d.slug === "demo-md")?.outcome).toBe("fired");
@@ -94,7 +92,7 @@ describe("daemon checkMissedRuns", () => {
   });
 
   test("expected fire fell in a daemon-down window → no false alert (inside the post-restart grace)", async () => {
-    seedOverdueJob();
+    await seedOverdueJob();
     // Daemon (re)started 2 minutes ago; the miss (25m ago) predates it —
     // catch-up dispatch gets a grace window (10m for a 5m job) from startup
     // to make the run happen, so the watchdog stays quiet for now.
@@ -108,7 +106,7 @@ describe("daemon checkMissedRuns", () => {
   });
 
   test("pre-restart miss still unresolved past the post-restart grace → alert fires (restarts delay, never mute)", async () => {
-    seedOverdueJob();
+    await seedOverdueJob();
     // Miss (25m ago) predates liveSince (15m ago), but the daemon has now
     // been live for 15m — past the 10m grace — and the run still never
     // happened. A restart must not permanently mute this fault.

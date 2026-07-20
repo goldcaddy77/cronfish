@@ -20,18 +20,7 @@ import {
   type DaemonCtx,
   type SpawnRequest,
 } from "../src/daemon.ts";
-import {
-  beatDaemonHeartbeat,
-  finishInvocation,
-  getDaemonHeartbeat,
-  getJobIdBySlug,
-  getRunRequest,
-  insertRunRequest,
-  listRunHistory,
-  migrate,
-  setJobLastRun,
-  startInvocation,
-} from "../src/db.ts";
+import { SqliteStore } from "../src/store/index.ts";
 
 const T0 = new Date("2026-07-17T12:00:00.000Z");
 
@@ -43,6 +32,7 @@ interface Harness {
   ctx: DaemonCtx;
   spawns: SpawnRequest[];
   db: Database;
+  store: SqliteStore;
   root: string;
   cronDir: string;
 }
@@ -70,21 +60,23 @@ function mdJob(schedule: string, extra = ""): string {
   return `---\nschedule: "${schedule}"\n${extra}---\n\nSay hello.\n`;
 }
 
-beforeEach(() => {
+beforeEach(async () => {
   const root = mkdtempSync(join(tmpdir(), "cronfish-daemon-"));
   const cronDir = join(root, "cron");
   mkdirSync(cronDir, { recursive: true });
   const db = new Database(":memory:");
   db.exec("PRAGMA foreign_keys = ON");
-  migrate(db);
+  const store = new SqliteStore(db);
+  await store.migrate();
   const spawns: SpawnRequest[] = [];
   harness = {
     root,
     cronDir,
     db,
+    store,
     spawns,
     ctx: {
-      db,
+      store,
       consumerRoot: root,
       cronDir,
       spawn: (req) => spawns.push(req),
@@ -102,9 +94,9 @@ afterEach(() => {
 });
 
 describe("daemon tickOnce — dispatch", () => {
-  test("first sight of a new job dispatches immediately and advances next_run", () => {
+  test("first sight of a new job dispatches immediately and advances next_run", async () => {
     writeJob("hello.md", mdJob("5m"));
-    tickOnce(harness.ctx, T0);
+    await tickOnce(harness.ctx, T0);
     expect(harness.spawns).toHaveLength(1);
     const s = harness.spawns[0]!;
     expect(s.slug).toBe("hello-md");
@@ -116,27 +108,27 @@ describe("daemon tickOnce — dispatch", () => {
     );
   });
 
-  test("a not-yet-due job does not dispatch", () => {
+  test("a not-yet-due job does not dispatch", async () => {
     writeJob("hello.md", mdJob("5m"));
-    tickOnce(harness.ctx, T0);
-    tickOnce(harness.ctx, at(0, 1));
-    tickOnce(harness.ctx, at(4, 59));
+    await tickOnce(harness.ctx, T0);
+    await tickOnce(harness.ctx, at(0, 1));
+    await tickOnce(harness.ctx, at(4, 59));
     expect(harness.spawns).toHaveLength(1);
   });
 
-  test("due within the grace tick stays trigger=schedule", () => {
+  test("due within the grace tick stays trigger=schedule", async () => {
     writeJob("hello.md", mdJob("5m"));
-    tickOnce(harness.ctx, T0);
-    tickOnce(harness.ctx, at(5, 30)); // 30s late < 60s grace
+    await tickOnce(harness.ctx, T0);
+    await tickOnce(harness.ctx, at(5, 30)); // 30s late < 60s grace
     expect(harness.spawns).toHaveLength(2);
     expect(harness.spawns[1]!.trigger).toBe("schedule");
   });
 
-  test("catch-up coalescing: 3 missed intervals collapse to exactly ONE catchup run", () => {
+  test("catch-up coalescing: 3 missed intervals collapse to exactly ONE catchup run", async () => {
     writeJob("hello.md", mdJob("5m"));
-    tickOnce(harness.ctx, T0); // dispatch #1, next_run = T0+5m
+    await tickOnce(harness.ctx, T0); // dispatch #1, next_run = T0+5m
     // Daemon "down" through T0+5m, +10m, +15m; back at T0+16m.
-    tickOnce(harness.ctx, at(16));
+    await tickOnce(harness.ctx, at(16));
     expect(harness.spawns).toHaveLength(2);
     const s = harness.spawns[1]!;
     expect(s.trigger).toBe("catchup");
@@ -146,22 +138,22 @@ describe("daemon tickOnce — dispatch", () => {
       at(21).toISOString(),
     );
     // And the very next tick has nothing to do.
-    tickOnce(harness.ctx, at(16, 1));
+    await tickOnce(harness.ctx, at(16, 1));
     expect(harness.spawns).toHaveLength(2);
   });
 });
 
 describe("daemon tickOnce — file sync", () => {
-  test("schedule change picked up via mtime: next_run = max(now, last_run + new interval)", () => {
+  test("schedule change picked up via mtime: next_run = max(now, last_run + new interval)", async () => {
     writeJob("hello.md", mdJob("5m"));
-    tickOnce(harness.ctx, T0);
+    await tickOnce(harness.ctx, T0);
     // Simulate the runner finishing the T0 run.
-    const jobId = getJobIdBySlug(harness.db, "hello-md")!;
-    setJobLastRun(harness.db, jobId, T0.toISOString(), "ok");
+    const jobId = (await harness.store.getJobIdBySlug("hello-md"))!;
+    await harness.store.setJobLastRun(jobId, T0.toISOString(), "ok");
 
     // 5m → 1h with a 2-min-old last run lands 58 minutes out.
     writeJob("hello.md", mdJob("1h"));
-    tickOnce(harness.ctx, at(2));
+    await tickOnce(harness.ctx, at(2));
     expect(jobRow(harness.db, "hello-md").next_run_at).toBe(
       at(60).toISOString(),
     );
@@ -170,7 +162,7 @@ describe("daemon tickOnce — file sync", () => {
     // 1h → 1m with the same last run: overdue → clamped to now → fires
     // on this very tick (sync runs before dispatch).
     writeJob("hello.md", mdJob("1m"));
-    tickOnce(harness.ctx, at(3));
+    await tickOnce(harness.ctx, at(3));
     expect(harness.spawns).toHaveLength(2);
     expect(harness.spawns[1]!.trigger).toBe("schedule"); // clamped-to-now, not late
     expect(jobRow(harness.db, "hello-md").next_run_at).toBe(
@@ -178,9 +170,9 @@ describe("daemon tickOnce — file sync", () => {
     );
   });
 
-  test("untouched files are not re-parsed (size+mtime scan)", () => {
+  test("untouched files are not re-parsed (size+mtime scan)", async () => {
     const path = writeJob("hello.md", mdJob("5m"));
-    tickOnce(harness.ctx, T0);
+    await tickOnce(harness.ctx, T0);
     // Corrupt the file WITHOUT changing its mtime OR size — a size+mtime
     // keyed scan must never read it, so the schedule stays intact.
     const original = readFileSync(path, "utf-8");
@@ -189,97 +181,101 @@ describe("daemon tickOnce — file sync", () => {
     writeFileSync(path, corrupted, "utf-8");
     const t = new Date(mtimeSeq * 1_000); // same stamp as writeJob set
     utimesSync(path, t, t);
-    tickOnce(harness.ctx, at(0, 1));
+    await tickOnce(harness.ctx, at(0, 1));
     expect(jobRow(harness.db, "hello-md").next_run_at).toBe(
       at(5).toISOString(),
     );
   });
 
-  test("mtime-preserving replacement (cp -p) is detected via size", () => {
+  test("mtime-preserving replacement (cp -p) is detected via size", async () => {
     const path = writeJob("hello.md", mdJob("5m"));
-    tickOnce(harness.ctx, T0);
+    await tickOnce(harness.ctx, T0);
     // Replace with a different-length file but the SAME mtime — the size
     // half of the change key must pick it up.
     writeFileSync(path, mdJob("1h", "description: swapped in\n"), "utf-8");
     const t = new Date(mtimeSeq * 1_000);
     utimesSync(path, t, t);
-    tickOnce(harness.ctx, at(0, 1));
+    await tickOnce(harness.ctx, at(0, 1));
     const row = jobRow(harness.db, "hello-md");
     expect(row.schedule).toBe("1h");
     expect(row.description).toBe("swapped in");
   });
 
-  test("disabled job never dispatches", () => {
+  test("disabled job never dispatches", async () => {
     writeJob("hello.md", mdJob("5m", "enabled: false\n"));
-    tickOnce(harness.ctx, T0);
+    await tickOnce(harness.ctx, T0);
     expect(harness.spawns).toHaveLength(0);
     const row = jobRow(harness.db, "hello-md");
     expect(row.state).toBe("disabled");
     expect(row.next_run_at).toBeNull();
   });
 
-  test("disabling an active job stops future dispatches", () => {
+  test("disabling an active job stops future dispatches", async () => {
     writeJob("hello.md", mdJob("5m"));
-    tickOnce(harness.ctx, T0);
+    await tickOnce(harness.ctx, T0);
     writeJob("hello.md", mdJob("5m", "enabled: false\n"));
-    tickOnce(harness.ctx, at(10)); // long past due
+    await tickOnce(harness.ctx, at(10)); // long past due
     expect(harness.spawns).toHaveLength(1);
     expect(jobRow(harness.db, "hello-md").state).toBe("disabled");
   });
 
-  test("deleted file → state=deleted, never dispatches, history retained", () => {
+  test("deleted file → state=deleted, never dispatches, history retained", async () => {
     const path = writeJob("hello.md", mdJob("5m"));
-    tickOnce(harness.ctx, T0);
+    await tickOnce(harness.ctx, T0);
     // Record a finished run so there is history to retain.
-    const jobId = getJobIdBySlug(harness.db, "hello-md")!;
-    const inv = startInvocation(harness.db, jobId, "schedule", "/tmp/x.log");
-    finishInvocation(harness.db, inv, "ok", 0);
+    const jobId = (await harness.store.getJobIdBySlug("hello-md"))!;
+    const inv = await harness.store.startInvocation(
+      jobId,
+      "schedule",
+      "/tmp/x.log",
+    );
+    await harness.store.finishInvocation(inv, "ok", 0);
 
     rmSync(path);
-    tickOnce(harness.ctx, at(0, 1));
+    await tickOnce(harness.ctx, at(0, 1));
     expect(jobRow(harness.db, "hello-md").state).toBe("deleted");
-    tickOnce(harness.ctx, at(10)); // long past the old next_run
+    await tickOnce(harness.ctx, at(10)); // long past the old next_run
     expect(harness.spawns).toHaveLength(1);
-    const history = listRunHistory(harness.db, { slug: "hello-md" });
+    const history = await harness.store.listRunHistory({ slug: "hello-md" });
     expect(history).toHaveLength(1);
     expect(history[0]!.status).toBe("ok");
   });
 
-  test("a broken job file logs and never kills the tick", () => {
+  test("a broken job file logs and never kills the tick", async () => {
     writeJob("bad.md", "---\nschedule: [nope\n---\n");
     writeJob("good.md", mdJob("5m"));
-    expect(() => tickOnce(harness.ctx, T0)).not.toThrow();
+    await expect(tickOnce(harness.ctx, T0)).resolves.toBeUndefined();
     expect(harness.spawns).toHaveLength(1);
     expect(harness.spawns[0]!.slug).toBe("good-md");
   });
 
-  test("manual-schedule job syncs but never dispatches", () => {
+  test("manual-schedule job syncs but never dispatches", async () => {
     writeJob("byhand.md", mdJob("manual"));
-    tickOnce(harness.ctx, T0);
-    tickOnce(harness.ctx, at(60));
+    await tickOnce(harness.ctx, T0);
+    await tickOnce(harness.ctx, at(60));
     expect(harness.spawns).toHaveLength(0);
     expect(jobRow(harness.db, "byhand-md").next_run_at).toBeNull();
   });
 });
 
 describe("daemon tickOnce — run requests", () => {
-  test("drains a pending request exactly once, trigger=manual, request id passed through", () => {
+  test("drains a pending request exactly once, trigger=manual, request id passed through", async () => {
     writeJob("hello.md", mdJob("1h"));
-    tickOnce(harness.ctx, T0); // sync + immediate first run
+    await tickOnce(harness.ctx, T0); // sync + immediate first run
     expect(harness.spawns).toHaveLength(1);
 
-    const jobId = getJobIdBySlug(harness.db, "hello-md")!;
-    const reqId = insertRunRequest(harness.db, jobId);
-    tickOnce(harness.ctx, at(0, 1));
+    const jobId = (await harness.store.getJobIdBySlug("hello-md"))!;
+    const reqId = await harness.store.insertRunRequest(jobId);
+    await tickOnce(harness.ctx, at(0, 1));
     expect(harness.spawns).toHaveLength(2);
     const s = harness.spawns[1]!;
     expect(s.trigger).toBe("manual");
     expect(s.runRequestId).toBe(reqId);
     expect(s.jobPath).toBe(join(harness.cronDir, "hello.md"));
-    expect(getRunRequest(harness.db, reqId)!.picked_up_at).not.toBeNull();
+    expect((await harness.store.getRunRequest(reqId))!.picked_up_at).not.toBeNull();
 
     // Claimed — a later tick must not re-spawn it.
-    tickOnce(harness.ctx, at(0, 2));
+    await tickOnce(harness.ctx, at(0, 2));
     expect(harness.spawns).toHaveLength(2);
   });
 });
@@ -294,15 +290,15 @@ describe("daemon tickOnce — one-time jobs", () => {
     return writeJob(join("one-time", name), content);
   }
 
-  test("future run_at → schedule_kind=once, next_run=run_at, dispatched exactly once", () => {
+  test("future run_at → schedule_kind=once, next_run=run_at, dispatched exactly once", async () => {
     writeOneTime("boom.md", oneTimeJob(at(2).toISOString()));
-    tickOnce(harness.ctx, T0);
+    await tickOnce(harness.ctx, T0);
     const row = jobRow(harness.db, "one-time/boom-md");
     expect(row.schedule_kind).toBe("once");
     expect(row.next_run_at).toBe(at(2).toISOString());
     expect(harness.spawns).toHaveLength(0); // not due yet
 
-    tickOnce(harness.ctx, at(2));
+    await tickOnce(harness.ctx, at(2));
     expect(harness.spawns).toHaveLength(1);
     const s = harness.spawns[0]!;
     expect(s.slug).toBe("one-time/boom-md");
@@ -311,37 +307,37 @@ describe("daemon tickOnce — one-time jobs", () => {
     // Never recurs: parked at NULL immediately after dispatch.
     expect(jobRow(harness.db, "one-time/boom-md").next_run_at).toBeNull();
 
-    tickOnce(harness.ctx, at(3));
-    tickOnce(harness.ctx, at(60));
+    await tickOnce(harness.ctx, at(3));
+    await tickOnce(harness.ctx, at(60));
     expect(harness.spawns).toHaveLength(1);
   });
 
-  test("run_at missed across daemon downtime → single catchup dispatch", () => {
+  test("run_at missed across daemon downtime → single catchup dispatch", async () => {
     writeOneTime("late.md", oneTimeJob(at(1).toISOString()));
-    tickOnce(harness.ctx, T0);
+    await tickOnce(harness.ctx, T0);
     // Daemon down through at(1); back at at(10).
-    tickOnce(harness.ctx, at(10));
+    await tickOnce(harness.ctx, at(10));
     expect(harness.spawns).toHaveLength(1);
     expect(harness.spawns[0]!.trigger).toBe("catchup");
     expect(jobRow(harness.db, "one-time/late-md").next_run_at).toBeNull();
   });
 
-  test("executed_at already stamped → never scheduled, never dispatched", () => {
+  test("executed_at already stamped → never scheduled, never dispatched", async () => {
     writeOneTime(
       "done.md",
       oneTimeJob(at(1).toISOString(), `executed_at: "${T0.toISOString()}"\n`),
     );
-    tickOnce(harness.ctx, T0);
+    await tickOnce(harness.ctx, T0);
     const row = jobRow(harness.db, "one-time/done-md");
     expect(row.schedule_kind).toBe("once");
     expect(row.next_run_at).toBeNull();
-    tickOnce(harness.ctx, at(30));
+    await tickOnce(harness.ctx, at(30));
     expect(harness.spawns).toHaveLength(0);
   });
 
-  test("stamped-under-lock edit (executed_at appears) un-schedules a pending one-time", () => {
+  test("stamped-under-lock edit (executed_at appears) un-schedules a pending one-time", async () => {
     writeOneTime("pending.md", oneTimeJob(at(5).toISOString()));
-    tickOnce(harness.ctx, T0);
+    await tickOnce(harness.ctx, T0);
     expect(jobRow(harness.db, "one-time/pending-md").next_run_at).toBe(
       at(5).toISOString(),
     );
@@ -350,24 +346,24 @@ describe("daemon tickOnce — one-time jobs", () => {
       "pending.md",
       oneTimeJob(at(5).toISOString(), `executed_at: "${at(1).toISOString()}"\n`),
     );
-    tickOnce(harness.ctx, at(2));
+    await tickOnce(harness.ctx, at(2));
     expect(jobRow(harness.db, "one-time/pending-md").next_run_at).toBeNull();
-    tickOnce(harness.ctx, at(10));
+    await tickOnce(harness.ctx, at(10));
     expect(harness.spawns).toHaveLength(0);
   });
 });
 
 describe("daemon tickOnce — dispatch error handling", () => {
-  test("DB error while advancing next_run skips the spawn and retries next tick", () => {
+  test("DB error while advancing next_run skips the spawn and retries next tick", async () => {
     writeJob("hello.md", mdJob("5m"));
-    tickOnce(harness.ctx, T0); // first run, next_run = T0+5m
+    await tickOnce(harness.ctx, T0); // first run, next_run = T0+5m
     expect(harness.spawns).toHaveLength(1);
 
     // Make every write fail (simulated SQLITE_BUSY/IO error). The due job
     // must NOT spawn — an unrecorded advance would double-run — and
     // next_run_at must stay untouched for the retry.
     harness.db.exec("PRAGMA query_only = ON");
-    tickOnce(harness.ctx, at(5));
+    await tickOnce(harness.ctx, at(5));
     expect(harness.spawns).toHaveLength(1); // no spawn
     expect(jobRow(harness.db, "hello-md").next_run_at).toBe(
       at(5).toISOString(),
@@ -375,18 +371,18 @@ describe("daemon tickOnce — dispatch error handling", () => {
 
     // DB recovers → the very next tick dispatches the still-due row.
     harness.db.exec("PRAGMA query_only = OFF");
-    tickOnce(harness.ctx, at(5, 30));
+    await tickOnce(harness.ctx, at(5, 30));
     expect(harness.spawns).toHaveLength(2);
     expect(jobRow(harness.db, "hello-md").next_run_at).toBe(
       at(10, 30).toISOString(),
     );
   });
 
-  test("never-occurring cron expr parks once with one log line — no 1 Hz spam", () => {
+  test("never-occurring cron expr parks once with one log line — no 1 Hz spam", async () => {
     const logs: string[] = [];
     harness.ctx.log = (m) => logs.push(m);
     writeJob("hello.md", mdJob("5m"));
-    tickOnce(harness.ctx, T0);
+    await tickOnce(harness.ctx, T0);
 
     // Schedule mutates to a valid-looking cron with no future occurrence
     // (Feb 30) and the row is due.
@@ -398,7 +394,7 @@ describe("daemon tickOnce — dispatch error handling", () => {
       .run({ $due: at(1).toISOString() });
     // Keep the file scan quiet about it (row matches file stat already).
 
-    tickOnce(harness.ctx, at(1));
+    await tickOnce(harness.ctx, at(1));
     // The due slot still ran (it WAS due), then parked.
     expect(harness.spawns).toHaveLength(2);
     expect(jobRow(harness.db, "hello-md").next_run_at).toBeNull();
@@ -406,28 +402,28 @@ describe("daemon tickOnce — dispatch error handling", () => {
     expect(parkLogs).toHaveLength(1);
 
     // Subsequent ticks: no re-dispatch, no repeated park/rescue logging.
-    tickOnce(harness.ctx, at(1, 1));
-    tickOnce(harness.ctx, at(1, 2));
-    tickOnce(harness.ctx, at(2));
+    await tickOnce(harness.ctx, at(1, 1));
+    await tickOnce(harness.ctx, at(1, 2));
+    await tickOnce(harness.ctx, at(2));
     expect(harness.spawns).toHaveLength(2);
     expect(logs.filter((l) => l.includes("parked"))).toHaveLength(1);
     expect(jobRow(harness.db, "hello-md").next_run_at).toBeNull();
 
     // A file edit un-parks it.
     writeJob("hello.md", mdJob("1m"));
-    tickOnce(harness.ctx, at(3));
+    await tickOnce(harness.ctx, at(3));
     expect(jobRow(harness.db, "hello-md").next_run_at).not.toBeNull();
   });
 });
 
 describe("daemon tickOnce — run request spawn failure", () => {
-  test("spawn failure releases the claim so the next tick retries", () => {
+  test("spawn failure releases the claim so the next tick retries", async () => {
     writeJob("hello.md", mdJob("1h"));
-    tickOnce(harness.ctx, T0);
+    await tickOnce(harness.ctx, T0);
     expect(harness.spawns).toHaveLength(1);
 
-    const jobId = getJobIdBySlug(harness.db, "hello-md")!;
-    const reqId = insertRunRequest(harness.db, jobId);
+    const jobId = (await harness.store.getJobIdBySlug("hello-md"))!;
+    const reqId = await harness.store.insertRunRequest(jobId);
 
     let failNext = true;
     const realSpawn = harness.ctx.spawn;
@@ -439,50 +435,50 @@ describe("daemon tickOnce — run request spawn failure", () => {
       realSpawn(req);
     };
 
-    tickOnce(harness.ctx, at(0, 1)); // spawn throws → claim released
+    await tickOnce(harness.ctx, at(0, 1)); // spawn throws → claim released
     expect(harness.spawns).toHaveLength(1);
-    expect(getRunRequest(harness.db, reqId)!.picked_up_at).toBeNull();
+    expect((await harness.store.getRunRequest(reqId))!.picked_up_at).toBeNull();
 
-    tickOnce(harness.ctx, at(0, 2)); // retried and succeeds
+    await tickOnce(harness.ctx, at(0, 2)); // retried and succeeds
     expect(harness.spawns).toHaveLength(2);
     expect(harness.spawns[1]!.runRequestId).toBe(reqId);
-    expect(getRunRequest(harness.db, reqId)!.picked_up_at).not.toBeNull();
+    expect((await harness.store.getRunRequest(reqId))!.picked_up_at).not.toBeNull();
   });
 });
 
 describe("daemon mutual exclusion", () => {
-  test("refuses when another live pid has a fresh heartbeat", () => {
+  test("refuses when another live pid has a fresh heartbeat", async () => {
     // process.pid is definitionally alive and != the candidate pid.
-    beatDaemonHeartbeat(harness.db, {
+    await harness.store.beatDaemonHeartbeat({
       pid: process.pid,
       startedAt: new Date().toISOString(),
     });
-    const r = acquireDaemonExclusivity(harness.db, harness.root, 4242);
+    const r = await acquireDaemonExclusivity(harness.store, harness.root, 4242);
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.reason).toContain(`pid ${process.pid}`);
   });
 
   test("a stale heartbeat or a dead pid does not block startup", async () => {
     // Stale tick from a live pid → not fresh → allowed.
-    beatDaemonHeartbeat(harness.db, {
+    await harness.store.beatDaemonHeartbeat({
       pid: process.pid,
       startedAt: new Date().toISOString(),
     });
     harness.db
       .prepare("UPDATE cron_daemon_heartbeat SET last_tick_at = $t")
       .run({ $t: new Date(Date.now() - 60_000).toISOString() });
-    let r = acquireDaemonExclusivity(harness.db, harness.root, 4242);
+    let r = await acquireDaemonExclusivity(harness.store, harness.root, 4242);
     expect(r.ok).toBe(true);
     rmSync(daemonLockPath(harness.root));
 
     // Fresh tick but from a DEAD pid → allowed.
     const dead = Bun.spawn(["true"]);
     await dead.exited;
-    beatDaemonHeartbeat(harness.db, {
+    await harness.store.beatDaemonHeartbeat({
       pid: dead.pid,
       startedAt: new Date().toISOString(),
     });
-    r = acquireDaemonExclusivity(harness.db, harness.root, 4242);
+    r = await acquireDaemonExclusivity(harness.store, harness.root, 4242);
     expect(r.ok).toBe(true);
     expect(readFileSync(daemonLockPath(harness.root), "utf-8").trim()).toBe(
       "4242",
@@ -495,7 +491,7 @@ describe("daemon mutual exclusion", () => {
 
     // Live holder → refuse.
     writeFileSync(lock, String(process.pid), "utf-8");
-    let r = acquireDaemonExclusivity(harness.db, harness.root, 4242);
+    let r = await acquireDaemonExclusivity(harness.store, harness.root, 4242);
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.reason).toContain("daemon lock");
 
@@ -503,7 +499,7 @@ describe("daemon mutual exclusion", () => {
     const dead = Bun.spawn(["true"]);
     await dead.exited;
     writeFileSync(lock, String(dead.pid), "utf-8");
-    r = acquireDaemonExclusivity(harness.db, harness.root, 4242);
+    r = await acquireDaemonExclusivity(harness.store, harness.root, 4242);
     expect(r.ok).toBe(true);
     expect(readFileSync(lock, "utf-8").trim()).toBe("4242");
     expect(existsSync(lock)).toBe(true);
@@ -525,9 +521,9 @@ describe("daemon tickOnce — one-time loss recovery (A1)", () => {
     return { ...harness.ctx, parked: undefined, dispatchedOnce: undefined };
   }
 
-  test("spawn failure restores next_run_at so the next tick retries", () => {
+  test("spawn failure restores next_run_at so the next tick retries", async () => {
     writeOneTime("boom.md", oneTimeJob(at(1).toISOString()));
-    tickOnce(harness.ctx, T0);
+    await tickOnce(harness.ctx, T0);
     expect(jobRow(harness.db, "one-time/boom-md").next_run_at).toBe(
       at(1).toISOString(),
     );
@@ -542,23 +538,23 @@ describe("daemon tickOnce — one-time loss recovery (A1)", () => {
       realSpawn(req);
     };
 
-    tickOnce(harness.ctx, at(1)); // spawn throws → next_run_at restored
+    await tickOnce(harness.ctx, at(1)); // spawn throws → next_run_at restored
     expect(harness.spawns).toHaveLength(0);
     expect(jobRow(harness.db, "one-time/boom-md").next_run_at).toBe(
       at(1).toISOString(),
     );
 
-    tickOnce(harness.ctx, at(1, 1)); // retried and succeeds — exactly once
+    await tickOnce(harness.ctx, at(1, 1)); // retried and succeeds — exactly once
     expect(harness.spawns).toHaveLength(1);
     expect(harness.spawns[0]!.slug).toBe("one-time/boom-md");
     expect(jobRow(harness.db, "one-time/boom-md").next_run_at).toBeNull();
-    tickOnce(harness.ctx, at(2));
+    await tickOnce(harness.ctx, at(2));
     expect(harness.spawns).toHaveLength(1);
   });
 
-  test("crash between advance and spawn: restart rescues the NULLed one-shot", () => {
+  test("crash between advance and spawn: restart rescues the NULLed one-shot", async () => {
     writeOneTime("crash.md", oneTimeJob(at(1).toISOString()));
-    tickOnce(harness.ctx, T0);
+    await tickOnce(harness.ctx, T0);
     // Simulate the crash window: next_run_at NULLed but nothing spawned.
     harness.db
       .prepare(
@@ -569,22 +565,22 @@ describe("daemon tickOnce — one-time loss recovery (A1)", () => {
     // Restarted daemon (empty dispatchedOnce): the once-repair restores
     // next_run_at from the file's run_at, and the same tick dispatches it.
     const ctx2 = restartedCtx();
-    tickOnce(ctx2, at(2));
+    await tickOnce(ctx2, at(2));
     expect(harness.spawns).toHaveLength(1);
     expect(harness.spawns[0]!.slug).toBe("one-time/crash-md");
     expect(jobRow(harness.db, "one-time/crash-md").next_run_at).toBeNull();
 
     // Post-dispatch NULL is now the "runner owns it" state — no churn.
-    tickOnce(ctx2, at(2, 1));
-    tickOnce(ctx2, at(3));
+    await tickOnce(ctx2, at(2, 1));
+    await tickOnce(ctx2, at(3));
     expect(harness.spawns).toHaveLength(1);
   });
 
-  test("crash-window loss past run_at+grace: sentinel written, parked, never runs", () => {
+  test("crash-window loss past run_at+grace: sentinel written, parked, never runs", async () => {
     const logs: string[] = [];
     harness.ctx.log = (m) => logs.push(m);
     writeOneTime("gone.md", oneTimeJob(at(1).toISOString()));
-    tickOnce(harness.ctx, T0);
+    await tickOnce(harness.ctx, T0);
     harness.db
       .prepare(
         "UPDATE cron_jobs SET next_run_at = NULL WHERE slug = 'one-time/gone-md'",
@@ -594,7 +590,7 @@ describe("daemon tickOnce — one-time loss recovery (A1)", () => {
     // Restart 30 min later — default grace is 5 min, so the slot is lost.
     const ctx2 = restartedCtx();
     ctx2.log = (m) => logs.push(m);
-    tickOnce(ctx2, at(30));
+    await tickOnce(ctx2, at(30));
     expect(harness.spawns).toHaveLength(0);
     expect(jobRow(harness.db, "one-time/gone-md").next_run_at).toBeNull();
     const errDir = join(harness.cronDir, ".errors");
@@ -605,24 +601,24 @@ describe("daemon tickOnce — one-time loss recovery (A1)", () => {
 
     // Parked: subsequent ticks stay silent — one warn, no re-parse spam.
     const warnsBefore = logs.filter((l) => l.includes("grace")).length;
-    tickOnce(ctx2, at(30, 1));
-    tickOnce(ctx2, at(31));
+    await tickOnce(ctx2, at(30, 1));
+    await tickOnce(ctx2, at(31));
     expect(logs.filter((l) => l.includes("grace")).length).toBe(warnsBefore);
     expect(harness.spawns).toHaveLength(0);
   });
 });
 
 describe("daemon tickOnce — unreadable cron dir (A2)", () => {
-  test("readdir failure skips the whole sync — no mass tombstone, no re-fire stampede", () => {
+  test("readdir failure skips the whole sync — no mass tombstone, no re-fire stampede", async () => {
     if (process.getuid?.() === 0) return; // chmod 000 is no barrier to root
     writeJob("a.md", mdJob("5m"));
     writeJob("b.md", mdJob("1h"));
-    tickOnce(harness.ctx, T0);
+    await tickOnce(harness.ctx, T0);
     expect(harness.spawns).toHaveLength(2);
 
     chmodSync(harness.cronDir, 0o000);
     try {
-      tickOnce(harness.ctx, at(0, 1));
+      await tickOnce(harness.ctx, at(0, 1));
     } finally {
       chmodSync(harness.cronDir, 0o755);
     }
@@ -632,42 +628,42 @@ describe("daemon tickOnce — unreadable cron dir (A2)", () => {
     expect(jobRow(harness.db, "a-md").next_run_at).toBe(at(5).toISOString());
 
     // Readable again: no re-upsert-as-new stampede — nothing is due.
-    tickOnce(harness.ctx, at(0, 2));
+    await tickOnce(harness.ctx, at(0, 2));
     expect(harness.spawns).toHaveLength(2);
   });
 
-  test("genuinely missing cron dir (ENOENT) still tombstones normally", () => {
+  test("genuinely missing cron dir (ENOENT) still tombstones normally", async () => {
     writeJob("a.md", mdJob("5m"));
-    tickOnce(harness.ctx, T0);
+    await tickOnce(harness.ctx, T0);
     rmSync(harness.cronDir, { recursive: true, force: true });
-    tickOnce(harness.ctx, at(0, 1));
+    await tickOnce(harness.ctx, at(0, 1));
     expect(jobRow(harness.db, "a-md").state).toBe("deleted");
   });
 });
 
 describe("daemon tickOnce — run request with missing file (A5)", () => {
-  test("claimed request whose job file is gone gets expired, not stuck in-flight", () => {
+  test("claimed request whose job file is gone gets expired, not stuck in-flight", async () => {
     writeJob("hello.md", mdJob("1h"));
-    tickOnce(harness.ctx, T0);
+    await tickOnce(harness.ctx, T0);
     expect(harness.spawns).toHaveLength(1);
 
-    const jobId = getJobIdBySlug(harness.db, "hello-md")!;
-    const reqId = insertRunRequest(harness.db, jobId);
+    const jobId = (await harness.store.getJobIdBySlug("hello-md"))!;
+    const reqId = await harness.store.insertRunRequest(jobId);
     // Ledger row loses its file_path (e.g. legacy row) — unspawnable.
     harness.db
       .prepare("UPDATE cron_jobs SET file_path = NULL WHERE id = $id")
       .run({ $id: jobId });
 
-    tickOnce(harness.ctx, at(0, 1));
+    await tickOnce(harness.ctx, at(0, 1));
     expect(harness.spawns).toHaveLength(1); // never spawned
-    const req = getRunRequest(harness.db, reqId)!;
+    const req = (await harness.store.getRunRequest(reqId))!;
     expect(req.picked_up_at).not.toBeNull();
     expect(req.expired_at).not.toBeNull(); // terminal, visibly dead
   });
 });
 
 describe("daemon mutual exclusion — stale-lock hardening (A3/A4)", () => {
-  test("pid-reuse: alive holder with no matching heartbeat and an old lock is taken over", () => {
+  test("pid-reuse: alive holder with no matching heartbeat and an old lock is taken over", async () => {
     const lock = daemonLockPath(harness.root);
     mkdirSync(join(harness.root, ".cronfish"), { recursive: true });
     // process.pid is alive but has never beaten this db's heartbeat — a
@@ -676,7 +672,7 @@ describe("daemon mutual exclusion — stale-lock hardening (A3/A4)", () => {
     const old = new Date(Date.now() - 10 * 60_000);
     utimesSync(lock, old, old);
 
-    const r = acquireDaemonExclusivity(harness.db, harness.root, 4242);
+    const r = await acquireDaemonExclusivity(harness.store, harness.root, 4242);
     expect(r.ok).toBe(true);
     expect(readFileSync(lock, "utf-8").trim()).toBe("4242");
     // Atomic takeover leaves no temp droppings.
@@ -686,7 +682,7 @@ describe("daemon mutual exclusion — stale-lock hardening (A3/A4)", () => {
     expect(leftovers).toHaveLength(0);
   });
 
-  test("alive holder that IS ticking (heartbeat pid matches, recent) refuses even with an old lock", () => {
+  test("alive holder that IS ticking (heartbeat pid matches, recent) refuses even with an old lock", async () => {
     const lock = daemonLockPath(harness.root);
     mkdirSync(join(harness.root, ".cronfish"), { recursive: true });
     writeFileSync(lock, String(process.pid), "utf-8");
@@ -694,7 +690,7 @@ describe("daemon mutual exclusion — stale-lock hardening (A3/A4)", () => {
     utimesSync(lock, old, old);
     // Tick 60s old: stale for the phase-1 fresh check (10s) but well inside
     // the 120s "still a ticking daemon" window for the lock cross-check.
-    beatDaemonHeartbeat(harness.db, {
+    await harness.store.beatDaemonHeartbeat({
       pid: process.pid,
       startedAt: new Date().toISOString(),
     });
@@ -702,24 +698,24 @@ describe("daemon mutual exclusion — stale-lock hardening (A3/A4)", () => {
       .prepare("UPDATE cron_daemon_heartbeat SET last_tick_at = $t")
       .run({ $t: new Date(Date.now() - 60_000).toISOString() });
 
-    const r = acquireDaemonExclusivity(harness.db, harness.root, 4242);
+    const r = await acquireDaemonExclusivity(harness.store, harness.root, 4242);
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.reason).toContain(`pid ${process.pid}`);
   });
 
-  test("a young lock from an alive pid refuses — a just-started daemon has not beaten yet", () => {
+  test("a young lock from an alive pid refuses — a just-started daemon has not beaten yet", async () => {
     const lock = daemonLockPath(harness.root);
     mkdirSync(join(harness.root, ".cronfish"), { recursive: true });
     writeFileSync(lock, String(process.pid), "utf-8"); // fresh mtime
-    const r = acquireDaemonExclusivity(harness.db, harness.root, 4242);
+    const r = await acquireDaemonExclusivity(harness.store, harness.root, 4242);
     expect(r.ok).toBe(false);
   });
 
-  test("EPERM-guarded pid (pid 1) counts as ALIVE, not dead", () => {
+  test("EPERM-guarded pid (pid 1) counts as ALIVE, not dead", async () => {
     const lock = daemonLockPath(harness.root);
     mkdirSync(join(harness.root, ".cronfish"), { recursive: true });
     writeFileSync(lock, "1", "utf-8"); // launchd/init — kill(1,0) → EPERM
-    const r = acquireDaemonExclusivity(harness.db, harness.root, 4242);
+    const r = await acquireDaemonExclusivity(harness.store, harness.root, 4242);
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.reason).toContain("pid 1");
   });
@@ -729,16 +725,16 @@ describe("daemon tickOnce — post-restore thundering-herd jitter (CAD-700)", ()
   // Craft a restored-from-backup db: job rows whose next_run_at is stale in
   // the past, plus an ancient heartbeat from the pre-restore daemon. Returns a
   // fresh ctx (a new process — startupJitterApplied unset) over the same db.
-  function seedRestore(slugs: string[], staleNextRun: Date): DaemonCtx {
+  async function seedRestore(slugs: string[], staleNextRun: Date): Promise<DaemonCtx> {
     for (const s of slugs) writeJob(`${s}.md`, mdJob("5m"));
-    tickOnce(harness.ctx, T0); // create rows + first dispatch
+    await tickOnce(harness.ctx, T0); // create rows + first dispatch
     harness.spawns.length = 0;
     // Every job overdue by way more than the catch-up grace.
     harness.db
       .prepare("UPDATE cron_jobs SET next_run_at = $n WHERE state = 'active'")
       .run({ $n: staleNextRun.toISOString() });
     // Ancient heartbeat rode in with the backup (pre-restore pid, old tick).
-    beatDaemonHeartbeat(harness.db, {
+    await harness.store.beatDaemonHeartbeat({
       pid: 111,
       startedAt: at(-2000).toISOString(),
     });
@@ -748,13 +744,13 @@ describe("daemon tickOnce — post-restore thundering-herd jitter (CAD-700)", ()
     return { ...harness.ctx, startupJitterApplied: undefined };
   }
 
-  test("restore: overdue interval jobs are staggered, not fired all at once", () => {
+  test("restore: overdue interval jobs are staggered, not fired all at once", async () => {
     const slugs = ["a", "b", "c", "d"];
-    const ctx2 = seedRestore(slugs, at(-30)); // 30m overdue
+    const ctx2 = await seedRestore(slugs, at(-30)); // 30m overdue
 
     // First tick after the "restore": only the single most-overdue job fires;
     // the other three are pushed into the jitter window.
-    tickOnce(ctx2, at(0, 1));
+    await tickOnce(ctx2, at(0, 1));
     expect(harness.spawns).toHaveLength(1);
     expect(harness.spawns[0]!.trigger).toBe("catchup");
 
@@ -770,52 +766,52 @@ describe("daemon tickOnce — post-restore thundering-herd jitter (CAD-700)", ()
     expect(new Set(deferred).size).toBe(3);
 
     // Marching the clock forward drains them one at a time, never in a burst.
-    tickOnce(ctx2, at(3, 1)); // past the whole window
+    await tickOnce(ctx2, at(3, 1)); // past the whole window
     expect(harness.spawns.length).toBe(4);
     // And no re-herd on the next tick.
-    tickOnce(ctx2, at(3, 2));
+    await tickOnce(ctx2, at(3, 2));
     expect(harness.spawns.length).toBe(4);
   });
 
-  test("a lone overdue job on cold start still fires immediately (no herd)", () => {
-    const ctx2 = seedRestore(["solo"], at(-30));
-    tickOnce(ctx2, at(0, 1));
+  test("a lone overdue job on cold start still fires immediately (no herd)", async () => {
+    const ctx2 = await seedRestore(["solo"], at(-30));
+    await tickOnce(ctx2, at(0, 1));
     expect(harness.spawns).toHaveLength(1);
     expect(jobRow(harness.db, "solo-md").next_run_at).toBe(at(5, 1).toISOString());
   });
 
-  test("a fresh heartbeat (quick restart) does NOT stagger — jobs fire at once", () => {
+  test("a fresh heartbeat (quick restart) does NOT stagger — jobs fire at once", async () => {
     for (const s of ["a", "b", "c"]) writeJob(`${s}.md`, mdJob("5m"));
-    tickOnce(harness.ctx, T0);
+    await tickOnce(harness.ctx, T0);
     harness.spawns.length = 0;
     harness.db
       .prepare("UPDATE cron_jobs SET next_run_at = $n WHERE state = 'active'")
       .run({ $n: at(-30).toISOString() });
     // Heartbeat only ~2s stale — a quick bounce, not a cold start.
-    beatDaemonHeartbeat(harness.db, { pid: 111, startedAt: T0.toISOString() });
+    await harness.store.beatDaemonHeartbeat({ pid: 111, startedAt: T0.toISOString() });
     harness.db
       .prepare("UPDATE cron_daemon_heartbeat SET last_tick_at = $t")
       .run({ $t: at(0, 1).toISOString() });
     const ctx2 = { ...harness.ctx, startupJitterApplied: undefined };
-    tickOnce(ctx2, at(0, 3));
+    await tickOnce(ctx2, at(0, 3));
     expect(harness.spawns.length).toBe(3); // all fire, no staggering
   });
 
-  test("fresh db first-sight of many jobs is unaffected (next_run=now, not overdue)", () => {
+  test("fresh db first-sight of many jobs is unaffected (next_run=now, not overdue)", async () => {
     for (const s of ["a", "b", "c", "d"]) writeJob(`${s}.md`, mdJob("5m"));
     // Cold start (no heartbeat) but first-sight next_run=now is not overdue
     // past the grace, so nothing is staggered — all dispatch on tick 1.
-    tickOnce(harness.ctx, T0);
+    await tickOnce(harness.ctx, T0);
     expect(harness.spawns.length).toBe(4);
   });
 });
 
 describe("daemon tickOnce — heartbeat", () => {
-  test("beats every tick and counts ticks for the same process", () => {
-    tickOnce(harness.ctx, T0);
-    tickOnce(harness.ctx, at(0, 1));
-    tickOnce(harness.ctx, at(0, 2));
-    const hb = getDaemonHeartbeat(harness.db)!;
+  test("beats every tick and counts ticks for the same process", async () => {
+    await tickOnce(harness.ctx, T0);
+    await tickOnce(harness.ctx, at(0, 1));
+    await tickOnce(harness.ctx, at(0, 2));
+    const hb = (await harness.store.getDaemonHeartbeat())!;
     expect(hb.pid).toBe(4242);
     expect(hb.tick_count).toBe(3);
     expect(hb.version).toBe("test");

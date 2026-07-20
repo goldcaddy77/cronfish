@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Database } from "bun:sqlite";
 import { tickOnce, type DaemonCtx, type SpawnRequest } from "../src/daemon.ts";
-import { migrate } from "../src/db.ts";
+import { SqliteStore } from "../src/store/index.ts";
 
 const DAY = 86_400_000;
 const T0 = new Date("2026-07-17T12:00:00.000Z");
@@ -41,16 +41,17 @@ function invocationCount(): number {
   ).n;
 }
 
-beforeEach(() => {
+beforeEach(async () => {
   root = mkdtempSync(join(tmpdir(), "cronfish-housekeeping-"));
   cronDir = join(root, "cron");
   mkdirSync(cronDir, { recursive: true });
   db = new Database(":memory:");
   db.exec("PRAGMA foreign_keys = ON");
-  migrate(db);
+  const store = new SqliteStore(db);
+  await store.migrate();
   const spawns: SpawnRequest[] = [];
   ctx = {
-    db,
+    store,
     consumerRoot: root,
     cronDir,
     spawn: (req) => spawns.push(req),
@@ -65,7 +66,7 @@ afterEach(() => {
 });
 
 describe("daemon housekeeping", () => {
-  test("prunes ledger rows once per UTC day when retention is configured", () => {
+  test("prunes ledger rows once per UTC day when retention is configured", async () => {
     writeFileSync(
       join(root, ".cronfish.json"),
       JSON.stringify({ retention: { max_age_days: 30 } }),
@@ -73,21 +74,21 @@ describe("daemon housekeeping", () => {
     );
     addJobWithInvocation("foo-md", 40);
 
-    tickOnce(ctx, T0);
+    await tickOnce(ctx, T0);
     expect(invocationCount()).toBe(0);
 
     // Same day: a newly-aged row is NOT pruned again until tomorrow.
     addJobWithInvocation("foo-md", 40);
-    tickOnce(ctx, new Date(T0.getTime() + 60_000));
-    tickOnce(ctx, new Date(T0.getTime() + 3_600_000));
+    await tickOnce(ctx, new Date(T0.getTime() + 60_000));
+    await tickOnce(ctx, new Date(T0.getTime() + 3_600_000));
     expect(invocationCount()).toBe(1);
 
     // Next UTC day (T0 is 12:00Z, +13h crosses midnight): pruned again.
-    tickOnce(ctx, new Date(T0.getTime() + 13 * 3_600_000));
+    await tickOnce(ctx, new Date(T0.getTime() + 13 * 3_600_000));
     expect(invocationCount()).toBe(0);
   });
 
-  test("per-slug override wins over the global window", () => {
+  test("per-slug override wins over the global window", async () => {
     writeFileSync(
       join(root, ".cronfish.json"),
       JSON.stringify({
@@ -101,7 +102,7 @@ describe("daemon housekeeping", () => {
     addJobWithInvocation("noisy-md", 10);
     addJobWithInvocation("quiet-md", 10);
 
-    tickOnce(ctx, T0);
+    await tickOnce(ctx, T0);
 
     const slugs = db
       .query(
@@ -111,10 +112,10 @@ describe("daemon housekeeping", () => {
     expect(slugs.map((s) => s.slug)).toEqual(["quiet-md"]);
   });
 
-  test("no retention configured → no rows are ever deleted", () => {
+  test("no retention configured → no rows are ever deleted", async () => {
     addJobWithInvocation("foo-md", 400);
-    tickOnce(ctx, T0);
-    tickOnce(ctx, new Date(T0.getTime() + 2 * DAY));
+    await tickOnce(ctx, T0);
+    await tickOnce(ctx, new Date(T0.getTime() + 2 * DAY));
     expect(invocationCount()).toBe(1);
   });
 });

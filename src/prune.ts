@@ -7,8 +7,7 @@
 
 import { readdirSync, rmSync, statSync } from "node:fs";
 import { join, relative } from "node:path";
-import type { Database } from "bun:sqlite";
-import { logsRoot } from "./db.ts";
+import { logsRoot } from "./store/paths.ts";
 
 export interface SlugRetention {
   // Delete logs whose mtime is older than this many days.
@@ -163,102 +162,16 @@ export function pruneLogs(opts: PruneOptions): PruneReport {
 // crash debris and prune normally.
 export const RUNNING_PROTECT_MS = 86_400_000;
 
-export interface LedgerPruneOptions {
-  db: Database;
-  // Default retention applied to every slug (only maxAgeDays matters here).
-  global: SlugRetention;
-  // Per-slug overrides; a slug present here fully replaces `global`.
-  perSlug?: Record<string, SlugRetention>;
-  // Limit pruning to a single slug.
-  onlySlug?: string;
-  // Report what would be deleted without touching the db.
-  dryRun?: boolean;
-  // Injectable clock for tests (ms since epoch). Defaults to Date.now().
-  nowMs?: number;
-}
-
-export interface LedgerPruneReport {
-  invocations: number;
-  runRequests: number;
-  missedAlerts: number;
-}
-
-export function pruneLedger(opts: LedgerPruneOptions): LedgerPruneReport {
-  const nowMs = opts.nowMs ?? Date.now();
-  const runningCutoff = new Date(nowMs - RUNNING_PROTECT_MS).toISOString();
-  const report: LedgerPruneReport = {
-    invocations: 0,
-    runRequests: 0,
-    missedAlerts: 0,
-  };
-
-  const jobs = opts.db
-    .query("SELECT id, slug FROM cron_jobs ORDER BY slug")
-    .all() as { id: number; slug: string }[];
-
-  // The doomed-invocation predicate, shared by count/null-refs/delete so the
-  // three can never disagree. Bind: $job, $cutoff, $running_cutoff.
-  const doomedInv = `job_id = $job AND started_at < $cutoff
-      AND NOT (status = 'running' AND started_at >= $running_cutoff)`;
-
-  const work = (): void => {
-    for (const job of jobs) {
-      if (opts.onlySlug && job.slug !== opts.onlySlug) continue;
-      const retention = opts.perSlug?.[job.slug] ?? opts.global;
-      if (retention.maxAgeDays === undefined) continue;
-      const cutoff = new Date(
-        nowMs - retention.maxAgeDays * 86_400_000,
-      ).toISOString();
-      const p = { $job: job.id, $cutoff: cutoff };
-
-      if (opts.dryRun) {
-        const count = (sql: string, params: Record<string, unknown>): number =>
-          (opts.db.query(sql).get(params) as { n: number }).n;
-        report.missedAlerts += count(
-          "SELECT COUNT(*) AS n FROM cron_missed_alerts WHERE job_id = $job AND fired_at < $cutoff",
-          p,
-        );
-        report.runRequests += count(
-          "SELECT COUNT(*) AS n FROM cron_run_requests WHERE job_id = $job AND requested_at < $cutoff",
-          p,
-        );
-        report.invocations += count(
-          `SELECT COUNT(*) AS n FROM cron_invocations WHERE ${doomedInv}`,
-          { ...p, $running_cutoff: runningCutoff },
-        );
-        continue;
-      }
-
-      report.missedAlerts += opts.db
-        .prepare(
-          "DELETE FROM cron_missed_alerts WHERE job_id = $job AND fired_at < $cutoff",
-        )
-        .run(p).changes;
-      report.runRequests += opts.db
-        .prepare(
-          "DELETE FROM cron_run_requests WHERE job_id = $job AND requested_at < $cutoff",
-        )
-        .run(p).changes;
-      // A surviving run request may still reference a doomed invocation
-      // (foreign_keys=ON would abort the delete) — sever the link first.
-      const pInv = { ...p, $running_cutoff: runningCutoff };
-      opts.db
-        .prepare(
-          `UPDATE cron_run_requests SET invocation_id = NULL
-           WHERE job_id = $job AND invocation_id IN
-             (SELECT id FROM cron_invocations WHERE ${doomedInv})`,
-        )
-        .run(pInv);
-      report.invocations += opts.db
-        .prepare(`DELETE FROM cron_invocations WHERE ${doomedInv}`)
-        .run(pInv).changes;
-    }
-  };
-
-  if (opts.dryRun) work();
-  else opts.db.transaction(work)();
-  return report;
-}
+// The ledger-prune DB body now lives in SqliteStore.pruneLedger (the store
+// seam owns every DB operation). The option/report SHAPES live in the store
+// interface; re-exported here so existing `from "./prune"` type imports keep
+// working. RUNNING_PROTECT_MS stays here — it is the shared retention constant
+// the store impl imports.
+export type {
+  LedgerPruneOptions,
+  LedgerPruneReport,
+} from "./store/interface.ts";
+import type { LedgerPruneReport } from "./store/interface.ts";
 
 export function ledgerPruneTotal(r: LedgerPruneReport): number {
   return r.invocations + r.runRequests + r.missedAlerts;

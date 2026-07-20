@@ -3,7 +3,7 @@
 
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
-import type { InvocationStatus } from "../db.ts";
+import type { InvocationStatus } from "../store/index.ts";
 import type { JobMeta, OnFailure } from "../jobs.ts";
 import { buildRegistry } from "./registry.ts";
 import { safeNotify, type AlertOutcome } from "./safe.ts";

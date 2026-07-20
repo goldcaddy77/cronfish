@@ -20,22 +20,14 @@ import {
   writeSync,
 } from "node:fs";
 import { extname, join, resolve } from "node:path";
-import type { Database } from "bun:sqlite";
 import {
-  finishInvocation,
-  getJobIdBySlug,
-  getPreviousFinishedStatus,
-  linkRunRequestInvocation,
-  openDb,
-  setInvocationAlert,
-  setJobLastRun,
-  startInvocation,
-  upsertJob,
+  tryOpenStore as tryOpenStoreImpl,
   type AlertLedgerStatus,
+  type CronStore,
   type InvocationResultRow,
   type InvocationStatus,
   type InvocationTrigger,
-} from "./db.ts";
+} from "./store/index.ts";
 import { loadJob, slugFromPath, type JobMeta } from "./jobs.ts";
 import { resolveModel, claudeEnvFor } from "./models.ts";
 import {
@@ -426,34 +418,33 @@ async function execOnce(
 
 // --- Ledger helpers (failure-safe) ---
 
-function tryOpenDb(): Database | null {
-  try {
-    return openDb(consumerRoot());
-  } catch (e) {
-    warn(`open ledger DB failed: ${(e as Error).message}`);
-    return null;
-  }
+async function tryOpenStore(): Promise<CronStore | null> {
+  const store = await tryOpenStoreImpl(consumerRoot());
+  if (!store) warn(`open ledger DB failed`);
+  return store;
 }
 
-function tryStartInvocation(
-  db: Database | null,
+async function tryStartInvocation(
+  store: CronStore | null,
   job: JobMeta,
   trigger: InvocationTrigger,
   logPath: string,
-): number | null {
-  if (!db) return null;
+): Promise<number | null> {
+  if (!store) return null;
   try {
-    upsertJob(db, job);
-    const jobId = getJobIdBySlug(db, job.slug);
+    await store.upsertJob(job);
+    const jobId = await store.getJobIdBySlug(job.slug);
     if (jobId === null) return null;
     // Daemon context, both optional: the planned fire time (lateness
     // reporting) and the `cron run` request this invocation fulfills.
     const scheduledFor = process.env.CRONFISH_SCHEDULED_FOR || undefined;
-    const id = startInvocation(db, jobId, trigger, logPath, { scheduledFor });
+    const id = await store.startInvocation(jobId, trigger, logPath, {
+      scheduledFor,
+    });
     const reqId = process.env.CRONFISH_RUN_REQUEST_ID;
     if (reqId && /^\d+$/.test(reqId)) {
       try {
-        linkRunRequestInvocation(db, parseInt(reqId, 10), id);
+        await store.linkRunRequestInvocation(parseInt(reqId, 10), id);
       } catch (e) {
         warn(`linkRunRequestInvocation failed: ${(e as Error).message}`);
       }
@@ -469,62 +460,62 @@ function tryStartInvocation(
 // schedule-change rule (next = max(now, last_run + new_interval)) reads
 // last_run_at, so the runner — the one place that knows how a run ended —
 // maintains it. Failure-safe like every ledger write.
-function trySetJobLastRun(
-  db: Database | null,
+async function trySetJobLastRun(
+  store: CronStore | null,
   jobSlug: string,
   startedAtIso: string,
   status: InvocationStatus,
-): void {
-  if (!db) return;
+): Promise<void> {
+  if (!store) return;
   try {
-    const jobId = getJobIdBySlug(db, jobSlug);
+    const jobId = await store.getJobIdBySlug(jobSlug);
     if (jobId === null) return;
-    setJobLastRun(db, jobId, startedAtIso, status);
+    await store.setJobLastRun(jobId, startedAtIso, status);
   } catch (e) {
     warn(`setJobLastRun failed: ${(e as Error).message}`);
   }
 }
 
-function tryFinishInvocation(
-  db: Database | null,
+async function tryFinishInvocation(
+  store: CronStore | null,
   invocationId: number | null,
   status: InvocationStatus,
   exitCode: number | null,
   result?: InvocationResultRow,
   attempt?: number,
-): void {
-  if (!db || invocationId === null) return;
+): Promise<void> {
+  if (!store || invocationId === null) return;
   try {
-    finishInvocation(db, invocationId, status, exitCode, result, attempt);
+    await store.finishInvocation(invocationId, status, exitCode, result, attempt);
   } catch (e) {
     warn(`finishInvocation failed: ${(e as Error).message}`);
   }
 }
 
-function trySetAlert(
-  db: Database | null,
+async function trySetAlert(
+  store: CronStore | null,
   invocationId: number | null,
   status: AlertLedgerStatus,
   error: string | null,
-): void {
-  if (!db || invocationId === null) return;
+): Promise<void> {
+  if (!store || invocationId === null) return;
   try {
-    setInvocationAlert(db, invocationId, status, error);
+    await store.setInvocationAlert(invocationId, status, error);
   } catch (e) {
     warn(`setInvocationAlert failed: ${(e as Error).message}`);
   }
 }
 
-function tryPrevStatus(
-  db: Database | null,
+async function tryPrevStatus(
+  store: CronStore | null,
   jobSlug: string,
   invocationId: number,
-): InvocationStatus | null {
-  if (!db) return null;
+): Promise<InvocationStatus | null> {
+  if (!store) return null;
   try {
-    const jobId = getJobIdBySlug(db, jobSlug);
+    const jobId = await store.getJobIdBySlug(jobSlug);
     if (jobId === null) return null;
-    return getPreviousFinishedStatus(db, jobId, invocationId);
+    return await store.getPreviousFinishedStatus(jobId, invocationId);
   } catch (e) {
     warn(`getPreviousFinishedStatus failed: ${(e as Error).message}`);
     return null;
@@ -760,7 +751,7 @@ async function main(): Promise<void> {
   process.on("SIGTERM", earlyCleanup);
   process.on("SIGINT", earlyCleanup);
 
-  const db = tryOpenDb();
+  const store = await tryOpenStore();
 
   // Open the log file BEFORE we know the invocation id (we need a real
   // path to record). The DB row references the file path; if DB write
@@ -768,16 +759,19 @@ async function main(): Promise<void> {
   // never blocked.
   const tsTag = new Date().toISOString().replace(/:/g, "-");
   const provisionalPath = logPathFor(job.slug, `preinit-${tsTag}`);
-  const invocationId = tryStartInvocation(db, job, trigger, provisionalPath);
+  const invocationId = await tryStartInvocation(
+    store,
+    job,
+    trigger,
+    provisionalPath,
+  );
   const logFile =
     invocationId !== null
       ? logPathFor(job.slug, invocationId)
       : provisionalPath;
-  if (invocationId !== null && logFile !== provisionalPath && db) {
+  if (invocationId !== null && logFile !== provisionalPath && store) {
     try {
-      db.prepare(
-        "UPDATE cron_invocations SET log_path = $p WHERE id = $id",
-      ).run({ $p: logFile, $id: invocationId });
+      await store.setInvocationLogPath(invocationId, logFile);
     } catch (e) {
       warn(`update log_path failed: ${(e as Error).message}`);
     }
@@ -800,8 +794,25 @@ async function main(): Promise<void> {
   const cleanup = (sig: NodeJS.Signals): void => {
     if (releasing) return;
     releasing = true;
-    tryFinishInvocation(
-      db,
+    // The store method's sync bun:sqlite write executes synchronously before
+    // this handler's process.exit — the returned promise is intentionally
+    // unawaited (a signal handler can't yield to the event loop).
+    //
+    // DIALECT CAVEAT (Postgres, CAD-790): with an async PostgresStore this
+    // crash-status write is a network round-trip that will NOT complete before
+    // process.exit — the invocation row stays 'running'. There is currently NO
+    // repair path that reconciles an orphaned 'running' row to 'crashed' on
+    // restart: repairLostOnce (daemon.ts) only re-schedules lost one-time JOBS,
+    // and the watchdog only detects MISSED runs — neither touches a stuck
+    // 'running' invocation. prune.ts protects fresh 'running' rows and
+    // eventually DELETES stale ones (RUNNING_PROTECT_MS) but never re-statuses
+    // them. So under Postgres a SIGTERM'd run leaves a permanent 'running' row
+    // until it ages out of retention. Scope-3 cutover (CAD-790) must add a
+    // startup reconcile that flips daemon-supervised orphaned 'running' rows to
+    // 'crashed', OR make this handler await the write (SIGTERM has a grace
+    // period). Sync bun:sqlite is unaffected — the write lands before exit.
+    void tryFinishInvocation(
+      store,
       invocationId,
       "crashed",
       sig === "SIGTERM" ? 143 : 130,
@@ -858,17 +869,22 @@ async function main(): Promise<void> {
           ? "ok"
           : "fail";
     const resultRow = await tryParseResult(logFile, lastResult.code);
-    tryFinishInvocation(
-      db,
+    await tryFinishInvocation(
+      store,
       invocationId,
       status,
       lastResult.code,
       resultRow,
       attemptsUsed,
     );
-    trySetJobLastRun(db, job.slug, new Date(start).toISOString(), status);
+    await trySetJobLastRun(
+      store,
+      job.slug,
+      new Date(start).toISOString(),
+      status,
+    );
     await maybeFireAlert({
-      db,
+      store,
       job,
       invocationId,
       status,
@@ -879,7 +895,7 @@ async function main(): Promise<void> {
       logPath: logFile,
     });
     try {
-      db?.close();
+      await store?.close();
     } catch {}
     // LAST act for a one-time job: remove its own plist. May SIGTERM us via
     // bootout, so everything above (ledger, alert) is already done.
@@ -889,7 +905,7 @@ async function main(): Promise<void> {
 }
 
 interface AlertFireInput {
-  db: Database | null;
+  store: CronStore | null;
   job: JobMeta;
   invocationId: number | null;
   status: InvocationStatus;
@@ -909,8 +925,11 @@ async function maybeFireAlert(input: AlertFireInput): Promise<void> {
   const isRecovery =
     input.status === "ok" &&
     FAILURE_STATUSES.has(
-      tryPrevStatus(input.db, input.job.slug, input.invocationId) ??
-        ("ok" as InvocationStatus),
+      (await tryPrevStatus(
+        input.store,
+        input.job.slug,
+        input.invocationId,
+      )) ?? ("ok" as InvocationStatus),
     );
   if (!isFailure && !isRecovery) return;
   try {
@@ -926,16 +945,26 @@ async function maybeFireAlert(input: AlertFireInput): Promise<void> {
       consumerRoot: consumerRoot(),
     });
     if (isRecovery && outcome.kind === "sent") {
-      trySetAlert(input.db, input.invocationId, "recovered", null);
+      await trySetAlert(input.store, input.invocationId, "recovered", null);
     } else {
       const ledger = outcomeToLedger(outcome);
-      trySetAlert(input.db, input.invocationId, ledger.status, ledger.error);
+      await trySetAlert(
+        input.store,
+        input.invocationId,
+        ledger.status,
+        ledger.error,
+      );
     }
   } catch (e) {
     // dispatchAlert is meant to be failure-safe; this catch is a last-resort
     // guard so a runner crash here never blocks the run.
     warn(`maybeFireAlert: ${(e as Error).message}`);
-    trySetAlert(input.db, input.invocationId, "error", (e as Error).message);
+    await trySetAlert(
+      input.store,
+      input.invocationId,
+      "error",
+      (e as Error).message,
+    );
   }
 }
 

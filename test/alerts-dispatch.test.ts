@@ -10,15 +10,7 @@ import {
   loadConsumerAlertsConfig,
   readLogTail,
 } from "../src/alerts/dispatch.ts";
-import {
-  getPreviousFinishedStatus,
-  finishInvocation,
-  getJobIdBySlug,
-  openDb,
-  setInvocationAlert,
-  startInvocation,
-  upsertJob,
-} from "../src/db.ts";
+import { openStore } from "../src/store/index.ts";
 import type { JobMeta } from "../src/jobs.ts";
 
 function tempRoot(): string {
@@ -260,33 +252,37 @@ describe("ledger v4 alert columns", () => {
   });
   afterEach(() => rmSync(root, { recursive: true, force: true }));
 
-  test("migration adds alert_status + alert_error columns", () => {
-    const db = openDb(root);
-    const cols = db.query("PRAGMA table_info(cron_invocations)").all() as {
+  test("migration adds alert_status + alert_error columns", async () => {
+    const store = await openStore(root);
+    const cols = store
+      .rawHandleForTests()
+      .query("PRAGMA table_info(cron_invocations)")
+      .all() as {
       name: string;
     }[];
     const names = cols.map((c) => c.name);
     expect(names).toContain("alert_status");
     expect(names).toContain("alert_error");
-    db.close();
+    await store.close();
   });
 
-  test("setInvocationAlert + getPreviousFinishedStatus round-trip", () => {
-    const db = openDb(root);
+  test("setInvocationAlert + getPreviousFinishedStatus round-trip", async () => {
+    const store = await openStore(root);
     const job = fakeJob();
-    upsertJob(db, job);
-    const jobId = getJobIdBySlug(db, job.slug)!;
-    const firstId = startInvocation(db, jobId, "schedule", "/log/1");
-    finishInvocation(db, firstId, "fail", 1);
-    setInvocationAlert(db, firstId, "sent", null);
+    await store.upsertJob(job);
+    const jobId = (await store.getJobIdBySlug(job.slug))!;
+    const firstId = await store.startInvocation(jobId, "schedule", "/log/1");
+    await store.finishInvocation(firstId, "fail", 1);
+    await store.setInvocationAlert(firstId, "sent", null);
 
-    const secondId = startInvocation(db, jobId, "schedule", "/log/2");
-    expect(getPreviousFinishedStatus(db, jobId, secondId)).toBe("fail");
+    const secondId = await store.startInvocation(jobId, "schedule", "/log/2");
+    expect(await store.getPreviousFinishedStatus(jobId, secondId)).toBe("fail");
 
-    finishInvocation(db, secondId, "ok", 0);
-    setInvocationAlert(db, secondId, "recovered", null);
+    await store.finishInvocation(secondId, "ok", 0);
+    await store.setInvocationAlert(secondId, "recovered", null);
 
-    const rows = db
+    const rows = store
+      .rawHandleForTests()
       .query(
         "SELECT id, alert_status, alert_error FROM cron_invocations ORDER BY id",
       )
@@ -294,6 +290,6 @@ describe("ledger v4 alert columns", () => {
     expect(rows.length).toBe(2);
     expect(rows[0]!.alert_status).toBe("sent");
     expect(rows[1]!.alert_status).toBe("recovered");
-    db.close();
+    await store.close();
   });
 });
