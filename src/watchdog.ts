@@ -7,7 +7,6 @@
 // Cold-start: jobs with zero successful runs are skipped — brand-new crons
 // don't ping until they've succeeded at least once.
 
-import { Database } from "bun:sqlite";
 import { join } from "node:path";
 import {
   buildRegistry,
@@ -16,14 +15,7 @@ import {
   type AlertPayload,
 } from "./alerts/index.ts";
 import { chooseAdapterName, buildUiUrl } from "./alerts/dispatch.ts";
-import {
-  getJobIdBySlug,
-  getLastOkStartedAt,
-  getLatestMissedFiredAt,
-  listEnabledJobs,
-  openDb,
-  recordMissedAlert,
-} from "./db.ts";
+import { openStore, type CronStore } from "./store/index.ts";
 import { discoverJobs } from "./jobs.ts";
 import {
   intervalSecondsAt,
@@ -46,9 +38,9 @@ export interface WatchdogDecision {
 export interface WatchdogInput {
   consumerRoot: string;
   now?: Date;
-  // Reuse an already-open ledger (the in-daemon caller passes its own db);
-  // left open on return. Omitted → open + close the consumer db as before.
-  db?: Database;
+  // Reuse an already-open ledger (the in-daemon caller passes its own store);
+  // left open on return. Omitted → open + close the consumer store as before.
+  store?: CronStore;
   // Daemon mode: a miss whose expected fire time predates the daemon's own
   // start is a downtime gap first — the catch-up dispatch gets one grace
   // window (measured from liveSince) to make the run happen. Past that the
@@ -64,14 +56,14 @@ export async function runWatchdog(
   const { jobs } = discoverJobs(cronDir);
   const jobBySlug = new Map(jobs.map((j) => [j.slug, j]));
 
-  const ownDb = input.db === undefined;
-  const db = input.db ?? openDb(input.consumerRoot);
+  const ownStore = input.store === undefined;
+  const store = input.store ?? (await openStore(input.consumerRoot));
   const cfg = loadConsumerAlertsConfig(input.consumerRoot);
   const registry = buildRegistry(cfg.alerts);
   const decisions: WatchdogDecision[] = [];
 
   try {
-    const rows = listEnabledJobs(db);
+    const rows = await store.listEnabledJobs();
     for (const row of rows) {
       const job = jobBySlug.get(row.slug);
       if (!job) continue;
@@ -79,7 +71,7 @@ export async function runWatchdog(
         decisions.push({ slug: row.slug, outcome: "skipped-manual" });
         continue;
       }
-      const lastOk = getLastOkStartedAt(db, row.id);
+      const lastOk = await store.getLastOkStartedAt(row.id);
       if (!lastOk) {
         decisions.push({ slug: row.slug, outcome: "skipped-cold" });
         continue;
@@ -110,7 +102,7 @@ export async function runWatchdog(
         });
         continue;
       }
-      const lastMissed = getLatestMissedFiredAt(db, row.id);
+      const lastMissed = await store.getLatestMissedFiredAt(row.id);
       if (lastMissed && new Date(lastMissed) > lastOkDate) {
         decisions.push({
           slug: row.slug,
@@ -141,7 +133,7 @@ export async function runWatchdog(
       };
       const outcome = await safeNotify(registry.get(adapterName), payload);
       if (outcome.status === "sent") {
-        recordMissedAlert(db, row.id, expected.toISOString());
+        await store.recordMissedAlert(row.id, expected.toISOString());
         decisions.push({
           slug: row.slug,
           outcome: "fired",
@@ -159,9 +151,9 @@ export async function runWatchdog(
       }
     }
   } finally {
-    if (ownDb) {
+    if (ownStore) {
       try {
-        db.close();
+        await store.close();
       } catch {}
     }
   }

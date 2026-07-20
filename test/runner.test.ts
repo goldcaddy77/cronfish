@@ -11,13 +11,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildClaudeArgs } from "../src/runner.ts";
-import {
-  getJobIdBySlug,
-  getRunRequest,
-  insertRunRequest,
-  openDb,
-  upsertJob,
-} from "../src/db.ts";
+import { openStore } from "../src/store/index.ts";
 import { loadJob } from "../src/jobs.ts";
 
 const RUNNER = new URL("../src/runner.ts", import.meta.url).pathname;
@@ -228,7 +222,7 @@ export default async function run() {
     expect(existsSync(lp)).toBe(false);
   }, 15_000);
 
-  test("daemon env: links the run request, records scheduled_for, stamps last_run", () => {
+  test("daemon env: links the run request, records scheduled_for, stamps last_run", async () => {
     const job = writeJob(
       root,
       "linked.ts",
@@ -244,11 +238,11 @@ export default async function run() {
     );
     // The daemon seeds the job row + run request before spawning the runner.
     const cronDir = join(root, "cron");
-    const seed = openDb(root);
-    upsertJob(seed, loadJob(job, undefined, cronDir));
-    const jobId = getJobIdBySlug(seed, "linked-ts")!;
-    const reqId = insertRunRequest(seed, jobId);
-    seed.close();
+    const seed = await openStore(root);
+    await seed.upsertJob(loadJob(job, undefined, cronDir));
+    const jobId = (await seed.getJobIdBySlug("linked-ts"))!;
+    const reqId = await seed.insertRunRequest(jobId);
+    await seed.close();
 
     const scheduledFor = "2026-07-17T12:00:00.000Z";
     const r = spawnRunner(root, job, {
@@ -258,8 +252,9 @@ export default async function run() {
     });
     expect(r.code).toBe(0);
 
-    const db = openDb(root);
-    const req = getRunRequest(db, reqId)!;
+    const store = await openStore(root);
+    const db = store.rawHandleForTests();
+    const req = (await store.getRunRequest(reqId))!;
     expect(req.invocation_id).not.toBeNull();
     const inv = db
       .query(
@@ -280,7 +275,7 @@ export default async function run() {
       .get() as { last_run_at: string | null; last_status: string | null };
     expect(jobRow.last_run_at).not.toBeNull();
     expect(jobRow.last_status).toBe("ok");
-    db.close();
+    await store.close();
   }, 20_000);
 
   test("runs a .sh job and captures stdout to the log", () => {

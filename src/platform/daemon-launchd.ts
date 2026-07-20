@@ -211,7 +211,8 @@ const HEARTBEAT_WAIT_MS = 15_000;
 const HEARTBEAT_POLL_MS = 500;
 
 export interface InstallDaemonOpts extends DaemonPlistConfig {
-  readHeartbeat: () => HeartbeatPeek | null;
+  // The heartbeat reader may be async (the store seam's reads are async).
+  readHeartbeat: () => HeartbeatPeek | null | Promise<HeartbeatPeek | null>;
   io?: DaemonServiceIo;
   heartbeatWaitMs?: number;
   sleep?: (ms: number) => Promise<void>;
@@ -310,7 +311,7 @@ export async function installDaemon(
   const deadline = Date.now() + waitMs;
   let live = false;
   for (;;) {
-    const hb = opts.readHeartbeat();
+    const hb = await opts.readHeartbeat();
     if (hb) {
       const tickMs = Date.parse(hb.last_tick_at);
       const fresh = Date.now() - tickMs <= HEARTBEAT_FRESH_MS;

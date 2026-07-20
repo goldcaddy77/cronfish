@@ -38,28 +38,18 @@ import {
 import { loadState, rememberPrefix } from "./state.ts";
 import {
   dbPath,
-  getDaemonHeartbeat,
-  getInvocationLogPath,
-  getJobIdBySlug,
-  getRunRequest,
-  insertRunRequest,
-  jobStats,
-  listRunHistory,
-  markDeleted,
-  openDb,
-  upsertJob,
+  openStore,
+  tryOpenStore,
   type DaemonHeartbeatRow,
-} from "./db.ts";
+} from "./store/index.ts";
 import {
   formatBytes,
   ledgerPruneTotal,
-  pruneLedger,
   pruneLogs,
   type LedgerPruneReport,
   type PruneReport,
   type SlugRetention,
 } from "./prune.ts";
-import { Database } from "bun:sqlite";
 import { startUiServer } from "./ui/server.ts";
 import pkg from "../package.json" with { type: "json" };
 
@@ -137,35 +127,18 @@ interface LastResult {
   finished_at: string | null;
 }
 
-function loadLastResults(slugs: string[]): Map<string, LastResult> {
+async function loadLastResults(
+  slugs: string[],
+): Promise<Map<string, LastResult>> {
   const out = new Map<string, LastResult>();
   if (slugs.length === 0) return out;
-  const path = dbPath(CONSUMER_ROOT);
-  if (!existsSync(path)) return out;
-  let db: Database;
+  // Read-only peek — must stay side-effect free (never create .cronfish/ or
+  // migrate) on a fresh consumer, same as peekHeartbeat.
+  if (!existsSync(dbPath(CONSUMER_ROOT))) return out;
+  const store = await tryOpenStore(CONSUMER_ROOT, { readonly: true });
+  if (!store) return out;
   try {
-    db = new Database(path, { readonly: true });
-  } catch {
-    return out;
-  }
-  try {
-    const rows = db
-      .query<
-        {
-          slug: string;
-          result_summary: string | null;
-          finished_at: string | null;
-        },
-        []
-      >(
-        `SELECT j.slug AS slug, i.result_summary AS result_summary, i.finished_at AS finished_at
-         FROM cron_invocations i
-         JOIN cron_jobs j ON j.id = i.job_id
-         WHERE i.id IN (
-           SELECT MAX(id) FROM cron_invocations GROUP BY job_id
-         )`,
-      )
-      .all();
+    const rows = await store.getLastResults();
     for (const r of rows) {
       out.set(r.slug, {
         summary: r.result_summary,
@@ -175,7 +148,7 @@ function loadLastResults(slugs: string[]): Map<string, LastResult> {
   } catch {
     // table may not have new columns yet; ignore
   } finally {
-    db.close();
+    await store.close();
   }
   return out;
 }
@@ -199,7 +172,7 @@ function truncate(s: string, max: number): string {
   return s.slice(0, Math.max(1, max - 1)) + "…";
 }
 
-function cmdList(): void {
+async function cmdList(): Promise<void> {
   const { jobs, errors } = discoverJobs(CRON_DIR);
   for (const e of errors) console.error(`[cronfish] ${e.path}: ${e.message}`);
   if (jobs.length === 0 && errors.length === 0) {
@@ -212,7 +185,7 @@ function cmdList(): void {
   const installed = new Set(p.listInstalled(PREFIX));
   const isInstalled = (slug: string): boolean =>
     installed.has(p.labelSuffixOf(slug));
-  const lastResults = loadLastResults(jobs.map((j) => j.slug));
+  const lastResults = await loadLastResults(jobs.map((j) => j.slug));
   const cols = Math.max(80, Number(process.stdout.columns) || 120);
   // Reserve 80 chars for the leading columns, give the rest to "last result".
   const resultBudget = Math.max(20, cols - 80);
@@ -312,7 +285,7 @@ function loadRunnerNames(): Set<string> {
   }
 }
 
-function cmdSync(): void {
+async function cmdSync(): Promise<void> {
   const p = platform();
   // Daemon guard: in daemon mode, per-job plists are retired — creating
   // them would double-fire every job. Sync then only updates the DB metadata
@@ -321,7 +294,7 @@ function cmdSync(): void {
   // installed OR a fresh heartbeat — never heartbeat alone: a momentarily
   // stale heartbeat (blocking alert send, KeepAlive restart gap) with the
   // daemon still installed must NOT flip sync back to per-job plists.
-  const daemonHb = liveHeartbeat();
+  const daemonHb = await liveHeartbeat();
   const daemonMode = daemonHb !== null || daemonPlistInstalled();
   if (daemonHb) {
     console.log(
@@ -453,11 +426,11 @@ function cmdSync(): void {
   // soft-delete anything no longer on disk. Failure-safe: a broken DB warns
   // once and does not abort the sync.
   try {
-    const db = openDb(CONSUMER_ROOT);
+    const store = await openStore(CONSUMER_ROOT);
     const presentSlugs: string[] = [];
     for (const j of jobs) {
       try {
-        upsertJob(db, j);
+        await store.upsertJob(j);
         presentSlugs.push(j.slug);
       } catch (e) {
         console.error(
@@ -465,8 +438,8 @@ function cmdSync(): void {
         );
       }
     }
-    markDeleted(db, presentSlugs);
-    db.close();
+    await store.markDeleted(presentSlugs);
+    await store.close();
   } catch (e) {
     console.error(`[cronfish] ledger sync skipped: ${(e as Error).message}`);
   }
@@ -483,7 +456,7 @@ function cmdSync(): void {
         perSlug,
       });
       if (report.totalDeleted > 0) printPruneReport(report, false);
-      printLedgerReport(pruneLedgerRows(global, perSlug), false);
+      printLedgerReport(await pruneLedgerRows(global, perSlug), false);
     } catch (e) {
       console.error(`[cronfish] auto-prune skipped: ${(e as Error).message}`);
     }
@@ -497,7 +470,7 @@ function cmdSync(): void {
   console.log("[cronfish] sync complete");
 }
 
-function flipEnabled(slug: string, enabled: boolean): void {
+async function flipEnabled(slug: string, enabled: boolean): Promise<void> {
   const path = findJobFile(CRON_DIR, slug);
   if (!path) throw new Error(`no job file for slug "${slug}"`);
   const raw = readFileSync(path, "utf-8");
@@ -513,7 +486,7 @@ function flipEnabled(slug: string, enabled: boolean): void {
     writeFileSync(path, rewriteTsEnabled(raw, enabled), "utf-8");
   }
   console.log(`[cronfish] ${enabled ? "enabled" : "disabled"} ${slug}`);
-  cmdSync();
+  await cmdSync();
 }
 
 function rewriteTsEnabled(source: string, enabled: boolean): string {
@@ -580,21 +553,16 @@ const DAEMON_FRESH_MS = 10_000;
 
 // Read-only heartbeat peek — never creates .cronfish/ or migrates (status on
 // a fresh consumer must stay side-effect free, same as loadLastResults).
-function peekHeartbeat(): DaemonHeartbeatRow | null {
-  const path = dbPath(CONSUMER_ROOT);
-  if (!existsSync(path)) return null;
-  let db: Database;
+async function peekHeartbeat(): Promise<DaemonHeartbeatRow | null> {
+  if (!existsSync(dbPath(CONSUMER_ROOT))) return null;
+  const store = await tryOpenStore(CONSUMER_ROOT, { readonly: true });
+  if (!store) return null;
   try {
-    db = new Database(path, { readonly: true });
-  } catch {
-    return null;
-  }
-  try {
-    return getDaemonHeartbeat(db);
+    return await store.getDaemonHeartbeat();
   } catch {
     return null; // pre-v6 db — no heartbeat table yet
   } finally {
-    db.close();
+    await store.close();
   }
 }
 
@@ -612,15 +580,15 @@ function daemonPlistInstalled(): boolean {
 
 // The daemon-mode guard shared by sync / watchdog: the heartbeat, but only
 // when it's fresh enough to prove a live daemon.
-function liveHeartbeat(): DaemonHeartbeatRow | null {
-  const hb = peekHeartbeat();
+async function liveHeartbeat(): Promise<DaemonHeartbeatRow | null> {
+  const hb = await peekHeartbeat();
   if (!hb) return null;
   const ageMs = Date.now() - Date.parse(hb.last_tick_at);
   return ageMs <= DAEMON_FRESH_MS ? hb : null;
 }
 
-function printDaemonLiveness(): void {
-  const hb = peekHeartbeat();
+async function printDaemonLiveness(): Promise<void> {
+  const hb = await peekHeartbeat();
   if (!hb) {
     console.log("[cronfish] daemon: not running (no heartbeat)");
     return;
@@ -632,13 +600,13 @@ function printDaemonLiveness(): void {
   );
 }
 
-function cmdStatus(slug?: string): void {
+async function cmdStatus(slug?: string): Promise<void> {
   const p = platform();
   const { jobs } = discoverJobs(CRON_DIR);
   const targets = slug ? jobs.filter((j) => j.slug === slug) : jobs;
   if (!slug) {
-    printDaemonLiveness();
-    cmdList();
+    await printDaemonLiveness();
+    await cmdList();
     return;
   }
   for (const j of targets) {
@@ -669,34 +637,30 @@ const RUN_POLL_STEP_MS = 300;
 // false when there is no fresh heartbeat — caller falls back to the v1
 // direct-spawn path so nothing breaks pre-migration.
 async function tryRunViaDaemon(slug: string, path: string): Promise<boolean> {
-  let db: Database;
+  const store = await tryOpenStore(CONSUMER_ROOT);
+  if (!store) return false;
   try {
-    db = openDb(CONSUMER_ROOT);
-  } catch {
-    return false;
-  }
-  try {
-    const hb = getDaemonHeartbeat(db);
+    const hb = await store.getDaemonHeartbeat();
     const fresh =
       hb !== null && Date.now() - Date.parse(hb.last_tick_at) <= DAEMON_FRESH_MS;
     if (!fresh) return false;
-    let jobId = getJobIdBySlug(db, slug);
+    let jobId = await store.getJobIdBySlug(slug);
     if (jobId === null) {
       // Brand-new file the daemon hasn't ticked over yet — seed the row.
-      upsertJob(db, loadJob(path, slug, CRON_DIR));
-      jobId = getJobIdBySlug(db, slug);
+      await store.upsertJob(loadJob(path, slug, CRON_DIR));
+      jobId = await store.getJobIdBySlug(slug);
     }
     if (jobId === null) return false;
-    const reqId = insertRunRequest(db, jobId);
+    const reqId = await store.insertRunRequest(jobId);
     console.log(
       `[cronfish] run request #${reqId} queued for daemon (pid ${hb!.pid})`,
     );
     const deadline = Date.now() + RUN_POLL_TOTAL_MS;
     while (Date.now() < deadline) {
       await Bun.sleep(RUN_POLL_STEP_MS);
-      const req = getRunRequest(db, reqId);
+      const req = await store.getRunRequest(reqId);
       if (req?.invocation_id) {
-        const logPath = getInvocationLogPath(db, req.invocation_id);
+        const logPath = await store.getInvocationLogPath(req.invocation_id);
         console.log(`[cronfish] invocation ${req.invocation_id} started`);
         if (logPath) console.log(`[cronfish] log: ${logPath}`);
         return true;
@@ -707,7 +671,7 @@ async function tryRunViaDaemon(slug: string, path: string): Promise<boolean> {
     );
     return true;
   } finally {
-    db.close();
+    await store.close();
   }
 }
 
@@ -828,11 +792,11 @@ function parseReportArgs(rest: string[], usage: string): ReportFlags {
 const HISTORY_USAGE =
   "usage: cronfish history [slug] [--limit N] [--since 7d]";
 
-function cmdHistory(rest: string[]): void {
+async function cmdHistory(rest: string[]): Promise<void> {
   const flags = parseReportArgs(rest, HISTORY_USAGE);
-  const db = openDb(CONSUMER_ROOT);
+  const store = await openStore(CONSUMER_ROOT);
   try {
-    const rows = listRunHistory(db, {
+    const rows = await store.listRunHistory({
       slug: flags.slug,
       limit: flags.limit,
       sinceIso: flags.sinceIso,
@@ -862,20 +826,20 @@ function cmdHistory(rest: string[]): void {
       );
     }
   } finally {
-    db.close();
+    await store.close();
   }
 }
 
 const STATS_USAGE = "usage: cronfish stats [--since 30d]";
 
-function cmdStats(rest: string[]): void {
+async function cmdStats(rest: string[]): Promise<void> {
   const flags = parseReportArgs(rest, STATS_USAGE);
   if (flags.slug !== undefined || flags.limit !== undefined) {
     throw new Error(STATS_USAGE);
   }
-  const db = openDb(CONSUMER_ROOT);
+  const store = await openStore(CONSUMER_ROOT);
   try {
-    const rows = jobStats(db, { sinceIso: flags.sinceIso });
+    const rows = await store.jobStats({ sinceIso: flags.sinceIso });
     if (rows.length === 0) {
       console.log("(no runs recorded)");
       return;
@@ -913,7 +877,7 @@ function cmdStats(rest: string[]): void {
       );
     }
   } finally {
-    db.close();
+    await store.close();
   }
 }
 
@@ -1050,7 +1014,7 @@ async function cmdWatchdog(): Promise<void> {
   // Daemon guard: a live daemon runs missed-run detection in-process (same
   // decision logic, same dedup table) — the standalone verb firing too would
   // double-alert. Kept working for v1 consumers with no daemon.
-  const hb = liveHeartbeat();
+  const hb = await liveHeartbeat();
   if (hb) {
     console.log(
       `[cronfish] daemon LIVE (pid ${hb.pid}) — the daemon owns missed-run detection; standalone watchdog skipped`,
@@ -1231,23 +1195,22 @@ function retentionToPruneInput(override?: SlugRetention): {
 // Ledger rows (invocations, run requests, missed alerts) age out on the same
 // window as logs. Failure-safe: a missing/locked db never breaks prune. A
 // consumer with no db yet has no rows to prune — never create one here.
-function pruneLedgerRows(
+async function pruneLedgerRows(
   global: SlugRetention,
   perSlug: Record<string, SlugRetention>,
   opts: { onlySlug?: string; dryRun?: boolean } = {},
-): LedgerPruneReport | null {
+): Promise<LedgerPruneReport | null> {
   if (!existsSync(dbPath(CONSUMER_ROOT))) return null;
-  const db = openDb(CONSUMER_ROOT);
+  const store = await openStore(CONSUMER_ROOT);
   try {
-    return pruneLedger({
-      db,
+    return await store.pruneLedger({
       global,
       perSlug,
       onlySlug: opts.onlySlug,
       dryRun: opts.dryRun,
     });
   } finally {
-    db.close();
+    await store.close();
   }
 }
 
@@ -1278,10 +1241,10 @@ function printPruneReport(report: PruneReport, dryRun: boolean): void {
   );
 }
 
-function cmdPrune(
+async function cmdPrune(
   slug: string | undefined,
   flags: { dryRun: boolean; maxAgeDays?: number; maxRuns?: number },
-): void {
+): Promise<void> {
   const hasFlagOverride =
     flags.maxAgeDays !== undefined || flags.maxRuns !== undefined;
   const override: SlugRetention | undefined = hasFlagOverride
@@ -1311,7 +1274,10 @@ function cmdPrune(
   });
   printPruneReport(report, flags.dryRun);
   printLedgerReport(
-    pruneLedgerRows(global, perSlug, { onlySlug: slug, dryRun: flags.dryRun }),
+    await pruneLedgerRows(global, perSlug, {
+      onlySlug: slug,
+      dryRun: flags.dryRun,
+    }),
     flags.dryRun,
   );
 }
@@ -1415,7 +1381,7 @@ async function main(): Promise<void> {
       cmdInit();
       return;
     case "list":
-      cmdList();
+      await cmdList();
       return;
     case "next": {
       const slug = rest[0] && /^\d+$/.test(rest[0]) ? undefined : rest[0];
@@ -1425,7 +1391,7 @@ async function main(): Promise<void> {
       return;
     }
     case "sync":
-      cmdSync();
+      await cmdSync();
       return;
     case "prune": {
       const valueFlags = new Set(["--max-age-days", "--max-runs"]);
@@ -1450,7 +1416,7 @@ async function main(): Promise<void> {
         slug = a;
         break;
       }
-      cmdPrune(slug, {
+      await cmdPrune(slug, {
         dryRun: rest.includes("--dry-run"),
         maxAgeDays: flag("--max-age-days"),
         maxRuns: flag("--max-runs"),
@@ -1459,18 +1425,18 @@ async function main(): Promise<void> {
     }
     case "enable":
       if (!rest[0]) throw new Error("usage: cronfish enable <slug>");
-      flipEnabled(rest[0], true);
+      await flipEnabled(rest[0], true);
       return;
     case "disable":
       if (!rest[0]) throw new Error("usage: cronfish disable <slug>");
-      flipEnabled(rest[0], false);
+      await flipEnabled(rest[0], false);
       return;
     case "delete":
       if (!rest[0]) throw new Error("usage: cronfish delete <slug> [--yes]");
       cmdDelete(rest[0], rest.includes("--yes"));
       return;
     case "status":
-      cmdStatus(rest[0]);
+      await cmdStatus(rest[0]);
       return;
     case "errors": {
       const clear = rest.includes("--clear");
@@ -1499,10 +1465,10 @@ async function main(): Promise<void> {
       return;
     }
     case "history":
-      cmdHistory(rest);
+      await cmdHistory(rest);
       return;
     case "stats":
-      cmdStats(rest);
+      await cmdStats(rest);
       return;
     case "watchdog":
       await cmdWatchdog();

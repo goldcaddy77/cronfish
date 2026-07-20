@@ -2,12 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import {
-  getJobIdBySlug,
-  openDb,
-  startInvocation,
-  upsertJob,
-} from "../src/db.ts";
+import { openStore } from "../src/store/index.ts";
 import { intervalSecondsAt, nextFireAfter } from "../src/schedule.ts";
 import { decideWatchdog, runWatchdog } from "../src/watchdog.ts";
 
@@ -155,22 +150,25 @@ describe("runWatchdog (integration)", () => {
       }),
     );
 
-    const db = openDb(root);
-    upsertJob(db, {
+    const store = await openStore(root);
+    await store.upsertJob({
       slug: "demo-md",
       path: join(root, "cron", "demo.md"),
       kind: "md",
       enabled: true,
       schedule: "5m",
     });
-    const jobId = getJobIdBySlug(db, "demo-md")!;
-    const inv = startInvocation(db, jobId, "schedule", "/log/1");
+    const jobId = (await store.getJobIdBySlug("demo-md"))!;
+    const inv = await store.startInvocation(jobId, "schedule", "/log/1");
     // Successful run 30 minutes ago — well past grace.
     const lastOk = new Date(Date.now() - 30 * 60 * 1000).toISOString();
-    db.prepare(
-      "UPDATE cron_invocations SET started_at = $s, finished_at = $s, status = 'ok', exit_code = 0 WHERE id = $id",
-    ).run({ $s: lastOk, $id: inv });
-    db.close();
+    store
+      .rawHandleForTests()
+      .prepare(
+        "UPDATE cron_invocations SET started_at = $s, finished_at = $s, status = 'ok', exit_code = 0 WHERE id = $id",
+      )
+      .run({ $s: lastOk, $id: inv });
+    await store.close();
 
     const first = await runWatchdog({ consumerRoot: root });
     expect(first.find((d) => d.slug === "demo-md")?.outcome).toBe("fired");
