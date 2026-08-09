@@ -28,5 +28,5 @@ export type {
 export { RUN_REQUEST_EXPIRY_MS } from "./interface.ts";
 export { SqliteStore } from "./sqlite.ts";
 export { PostgresStore } from "./postgres.ts";
-export { openStore, tryOpenStore } from "./open.ts";
+export { openStore, storeDefinitelyAbsent, tryOpenStore } from "./open.ts";
 export { dbPath, logsRoot } from "./paths.ts";

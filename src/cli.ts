@@ -37,8 +37,8 @@ import {
 } from "./platform/daemon-launchd.ts";
 import { loadState, rememberPrefix } from "./state.ts";
 import {
-  dbPath,
   openStore,
+  storeDefinitelyAbsent,
   tryOpenStore,
   type DaemonHeartbeatRow,
 } from "./store/index.ts";
@@ -133,8 +133,11 @@ async function loadLastResults(
   const out = new Map<string, LastResult>();
   if (slugs.length === 0) return out;
   // Read-only peek — must stay side-effect free (never create .cronfish/ or
-  // migrate) on a fresh consumer, same as peekHeartbeat.
-  if (!existsSync(dbPath(CONSUMER_ROOT))) return out;
+  // migrate) on a fresh consumer, same as peekHeartbeat. `tryOpenStore` already
+  // guarantees that for both backends (a readonly sqlite open of a missing file
+  // throws and is caught; postgres never touches the filesystem), so there is
+  // no local-file precheck here — one used to live here and made this return
+  // empty forever on a Postgres consumer. See storeDefinitelyAbsent (CAD-1104).
   const store = await tryOpenStore(CONSUMER_ROOT, { readonly: true });
   if (!store) return out;
   try {
@@ -553,8 +556,11 @@ const DAEMON_FRESH_MS = 10_000;
 
 // Read-only heartbeat peek — never creates .cronfish/ or migrates (status on
 // a fresh consumer must stay side-effect free, same as loadLastResults).
+// `tryOpenStore` is fail-soft for both backends, so no local-file precheck: the
+// one that used to sit here checked for a SQLite file on a Postgres consumer,
+// where it can never exist, and so reported a live daemon dead for 20 days
+// (CAD-1104). Absence is only ever a local question for sqlite.
 async function peekHeartbeat(): Promise<DaemonHeartbeatRow | null> {
-  if (!existsSync(dbPath(CONSUMER_ROOT))) return null;
   const store = await tryOpenStore(CONSUMER_ROOT, { readonly: true });
   if (!store) return null;
   try {
@@ -1200,7 +1206,11 @@ async function pruneLedgerRows(
   perSlug: Record<string, SlugRetention>,
   opts: { onlySlug?: string; dryRun?: boolean } = {},
 ): Promise<LedgerPruneReport | null> {
-  if (!existsSync(dbPath(CONSUMER_ROOT))) return null;
+  // Unlike the read-only peeks above this opens for WRITE, and a sqlite open
+  // creates the db — hence a real guard, but a backend-aware one. The
+  // backend-blind version silently skipped ledger pruning entirely on a
+  // Postgres consumer, so retention quietly stopped being enforced (CAD-1104).
+  if (storeDefinitelyAbsent(CONSUMER_ROOT)) return null;
   const store = await openStore(CONSUMER_ROOT);
   try {
     return await store.pruneLedger({
