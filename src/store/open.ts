@@ -9,10 +9,35 @@
 // semantics hold for BOTH backends: a missing sqlite file OR an unreachable /
 // misconfigured postgres returns null instead of throwing.
 
+import { existsSync } from "node:fs";
 import { loadStoreConfig, resolveStoreUrl } from "../config.ts";
 import type { CronStore } from "./interface.ts";
+import { dbPath } from "./paths.ts";
 import { PostgresStore } from "./postgres.ts";
 import { openSqliteStore, tryOpenSqliteStore } from "./sqlite.ts";
+
+// Is there definitively no store to read — i.e. may a caller skip opening one
+// without risking a false "nothing here"? This only ever answers true for
+// SQLite, where absence is a local fact: no file, no store, and opening one
+// would CREATE it, which read paths must never do on a fresh consumer.
+//
+// For Postgres the honest answer is "ask the server". The store is remote, so
+// no local path can prove its absence; callers go through `tryOpenStore`,
+// which is already fail-soft when the server is unreachable.
+//
+// This exists because call sites used to inline `existsSync(dbPath(root))` as
+// a stand-in for "is there a store?". That predicate is backend-blind, and on
+// a Postgres consumer it is not merely wrong but PERMANENTLY wrong: the SQLite
+// file it looks for will never exist, so every guarded read path reports empty
+// forever, without erroring. `cronfish status` printed "daemon: not running
+// (no heartbeat)" for 20 days at a daemon that was ticking at 1 Hz throughout
+// (CAD-1104). Backend selection belongs in this file, which already owns it —
+// never at a call site.
+export function storeDefinitelyAbsent(consumerRoot: string): boolean {
+  const cfg = loadStoreConfig(consumerRoot);
+  if (cfg.type === "postgres") return false;
+  return !existsSync(dbPath(consumerRoot));
+}
 
 // Open the consumer's store, dispatching on the configured backend. Migrates to
 // head. Throws on a hard failure (unreachable postgres, invalid config) — same
