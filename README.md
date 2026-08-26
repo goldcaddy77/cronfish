@@ -28,6 +28,8 @@ one-paragraph brief to the #daily Slack channel.
 
 Drop it in `cron/`, run `cronfish sync`, and launchd runs it every morning — the body _is_ the job,
 handed to an LLM at fire time. No script to write, no glue code. **Markdown is a valid cron job.**
+(Or let [`cronfish new`](#creating-a-job--cronfish-new) write it for you — it validates the schedule
+and shows the next fire times before anything lands on disk.)
 
 When the work _is_ deterministic — a backup, a sync, a healthcheck — write it as `.ts` (Bun) or
 `.sh` (bash) instead. Same frontmatter, same `cronfish sync`, no LLM in the loop. One scheduler,

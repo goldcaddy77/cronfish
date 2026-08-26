@@ -1584,7 +1584,8 @@ function cmdInit(): void {
   }
   ensureGitignoreBlock();
   console.log(
-    "\nNext: edit cron/hello.md, cron/touch.ts, or cron/ping.sh, flip `enabled: true`, run `cronfish sync`.",
+    "\nNext: edit cron/hello.md, cron/touch.ts, or cron/ping.sh, flip `enabled: true`, run `cronfish sync`." +
+      "\nCreate your first real job with `cronfish new <name> --schedule <expr>` — it validates and previews the fire times before writing.",
   );
 }
 
