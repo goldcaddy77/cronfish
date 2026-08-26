@@ -1,3 +1,10 @@
+# [0.21.0](https://github.com/goldcaddy77/cronfish/compare/v0.20.0...v0.21.0) (2026-08-26)
+
+
+### Features
+
+* **pkg:** export the authoring seam as cronfish/authoring ([#29](https://github.com/goldcaddy77/cronfish/issues/29)) ([95f98e3](https://github.com/goldcaddy77/cronfish/commit/95f98e3237ef1e3ce51b0e4cc4d5b5dcc338c0fb))
+
 # [0.20.0](https://github.com/goldcaddy77/cronfish/compare/v0.19.0...v0.20.0) (2026-08-26)
 
 
