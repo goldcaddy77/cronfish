@@ -125,9 +125,18 @@ function warn(ctx: DaemonCtx, msg: string): void {
 // and any heartbeat sweeping cron/.errors/ all see it. Best-effort: a
 // sentinel write must never take down a tick.
 function flagBadJob(ctx: DaemonCtx, slug: string, reason: string): void {
-  warn(ctx, `sync ${slug}: ${reason}`);
+  // The sentinel filename is hash(reason), so the SAME failure must produce
+  // the SAME reason string from every code path that detects it. A broken job
+  // is seen twice — once when its next-run computation throws, once when the
+  // row is parked — and decorating each with its own suffix produced TWO
+  // sentinel files for one job. Two rows in `cronfish errors` for one problem
+  // is the same dilution this release exists to remove, in miniature.
+  const detail =
+    `${reason} — this job will NOT fire; it stays parked until the file is` +
+    ` edited, and \`cronfish sync\` clears this once it parses`;
+  warn(ctx, `sync ${slug}: ${detail}`);
   try {
-    writeSentinel(ctx.cronDir, slug, reason, "sync");
+    writeSentinel(ctx.cronDir, slug, detail, "sync");
   } catch {}
 }
 
@@ -247,11 +256,7 @@ async function syncFiles(ctx: DaemonCtx, now: Date): Promise<void> {
           // Stored schedule no longer computes (e.g. cron expr with no
           // future occurrence). Park it — one warn, then quiet until edited.
           parked.set(prev!.id, (e as Error).message);
-          flagBadJob(
-            ctx,
-            slug,
-            `${(e as Error).message} — parked until the file is edited (it will not fire; \`cronfish sync\` clears this once it parses)`,
-          );
+          flagBadJob(ctx, slug, (e as Error).message);
         }
       }
     } catch (e) {
@@ -259,11 +264,7 @@ async function syncFiles(ctx: DaemonCtx, now: Date): Promise<void> {
       // existing row: leave state/schedule as-is until the file parses again.
       // It still gets a sentinel: an unloadable job never fires, and that has
       // to be visible outside the daemon log.
-      flagBadJob(
-        ctx,
-        slug,
-        `${(e as Error).message} — this job will not fire (\`cronfish sync\` clears this once it parses)`,
-      );
+      flagBadJob(ctx, slug, (e as Error).message);
     }
   }
 
