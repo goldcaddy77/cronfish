@@ -1,3 +1,10 @@
+## [0.21.3](https://github.com/goldcaddy77/cronfish/compare/v0.21.2...v0.21.3) (2026-08-26)
+
+
+### Bug Fixes
+
+* **list:** describe a one-time job by its run_at, not as BAD ([#32](https://github.com/goldcaddy77/cronfish/issues/32)) ([c6aeb7d](https://github.com/goldcaddy77/cronfish/commit/c6aeb7d0178ac486969a6db80c8eb5b1e7d197a4))
+
 ## [0.21.2](https://github.com/goldcaddy77/cronfish/compare/v0.21.1...v0.21.2) (2026-08-26)
 
 
