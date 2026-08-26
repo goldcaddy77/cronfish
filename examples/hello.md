@@ -1,5 +1,5 @@
 ---
-schedule: "0 9 * * *" # every day at 9:00am (5-field cron, or try "every day")
+schedule: "0 9 * * *" # every day at 9:00am (5-field cron, or the equivalent human form "every day at 9")
 model: haiku # haiku | sonnet | opus | a raw ID | local:<name>
 enabled: false # flip on with `cronfish enable hello-md`
 timeout: 120 # seconds; the runner kills the job past this

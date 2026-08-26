@@ -481,4 +481,196 @@ export default async function run() {}
     expect(r.code).toBe(0);
     expect(`${r.out}${r.err}`).toMatch(/below launchd's ~10s relaunch floor/);
   });
+
+  // --- cronfish new: the validated authoring front door (CAD-1587) ---
+
+  test("new writes a recurring job and previews the fire times before writing", () => {
+    const r = runCli(ctx, [
+      "new",
+      "spend watchdog",
+      "--schedule",
+      "every day at 07:20",
+      "--body",
+      "Check today's spend.",
+      "--model",
+      "sonnet",
+    ]);
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("spend-watchdog-md");
+    // Three resolved fire times, not a promise that it parsed.
+    expect(r.out.match(/07:20:00/g) ?? []).toHaveLength(3);
+    const src = readFileSync(join(ctx.root, "cron", "spend-watchdog.md"), "utf-8");
+    expect(src).toContain('schedule: "every day at 07:20"');
+    expect(src).toContain('model: "sonnet"');
+    expect(src).toContain("enabled: true");
+    // And the job it wrote actually syncs.
+    expect(runCli(ctx, ["sync"]).code).toBe(0);
+  });
+
+  test("new --at writes a one-time job into cron/one-time/, never a pinned cron", () => {
+    const r = runCli(ctx, ["new", "flip back", "--at", "+2h", "--body", "Flip it back."]);
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("one-time/flip-back-md");
+    const src = readFileSync(join(ctx.root, "cron", "one-time", "flip-back.md"), "utf-8");
+    expect(src).toContain("run_at:");
+    expect(src).not.toContain("schedule:");
+    expect(runCli(ctx, ["sync"]).code).toBe(0);
+  });
+
+  test("new refuses an unparseable schedule and writes nothing", () => {
+    const r = runCli(ctx, ["new", "oops", "--schedule", "every morning at 8", "--body", "x"]);
+    expect(r.code).toBe(1);
+    expect(r.err).toContain("unrecognized human form");
+    expect(existsSync(join(ctx.root, "cron", "oops.md"))).toBe(false);
+  });
+
+  test("new refuses a run_at in the past", () => {
+    const r = runCli(ctx, ["new", "stale", "--at", "2020-01-01T00:00:00Z", "--body", "x"]);
+    expect(r.code).toBe(1);
+    expect(r.err).toContain("in the past");
+  });
+
+  test("new refuses --schedule and --at together", () => {
+    const r = runCli(ctx, ["new", "both", "--schedule", "0 9 * * *", "--at", "+1h", "--body", "x"]);
+    expect(r.code).toBe(1);
+    expect(r.err).toContain("pick one");
+  });
+
+  test("new --dry-run previews and writes nothing", () => {
+    const r = runCli(ctx, ["new", "peek", "--schedule", "0 9 * * *", "--body", "x", "--dry-run"]);
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("nothing written");
+    expect(existsSync(join(ctx.root, "cron", "peek.md"))).toBe(false);
+  });
+
+  test("new --json emits a machine-readable plan for agents", () => {
+    const r = runCli(ctx, ["new", "botjob", "--schedule", "0 9 * * *", "--body", "x", "--json"]);
+    expect(r.code).toBe(0);
+    const plan = JSON.parse(r.out);
+    expect(plan.slug).toBe("botjob-md");
+    expect(plan.one_time).toBe(false);
+    expect(plan.next_fires).toHaveLength(3);
+    expect(plan.written).toBe(true);
+    expect(existsSync(join(ctx.root, "cron", "botjob.md"))).toBe(true);
+  });
+
+  test("new --kind sh writes an executable script that loads", () => {
+    const r = runCli(ctx, [
+      "new",
+      "diskcheck",
+      "--kind",
+      "sh",
+      "--schedule",
+      "every 6 hours",
+      "--body",
+      "df -h",
+    ]);
+    expect(r.code).toBe(0);
+    const list = runCli(ctx, ["list"]);
+    expect(list.out).toContain("diskcheck-sh");
+  });
+
+  // --- the loud load path (CAD-1577) ---
+
+  test("sync exits non-zero and summarizes when a job cannot be scheduled", () => {
+    writeJob(ctx, "good.md", MD_ENABLED);
+    writeJob(
+      ctx,
+      "bad.md",
+      `---
+schedule: "every day at 07:20 sharp"
+enabled: true
+---
+hi
+`,
+    );
+    const r = runCli(ctx, ["sync"]);
+    expect(r.code).toBe(1);
+    expect(r.err).toContain("job(s) that will NOT run");
+    expect(r.err).toContain("bad-md");
+    // The healthy job still installs — strictness reports, it doesn't abort.
+    expect(listPlists(ctx).join()).toContain("good-md");
+    // And the failure leaves a durable sentinel, not just a scrolled-off line.
+    expect(errorFiles(ctx).length).toBeGreaterThan(0);
+    expect(runCli(ctx, ["errors"]).out).toContain("bad-md");
+  });
+
+  test("sync goes back to zero — and reaps the sentinel — once the job is fixed", () => {
+    writeJob(
+      ctx,
+      "bad.md",
+      `---
+schedule: "every day at 07:20 sharp"
+enabled: true
+---
+hi
+`,
+    );
+    expect(runCli(ctx, ["sync"]).code).toBe(1);
+    writeJob(ctx, "bad.md", MD_ENABLED);
+    const r = runCli(ctx, ["sync"]);
+    expect(r.code).toBe(0);
+    expect(errorFiles(ctx)).toHaveLength(0);
+  });
+
+  test("a one-time job with an unparseable run_at is loud too", () => {
+    writeOneTime(
+      ctx,
+      "broken.md",
+      `---
+run_at: "next tuesday"
+---
+hi
+`,
+    );
+    const r = runCli(ctx, ["sync"]);
+    expect(r.code).toBe(1);
+    expect(r.err).toContain("job(s) that will NOT run");
+  });
+
+  test("a disabled job with a bad schedule stays quiet — off is intentional", () => {
+    writeJob(
+      ctx,
+      "parked.md",
+      `---
+schedule: "every day at 07:20 sharp"
+enabled: false
+---
+hi
+`,
+    );
+    const r = runCli(ctx, ["sync"]);
+    expect(r.code).toBe(0);
+    expect(errorFiles(ctx)).toHaveLength(0);
+  });
+
+  test("next previews cron (it used to say 'not implemented') and exits non-zero on a bad job", () => {
+    writeJob(
+      ctx,
+      "daily.md",
+      `---
+schedule: "0 9 * * *"
+enabled: true
+---
+hi
+`,
+    );
+    const ok = runCli(ctx, ["next", "daily-md", "3"]);
+    expect(ok.code).toBe(0);
+    expect(ok.out).not.toContain("not implemented");
+    expect(ok.out.match(/09:00:00/g) ?? []).toHaveLength(3);
+
+    writeJob(
+      ctx,
+      "bad.md",
+      `---
+schedule: "every day at 07:20 sharp"
+enabled: true
+---
+hi
+`,
+    );
+    const bad = runCli(ctx, ["next"]);
+    expect(bad.code).toBe(1);
+  });
 });

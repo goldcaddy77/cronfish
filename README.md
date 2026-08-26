@@ -18,7 +18,7 @@ The pitch in one file. This is a complete, scheduled cron job:
 
 ```markdown
 ---
-schedule: "every morning at 8"
+schedule: "every day at 8:00"
 model: sonnet
 ---
 
@@ -73,6 +73,50 @@ bunx cronfish init               # scaffolds starter jobs in cron/ (disabled)
 bunx cronfish enable hello-md    # flip on, sync to launchd
 bunx cronfish list               # see what's scheduled and what's loaded
 ```
+
+## Creating a job — `cronfish new`
+
+You can hand-write a file into `cron/` and cronfish will pick it up; files are the storage and the
+source of truth, and always will be. But `cronfish new` is the front door, because a hand-written
+schedule that doesn't parse is a job that never fires:
+
+```bash
+cronfish new "spend watchdog" --schedule "every day at 07:20" \
+  --body "Check today's API spend and alert if it's over budget."
+
+  spend-watchdog-md  (spend-watchdog.md)
+  schedule: cron "20 7 * * *" (local time)
+  next:     2026-08-27T07:20:00-04:00  (in 21h 6m)
+            2026-08-28T07:20:00-04:00  (in 1d 21h 6m)
+            2026-08-29T07:20:00-04:00  (in 2d 21h 6m)
+
+[cronfish] wrote spend-watchdog.md — validated by loading it back
+```
+
+The resolved fire times print **before** anything is written. That's the point: "I hope this
+parses" becomes "I watched it resolve to Aug 27 at 07:20." Four guarantees:
+
+- The schedule is checked by the same parser the daemon uses, so "it validated" and "it will fire"
+  cannot diverge.
+- Recurring and one-time are an explicit either/or — `--schedule` or `--at`, never both. A
+  recurring cron expression pinned to a single date (`7 9 29 8 *`) is not a one-shot job; it fires
+  again next year. `--at` writes a real one-time job into `cron/one-time/`.
+- The written file is read back through cronfish's real loader before the command succeeds. Exit 0
+  means the job is loadable, not merely written.
+- Nothing is written on any validation failure.
+
+```bash
+cronfish new "flip back" --at 2026-08-29T09:07 --body "Flip the ranking model back."
+cronfish new diskcheck --kind sh --schedule "every 6 hours" --body-file ./check.sh
+cronfish new nightly --schedule "0 3 * * *" --body-file - --dry-run   # preview, write nothing
+cronfish new botjob --schedule "every 15 minutes" --body "..." --json  # machine-readable plan
+```
+
+Run `cronfish new` with no arguments for the full flag list (`--kind`, `--description`, `--model`,
+`--timeout`, `--retries`, `--concurrency`, `--grace`, `--disabled`, `--force`, `--count`).
+
+**Agents and scripts should use `--json`**: it emits the slug, the resolved schedule, the next fire
+times, and the file contents as structured output, and still fails loudly on a bad schedule.
 
 ## Where jobs live
 
@@ -181,9 +225,12 @@ fails with a clear error if the key is unset.
 
 ## One-shot jobs — `cron/one-time/`
 
-Drop a `.md`, `.ts`, or `.sh` under `cron/one-time/` to schedule a job that
-fires **exactly once** at a `run_at` timestamp, then archives itself. Same
-file format as recurring jobs except `schedule:` is replaced by `run_at:`.
+A job under `cron/one-time/` fires **exactly once** at a `run_at` timestamp,
+then archives itself. Same file format as recurring jobs except `schedule:` is
+replaced by `run_at:`. Create one with `cronfish new <name> --at <when>`, which
+refuses a timestamp in the past and puts the file in the right folder — a
+recurring cron expression pinned to a single date is the wrong shape and fires
+again next year.
 
 ```yaml
 ---
@@ -230,15 +277,29 @@ same folder without them being reaped.
 
 Smoke-test template: `templates/_examples/one-time/echo-at.md`.
 
-## `schedule:` — one key, five shapes
+## `schedule:` — one key, six shapes
 
-| Input                     | Meaning                                       |
-| ------------------------- | --------------------------------------------- |
-| `"0 9 * * *"`             | cron (5 fields, integers or `*`)              |
-| `"every 5 minutes"`       | human (`every minute`, `every N hours`, etc.) |
-| `60`                      | bare number → seconds                         |
-| `"60s"` / `"5m"` / `"1d"` | compact unit suffix                           |
-| `"manual"`                | no autoschedule; run only via `cronfish run`  |
+| Input                     | Meaning                                                          |
+| ------------------------- | ---------------------------------------------------------------- |
+| `"0 9 * * *"`             | cron (5 fields, integers or `*`)                                 |
+| `"every day at 07:20"`    | human calendar → cron. Also `every monday at 8:30`, `every hour at :15` |
+| `"every 5 minutes"`       | human interval (`every minute`, `every N hours`, etc.)           |
+| `60`                      | bare number → seconds                                            |
+| `"60s"` / `"5m"` / `"1d"` | compact unit suffix                                              |
+| `"manual"`                | no autoschedule; run only via `cronfish run`                     |
+
+The two human families are different things and it matters: **`at` pins a wall-clock time** and
+lowers to a cron expression evaluated in local time (DST-correct). Everything else lowers to a
+fixed interval measured from the last run. Times accept `9`, `07:20`, `3pm`, `8:05 AM`.
+
+A few readable-looking forms are **deliberately refused** rather than guessed at, with an error
+that names the fix:
+
+| Refused           | Why                                                             |
+| ----------------- | ---------------------------------------------------------------- |
+| `every day`       | interval-from-now or midnight? Say `every 1 days` or `every day at 0:00` |
+| `every morning`   | no defensible hour — name it                                    |
+| `every weekday`   | needs a day-of-week range, which launchd's `StartCalendarInterval` can't express |
 
 `manual` jobs are discovered, validated, and listed, but no plist is installed and no calendar
 fires them. Use it for scheduling candidates — jobs you're staging in `cron/` before flipping on
@@ -281,9 +342,12 @@ as a single job instead of many fast fires.
 
 ```
 cronfish init                       scaffold cron/hello.md + cron/touch.ts + cron/ping.sh + cron/watchdog.sh
+cronfish new <name> --schedule <expr>   create a recurring job — validates, previews fire times, then writes
+cronfish new <name> --at <when>         create a one-time job in cron/one-time/ (fires once, then archives)
+                [--kind md|ts|sh] [--body <text> | --body-file <path>] [--dry-run] [--json]
 cronfish list                       every job + state
-cronfish next [slug] [N]            preview the next N fire times (default 5)
-cronfish sync                       reconcile cron/ ↔ launchd (idempotent)
+cronfish next [slug] [N]            preview the next N fire times (default 5); non-zero if a job can't be scheduled
+cronfish sync                       reconcile cron/ ↔ launchd (idempotent); non-zero if ANY job failed to load
 cronfish enable <slug>              flip enabled, then sync
 cronfish disable <slug>             flip disabled, then sync
 cronfish delete <slug> --yes        bootout + remove plist + job file
@@ -303,6 +367,25 @@ cronfish ui uninstall               bootout + remove dashboard daemon
 cronfish ui status                  show dashboard daemon state
 cronfish --version
 ```
+
+### Silence means healthy — the load path is loud
+
+A job that cannot be loaded, or whose `schedule:` cannot be parsed, will never fire. cronfish
+refuses to let that look like success:
+
+- **`cronfish sync` exits non-zero** and ends with a summary block naming every job that will not
+  run. Healthy jobs still install — strictness reports, it doesn't abort the reconcile.
+- **Every such job gets a durable sentinel** in `cron/.errors/`, visible via `cronfish errors` and
+  the dashboard. This covers recurring jobs, not just one-shot ones. Sync-class sentinels
+  self-heal: the next clean `cronfish sync` clears any whose error no longer occurs.
+- **The daemon writes one too.** A parked or unloadable job used to produce a single line in the
+  daemon log, which is not a surface anyone reads.
+- **`cronfish next` exits non-zero** if any job's schedule can't be previewed.
+
+Wire `cronfish sync` into CI or a pre-commit hook and a broken schedule fails the build. The
+failure mode this replaces: a job silently marked `BAD`, skipped, and never mentioned again — a
+watchdog reporting nothing because it never ran, indistinguishable from a watchdog reporting
+all-clear.
 
 ## Alerts
 
@@ -525,7 +608,7 @@ read, search, and draft but never edit files or shell out:
 
 ```
 ---
-schedule: every morning at 8
+schedule: every day at 8:00
 read_only: true
 ---
 ```

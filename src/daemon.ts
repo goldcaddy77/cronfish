@@ -119,6 +119,18 @@ function warn(ctx: DaemonCtx, msg: string): void {
   (ctx.log ?? ((m: string) => console.error(m)))(`[daemon] ${msg}`);
 }
 
+// A job the daemon cannot load or cannot schedule will never fire. Warning
+// into the daemon log is not enough — nobody reads a healthy-looking log
+// (CAD-1577). Write a durable sentinel so `cronfish errors`, the dashboard,
+// and any heartbeat sweeping cron/.errors/ all see it. Best-effort: a
+// sentinel write must never take down a tick.
+function flagBadJob(ctx: DaemonCtx, slug: string, reason: string): void {
+  warn(ctx, `sync ${slug}: ${reason}`);
+  try {
+    writeSentinel(ctx.cronDir, slug, reason, "sync");
+  } catch {}
+}
+
 // --- 1. File sync (size+mtime scan) ---
 //
 // Stat every job file; only files whose size+mtime differ from the stored
@@ -235,16 +247,23 @@ async function syncFiles(ctx: DaemonCtx, now: Date): Promise<void> {
           // Stored schedule no longer computes (e.g. cron expr with no
           // future occurrence). Park it — one warn, then quiet until edited.
           parked.set(prev!.id, (e as Error).message);
-          warn(
+          flagBadJob(
             ctx,
-            `sync ${slug}: ${(e as Error).message} — parked until the file is edited`,
+            slug,
+            `${(e as Error).message} — parked until the file is edited (it will not fire; \`cronfish sync\` clears this once it parses)`,
           );
         }
       }
     } catch (e) {
       // A broken file must not kill the tick — and must not clobber the
       // existing row: leave state/schedule as-is until the file parses again.
-      warn(ctx, `sync ${slug}: ${(e as Error).message}`);
+      // It still gets a sentinel: an unloadable job never fires, and that has
+      // to be visible outside the daemon log.
+      flagBadJob(
+        ctx,
+        slug,
+        `${(e as Error).message} — this job will not fire (\`cronfish sync\` clears this once it parses)`,
+      );
     }
   }
 
