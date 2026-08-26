@@ -118,6 +118,19 @@ Run `cronfish new` with no arguments for the full flag list (`--kind`, `--descri
 **Agents and scripts should use `--json`**: it emits the slug, the resolved schedule, the next fire
 times, and the file contents as structured output, and still fails loudly on a bad schedule.
 
+The same seam is importable, for a tool that wants to preview before committing:
+
+```ts
+import { planNewJob, commitNewJob, previewFires } from "cronfish/authoring";
+
+const plan = planNewJob("./cron", { name: "nightly", kind: "sh", schedule: "0 3 * * *", body: "..." });
+console.log(plan.fires); // show the user, get a yes
+commitNewJob("./cron", plan);
+```
+
+`planNewJob` is pure — it validates and renders but touches nothing. `commitNewJob` writes and
+round-trips. `cronfish/schedule` exports `dispatchSchedule` if you only need to validate a string.
+
 ## Where jobs live
 
 `cron/` is a tree, not a flat directory. Any `.md`, `.ts`, or `.sh` file at any depth is a job.
