@@ -1,3 +1,10 @@
+# [0.22.0](https://github.com/goldcaddy77/cronfish/compare/v0.21.5...v0.22.0) (2026-08-26)
+
+
+### Features
+
+* **schedule:** warn on a cron that pins both day-of-month and month ([#35](https://github.com/goldcaddy77/cronfish/issues/35)) ([679e74f](https://github.com/goldcaddy77/cronfish/commit/679e74fbe926df0c9a9edccabfa29a15e6dd34a1))
+
 ## [0.21.5](https://github.com/goldcaddy77/cronfish/compare/v0.21.4...v0.21.5) (2026-08-26)
 
 
