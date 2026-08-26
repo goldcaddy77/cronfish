@@ -187,6 +187,39 @@ function truncate(s: string, max: number): string {
   return s.slice(0, Math.max(1, max - 1)) + "…";
 }
 
+// The "schedule" column for one job.
+//
+// One-time jobs have no `schedule:` AT ALL — that is their contract, enforced
+// at load time. Dispatching their absent schedule therefore always threw, and
+// every healthy one-time job rendered as `BAD(schedule: required)`. That is
+// worse than cosmetic: `BAD` is the loud signal that a job will never fire, so
+// a list that cries wolf on every one-shot job is a list you learn to skim —
+// and a BAD list you skim is one that hides the next real failure. A one-time
+// job is now described by its run_at, and `BAD` is reserved for jobs that
+// genuinely will not run.
+function scheduleCell(j: JobMeta): string {
+  if (j.oneTime) {
+    if (j.runAtMs === undefined) return `BAD(one-time: missing run_at)`;
+    if (j.executedAt) return `once (executed)`;
+    if (!j.enabled) return "—";
+    const status = resolveOneTime(
+      j.runAtMs,
+      j.graceSeconds ?? 0,
+      Date.now(),
+      j.executedAt,
+    );
+    if (status.kind === "past-grace") {
+      return `BAD(one-time: missed its window, past grace)`;
+    }
+    return `once @ ${toLocalOffsetIso(new Date(j.runAtMs))}`;
+  }
+  const d = safeDispatch(j.schedule);
+  if (d.kind === "error") return j.enabled ? `BAD(${d.msg})` : "—";
+  if (d.kind === "manual") return "manual";
+  if (d.kind === "cron") return d.expr;
+  return `every ${d.value}s`;
+}
+
 async function cmdList(): Promise<void> {
   const { jobs, errors } = discoverJobs(CRON_DIR);
   for (const e of errors) console.error(`[cronfish] ${e.path}: ${e.message}`);
@@ -217,17 +250,7 @@ async function cmdList(): Promise<void> {
   ];
   console.log(headers.join("\t"));
   for (const j of jobs) {
-    const d = safeDispatch(j.schedule);
-    let sched: string;
-    if (d.kind === "error") {
-      sched = j.enabled ? `BAD(${d.msg})` : "—";
-    } else if (d.kind === "manual") {
-      sched = "manual";
-    } else if (d.kind === "cron") {
-      sched = d.expr;
-    } else {
-      sched = `every ${d.value}s`;
-    }
+    const sched = scheduleCell(j);
     const lr = lastResults.get(j.slug);
     let resultCell = "—";
     if (lr) {

@@ -570,6 +570,32 @@ export default async function run() {}
     expect(list.out).toContain("diskcheck-sh");
   });
 
+  test("list describes a healthy one-time job by its run_at, never as BAD", () => {
+    // `BAD` is the loud signal that a job will never fire. A list that prints
+    // it for every healthy one-shot job is a list you learn to skim — which is
+    // exactly how the next real failure gets missed.
+    runCli(ctx, ["new", "future thing", "--at", "+3h", "--body", "later"]);
+    const r = runCli(ctx, ["list"]);
+    expect(r.out).toContain("one-time/future-thing-md");
+    expect(r.out).toContain("once @");
+    expect(r.out).not.toContain("BAD(");
+  });
+
+  test("list still says BAD for a one-time job that genuinely missed its window", () => {
+    writeOneTime(
+      ctx,
+      "expired.md",
+      `---
+run_at: "2020-01-01T00:00:00Z"
+grace_seconds: 60
+---
+too late
+`,
+    );
+    const r = runCli(ctx, ["list"]);
+    expect(r.out).toContain("BAD(one-time: missed its window");
+  });
+
   // --- the loud load path (CAD-1577) ---
 
   test("sync exits non-zero and summarizes when a job cannot be scheduled", () => {
