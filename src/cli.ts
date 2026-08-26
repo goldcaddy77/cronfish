@@ -1211,6 +1211,7 @@ function cmdNew(rest: string[]): void {
     "--retries",
     "--concurrency",
     "--grace",
+    "--dir",
     "--count",
   ]);
   const BOOL_FLAGS = new Set(["--disabled", "--enabled", "--force", "--dry-run", "--json"]);
@@ -1265,6 +1266,7 @@ function cmdNew(rest: string[]): void {
       kind: (flags.get("--kind") ?? "md") as JobKind,
       schedule: flags.get("--schedule"),
       runAt: flags.get("--at"),
+      dir: flags.get("--dir"),
       body: flags.has("--body-file")
         ? bodyFromFile(flags.get("--body-file")!)
         : flags.get("--body"),
@@ -1283,6 +1285,12 @@ function cmdNew(rest: string[]): void {
   const dryRun = bools.has("--dry-run");
 
   if (bools.has("--json")) {
+    // Write FIRST, then report. Emitting `"written": true` and only then
+    // attempting the write means a failed write (EACCES, a full disk, a
+    // round-trip rejection) leaves a machine-readable claim on stdout that
+    // the job exists when it does not — the exact shape of bug this command
+    // was built to eliminate, on the path agents are told to use.
+    if (!dryRun) commitNewJob(CRON_DIR, plan);
     console.log(
       JSON.stringify(
         {
@@ -1294,13 +1302,13 @@ function cmdNew(rest: string[]): void {
           schedule: plan.summary,
           next_fires: plan.fires.map((f) => toLocalOffsetIso(f)),
           written: !dryRun,
+          overwrote: !dryRun && plan.overwrite,
           content: plan.content,
         },
         null,
         2,
       ),
     );
-    if (!dryRun) commitNewJob(CRON_DIR, plan);
     return;
   }
 
@@ -1360,6 +1368,8 @@ const NEW_USAGE = `usage: cronfish new <name> (--schedule <expr> | --at <when>) 
     --retries <n>         retry a failed run N times
     --concurrency skip|queue    what to do when the previous run is still going
     --grace <seconds>     one-time only: how late a missed fire may still run
+    --dir <subpath>       create under cron/<subpath>/ (recurring only; cron/ is a tree)
+    --enabled             arm it (the default; the explicit form)
     --disabled            write it, don't arm it
     --force               overwrite an existing job of the same name
     --dry-run             print the file and the fire times; write nothing

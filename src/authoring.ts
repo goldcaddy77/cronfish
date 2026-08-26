@@ -279,6 +279,8 @@ export interface NewJobSpec {
   schedule?: string;
   /** One-time. Mutually exclusive with schedule. */
   runAt?: string;
+  /** Subfolder under cron/ for a recurring job, e.g. "email". Not for one-time. */
+  dir?: string;
   body?: string;
   description?: string;
   model?: string;
@@ -368,11 +370,41 @@ export function planNewJob(
   }
 
   const name = slugifyJobName(spec.name);
-  const dir = hasRunAt ? join(cronDir, ONE_TIME_DIR) : cronDir;
-  const path = safeChild(dir, `${name}.${spec.kind}`);
-  const slug = hasRunAt
-    ? `${ONE_TIME_DIR}/${name}-${spec.kind}`
-    : `${name}-${spec.kind}`;
+  // `cron/` is a tree, so authoring has to be able to reach into it — otherwise
+  // "group related crons in folders" and "always create with cronfish new" are
+  // contradictory instructions. One-time jobs are exempt: cron/one-time/ IS
+  // their location and is what marks them one-time.
+  let subdir = "";
+  if (spec.dir) {
+    if (hasRunAt) {
+      throw new AuthoringError(
+        "--dir does not apply to one-time jobs — they always live in cron/one-time/, which is what makes them one-time",
+      );
+    }
+    // Absolute paths are REJECTED, not silently re-read as relative: quietly
+    // turning "/etc" into "cron/etc" is the same silent reinterpretation of
+    // intent this command exists to prevent.
+    if (spec.dir.startsWith("/")) {
+      throw new AuthoringError(
+        `--dir "${spec.dir}" is absolute — it must be a path relative to cron/, e.g. "email"`,
+      );
+    }
+    subdir = spec.dir.replace(/\/+$/g, "");
+    if (!subdir || subdir.split("/").some((seg) => !/^[a-z0-9][a-z0-9-]*$/.test(seg))) {
+      throw new AuthoringError(
+        `--dir "${spec.dir}" must be a relative path of lowercase alnum/dash segments, e.g. "email" or "email/inbound"`,
+      );
+    }
+    if (subdir === ONE_TIME_DIR || subdir.startsWith(`${ONE_TIME_DIR}/`)) {
+      throw new AuthoringError(
+        `--dir cannot target cron/${ONE_TIME_DIR}/ — use --at to create a one-time job`,
+      );
+    }
+  }
+  const relDir = hasRunAt ? ONE_TIME_DIR : subdir;
+  const dir = relDir ? join(cronDir, relDir) : cronDir;
+  const path = safeChild(cronDir, join(relDir, `${name}.${spec.kind}`));
+  const slug = `${relDir ? `${relDir}/` : ""}${name}-${spec.kind}`;
 
   // Collide across ALL kinds, not just this one: `foo.md` and `foo.sh` are
   // distinct slugs to cronfish but nearly always a mistake by the author.
