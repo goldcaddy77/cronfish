@@ -1,3 +1,10 @@
+# [0.20.0](https://github.com/goldcaddy77/cronfish/compare/v0.19.0...v0.20.0) (2026-08-26)
+
+
+### Features
+
+* cronfish new — a validated authoring front door, plus a loud load path (CAD-1587) ([#28](https://github.com/goldcaddy77/cronfish/issues/28)) ([4ba584e](https://github.com/goldcaddy77/cronfish/commit/4ba584eed185ef70fe03e64b55f9146b4032cf4f))
+
 # [0.19.0](https://github.com/goldcaddy77/cronfish/compare/v0.18.0...v0.19.0) (2026-07-20)
 
 
