@@ -112,11 +112,18 @@ cronfish new nightly --schedule "0 3 * * *" --body-file - --dry-run   # preview,
 cronfish new botjob --schedule "every 15 minutes" --body "..." --json  # machine-readable plan
 ```
 
+`cron/` is a tree, so `--dir` reaches into it: `cronfish new triage --dir email --schedule "every
+10 minutes" --body-file ./triage.ts` writes `cron/email/triage.ts` (slug `email/triage-ts`).
+One-time jobs ignore it — `cron/one-time/` is what makes them one-time.
+
 Run `cronfish new` with no arguments for the full flag list (`--kind`, `--description`, `--model`,
-`--timeout`, `--retries`, `--concurrency`, `--grace`, `--disabled`, `--force`, `--count`).
+`--timeout`, `--retries`, `--concurrency`, `--grace`, `--dir`, `--enabled`/`--disabled`, `--force`,
+`--count`).
 
 **Agents and scripts should use `--json`**: it emits the slug, the resolved schedule, the next fire
-times, and the file contents as structured output, and still fails loudly on a bad schedule.
+times, and the file contents as structured output, and still fails loudly on a bad schedule. The
+write happens *before* the report, so a JSON object on stdout always describes a file that exists —
+a failed write produces no stdout and a non-zero exit, never `"written": true`.
 
 The same seam is importable, for a tool that wants to preview before committing:
 

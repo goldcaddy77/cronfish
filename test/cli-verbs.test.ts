@@ -554,6 +554,30 @@ export default async function run() {}
     expect(existsSync(join(ctx.root, "cron", "botjob.md"))).toBe(true);
   });
 
+  test("new --json does not claim `written: true` when the write fails", () => {
+    // The write is attempted BEFORE the report. Reporting first left a
+    // machine-readable claim on stdout that the job existed when it did not —
+    // on the exact path agents are told to use.
+    const cronDir = join(ctx.root, "cron");
+    mkdirSync(cronDir, { recursive: true });
+    chmodSync(cronDir, 0o500);
+    const r = runCli(ctx, ["new", "denied", "--schedule", "0 9 * * *", "--body", "x", "--json"]);
+    chmodSync(cronDir, 0o700);
+    expect(r.code).toBe(1);
+    expect(r.out).not.toContain('"written": true');
+    expect(existsSync(join(cronDir, "denied.md"))).toBe(false);
+  });
+
+  test("new --dir creates inside a subfolder of the cron tree", () => {
+    const r = runCli(ctx, [
+      "new", "triage", "--dir", "email", "--schedule", "every 10 minutes", "--body", "x",
+    ]);
+    expect(r.code).toBe(0);
+    expect(existsSync(join(ctx.root, "cron", "email", "triage.md"))).toBe(true);
+    expect(runCli(ctx, ["list"]).out).toContain("email/triage-md");
+    expect(runCli(ctx, ["sync"]).code).toBe(0);
+  });
+
   test("new --kind sh writes an executable script that loads", () => {
     const r = runCli(ctx, [
       "new",

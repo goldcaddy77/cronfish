@@ -298,3 +298,68 @@ describe("commitNewJob — every kind round-trips through the real loader", () =
     expect(src).toContain("set -euo pipefail");
   });
 });
+
+describe("subfolders — cron/ is a tree, so authoring must reach into it", () => {
+  test("--dir places a recurring job under cron/<dir>/ with a matching slug", () => {
+    const plan = planNewJob(cronDir, {
+      name: "triage",
+      kind: "ts",
+      dir: "email",
+      schedule: "every 10 minutes",
+      body: "await triage();",
+      now: NOW,
+    });
+    expect(plan.relPath).toBe("email/triage.ts");
+    expect(plan.slug).toBe("email/triage-ts");
+    commitNewJob(cronDir, plan);
+    expect(loadJob(plan.path, plan.slug, cronDir).schedule).toBe("every 10 minutes");
+  });
+
+  test("nested dirs work", () => {
+    const plan = planNewJob(cronDir, {
+      name: "bounce",
+      kind: "sh",
+      dir: "email/inbound",
+      schedule: "0 9 * * *",
+      body: "true",
+      now: NOW,
+    });
+    expect(plan.slug).toBe("email/inbound/bounce-sh");
+    commitNewJob(cronDir, plan);
+    expect(existsSync(join(cronDir, "email", "inbound", "bounce.sh"))).toBe(true);
+  });
+
+  test("refuses traversal, absolute paths, and junk segments", () => {
+    for (const dir of ["../escape", "email/../..", "Email", "a b", ".hidden"]) {
+      expect(() =>
+        planNewJob(cronDir, { name: "x", kind: "md", dir, schedule: "0 9 * * *", body: "b", now: NOW }),
+      ).toThrow(/must be a relative path|cannot target/);
+    }
+    // An absolute path is REJECTED, not silently re-read as relative.
+    expect(() =>
+      planNewJob(cronDir, { name: "x", kind: "md", dir: "/etc", schedule: "0 9 * * *", body: "b", now: NOW }),
+    ).toThrow(/is absolute/);
+    expect(existsSync(join(cronDir, "..", "x.md"))).toBe(false);
+  });
+
+  test("refuses --dir on a one-time job, and refuses aiming --dir at one-time/", () => {
+    expect(() =>
+      planNewJob(cronDir, { name: "x", kind: "md", dir: "email", runAt: "+1h", body: "b", now: NOW }),
+    ).toThrow(/does not apply to one-time/);
+    expect(() =>
+      planNewJob(cronDir, { name: "x", kind: "md", dir: "one-time", schedule: "0 9 * * *", body: "b", now: NOW }),
+    ).toThrow(/use --at/);
+  });
+
+  test("a one-time job still lands in cron/one-time/ when no --dir is given", () => {
+    const plan = planNewJob(cronDir, {
+      name: "still one time",
+      kind: "md",
+      runAt: "+1h",
+      body: "b",
+      now: NOW,
+    });
+    expect(plan.relPath).toBe("one-time/still-one-time.md");
+    expect(plan.slug).toBe("one-time/still-one-time-md");
+  });
+});
