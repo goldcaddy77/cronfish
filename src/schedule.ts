@@ -206,3 +206,39 @@ export function dispatchSchedule(
     `schedule: unsupported "${input}" — use cron "M H DOM MON DOW", "every N <unit>", seconds (60, "5m"), or "manual"`,
   );
 }
+
+// A cron expression with BOTH day-of-month and month pinned fires roughly
+// once a YEAR. Sometimes that is genuinely what you want; far more often it
+// is a one-shot job wearing a recurring costume — someone wanted "9:07 on
+// Aug 29" and reached for the only key they knew, not realising it fires
+// again next August and every August after.
+//
+// That is CAD-1585, and it is the failure a create-command alone cannot
+// prevent: a hand-written file with this schedule parses perfectly, installs
+// cleanly, and passes every guard, because nothing about it is invalid — it
+// is merely not what was meant. So the check has to look at the OUTCOME, not
+// at how the file was authored. Provenance is unobservable by design (files
+// are the source of truth and carry no watermark); shape is not.
+//
+// A warning, never an error: annual jobs are real. It just has to name the
+// alternative, because the person who made this mistake did not know the
+// alternative existed.
+export function annualCronWarning(
+  schedule: string | number | undefined,
+): string | null {
+  let d: Dispatched;
+  try {
+    d = dispatchSchedule(schedule);
+  } catch {
+    return null; // an unparseable schedule is a louder problem, reported elsewhere
+  }
+  if (d.kind !== "cron") return null;
+  const [, , dom, mon] = d.expr.split(/\s+/);
+  if (dom === "*" || mon === "*") return null;
+  return (
+    `cron "${d.expr}" pins both a day-of-month and a month, so it fires ONCE A YEAR` +
+    ` — and again every year after. If you meant it to run a single time, that is a` +
+    ` one-time job: \`cronfish new <name> --at <timestamp>\` (writes cron/one-time/,` +
+    ` fires once, then archives itself). If an annual job IS what you want, ignore this.`
+  );
+}

@@ -21,7 +21,7 @@ import {
   type JobKind,
   type JobMeta,
 } from "./jobs.ts";
-import { dispatchSchedule, type Dispatched } from "./schedule.ts";
+import { annualCronWarning, dispatchSchedule, type Dispatched } from "./schedule.ts";
 import {
   commitNewJob,
   describeSchedule,
@@ -388,6 +388,14 @@ async function cmdSync(): Promise<void> {
     // ThrottleInterval). A faster `schedule:` silently fires no quicker than
     // every 10s, so warn rather than let it look like it works. Moot in
     // daemon mode — the 1s tick loop handles sub-10s schedules fine.
+    // A one-shot job wearing a recurring costume (CAD-1585). Parses fine,
+    // installs fine, and fires again next year — so no amount of validation
+    // at CREATE time catches it on a hand-written file. Checked on the
+    // outcome instead, which works however the file got there.
+    if (j.enabled && !j.oneTime) {
+      const annual = annualCronWarning(j.schedule);
+      if (annual) console.error(`[cronfish] WARN ${j.slug}: ${annual}`);
+    }
     const d = safeDispatch(j.schedule);
     if (!daemonMode && d.kind === "seconds" && d.value < 10) {
       console.error(
@@ -1259,12 +1267,13 @@ function cmdNew(rest: string[]): void {
     throw new Error("pick one: --body or --body-file");
   }
 
+  const spec_schedule = flags.get("--schedule");
   const plan = planNewJob(
     CRON_DIR,
     {
       name,
       kind: (flags.get("--kind") ?? "md") as JobKind,
-      schedule: flags.get("--schedule"),
+      schedule: spec_schedule,
       runAt: flags.get("--at"),
       dir: flags.get("--dir"),
       body: flags.has("--body-file")
@@ -1326,6 +1335,8 @@ function cmdNew(rest: string[]): void {
       );
     });
   }
+  const annual = plan.oneTime ? null : annualCronWarning(spec_schedule);
+  if (annual) console.log(`  ⚠ ${annual}`);
   if (!plan.enabled) {
     console.log(
       `  enabled:  NO${
