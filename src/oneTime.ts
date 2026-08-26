@@ -223,9 +223,22 @@ const LOCK_EX = 2;
 const LOCK_NB = 4;
 const LOCK_UN = 8;
 
-const libc = dlopen(`libc.${suffix}`, {
-  flock: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 },
-});
+// Loaded LAZILY, on the first actual lock. A top-level dlopen makes MERELY
+// IMPORTING this module a hard error anywhere `libc.${suffix}` doesn't resolve
+// — notably Linux CI, where the file is `libc.so.6` and `libc.so` is a
+// linker-only symlink from a -dev package. cronfish only RUNS on macOS, but
+// its modules get imported elsewhere (a consumer's test suite pulling in the
+// authoring seam, a typecheck, a docs build), and none of those touch flock.
+// Deferring the load keeps the import graph portable and costs one null check.
+let libc: ReturnType<typeof dlopen> | null = null;
+function flockSymbols() {
+  if (!libc) {
+    libc = dlopen(`libc.${suffix}`, {
+      flock: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 },
+    });
+  }
+  return libc.symbols as { flock: (fd: number, op: number) => number };
+}
 
 export interface FlockHandle {
   fd: number;
@@ -239,7 +252,7 @@ export function tryFlockExclusive(path: string): FlockHandle | null {
   } catch {
     return null;
   }
-  const r = libc.symbols.flock(fd, LOCK_EX | LOCK_NB);
+  const r = flockSymbols().flock(fd, LOCK_EX | LOCK_NB);
   if (r !== 0) {
     try {
       closeSync(fd);
@@ -251,7 +264,7 @@ export function tryFlockExclusive(path: string): FlockHandle | null {
 
 export function releaseFlock(h: FlockHandle): void {
   try {
-    libc.symbols.flock(h.fd, LOCK_UN);
+    flockSymbols().flock(h.fd, LOCK_UN);
   } catch {}
   try {
     closeSync(h.fd);
