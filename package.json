@@ -6,6 +6,12 @@
   "bin": {
     "cronfish": "./src/cli.ts"
   },
+  "exports": {
+    "./authoring": "./src/authoring.ts",
+    "./schedule": "./src/schedule.ts",
+    "./jobs": "./src/jobs.ts",
+    "./src/*": "./src/*"
+  },
   "engines": {
     "bun": ">=1.0"
   },
