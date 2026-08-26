@@ -237,7 +237,14 @@ function flockSymbols() {
       flock: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 },
     });
   }
-  return libc.symbols as { flock: (fd: number, op: number) => number };
+  // Through `unknown`: dlopen's return is typed generically as
+  // ConvertFns<Record<string, FFIFunction>>, which does not structurally
+  // overlap with the concrete signature. A direct cast compiles here but
+  // fails TS2352 under a consumer's stricter tsc — which is exactly the kind
+  // of breakage a published package must not ship.
+  return libc.symbols as unknown as {
+    flock: (fd: number, op: number) => number;
+  };
 }
 
 export interface FlockHandle {
