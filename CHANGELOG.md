@@ -1,3 +1,10 @@
+## [0.21.4](https://github.com/goldcaddy77/cronfish/compare/v0.21.3...v0.21.4) (2026-08-26)
+
+
+### Bug Fixes
+
+* **new:** write before reporting in --json, and let --dir reach into the cron tree ([#33](https://github.com/goldcaddy77/cronfish/issues/33)) ([94f7d4f](https://github.com/goldcaddy77/cronfish/commit/94f7d4f32e7d2bbb2251a165d361f94d96a14f8d))
+
 ## [0.21.3](https://github.com/goldcaddy77/cronfish/compare/v0.21.2...v0.21.3) (2026-08-26)
 
 
