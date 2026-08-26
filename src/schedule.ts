@@ -14,7 +14,7 @@
 // launchd `StartCalendarInterval` only accepts single ints per field, so we
 // never emit `*/N` cron expressions — those become seconds intervals instead.
 
-import { parseFriendly } from "./parsers/friendly.ts";
+import { FRIENDLY_FORMS, parseFriendly } from "./parsers/friendly.ts";
 
 export type Dispatched =
   | { kind: "cron"; expr: string }
@@ -134,6 +134,25 @@ export function parseMissedAfter(input: string | number | undefined): number | n
   return null;
 }
 
+// Targeted nudges for the human forms people reach for that we deliberately
+// refuse to guess at. A vague accepted-forms list is not enough when the
+// caller wrote something that reads perfectly (CAD-1577).
+function friendlyHint(s: string): string {
+  if (/^every (day|night)$/.test(s)) {
+    return ` — ambiguous: say "every 1 days" (interval from now) or "every day at 9:00" (calendar)`;
+  }
+  if (/^every (morning|afternoon|evening|night)\b/.test(s)) {
+    return ` — no defensible hour; name it: "every day at 8:00"`;
+  }
+  if (/^every (weekday|weekend)\b/.test(s)) {
+    return ` — day-of-week ranges are not expressible in launchd; write one job per day, e.g. "every monday at 9:00"`;
+  }
+  if (/\bat\b/.test(s)) {
+    return ` — the time-of-day part did not parse; use "9", "07:20", "3pm", or ":15" after "every hour"`;
+  }
+  return "";
+}
+
 export function dispatchSchedule(
   input: string | number | undefined,
 ): Dispatched {
@@ -171,9 +190,10 @@ export function dispatchSchedule(
     const f = parseFriendly(s);
     if (!f) {
       throw new Error(
-        `schedule: unrecognized human form "${input}" — try "every N seconds|minutes|hours|days"`,
+        `schedule: unrecognized human form "${input}"${friendlyHint(s)} — accepted: ${FRIENDLY_FORMS.join("; ")}`,
       );
     }
+    if (f.kind === "cron") return { kind: "cron", expr: validateCronExpr(f.expr) };
     return f;
   }
 
