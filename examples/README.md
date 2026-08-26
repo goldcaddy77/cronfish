@@ -16,13 +16,15 @@ with `cronfish enable <slug>`.
 ## The 60-second loop
 
 ```bash
-cp examples/healthcheck.ts cron/healthcheck.ts   # drop a file
-cronfish list                                    # it shows up as `healthcheck-ts` (disabled)
-cronfish enable healthcheck-ts                    # flip on + sync to launchd
+cronfish new healthcheck --kind ts --schedule "every 15 minutes" \
+  --body-file examples/healthcheck.ts --disabled   # validated create: previews fire times first
+cronfish list                                      # it shows up as `healthcheck-ts` (disabled)
+cronfish enable healthcheck-ts                     # flip on + sync to launchd
 cronfish next healthcheck-ts                       # preview the next 5 fire times
-cronfish run healthcheck-ts                         # run it now, no launchd, for testing
+cronfish run healthcheck-ts                        # run it now, no launchd, for testing
 ```
 
-No code change registers a job — the file *is* the registration. See the
+(`cp examples/healthcheck.ts cron/` works too — the file *is* the registration — but `cronfish new`
+shows you the resolved fire times before writing and refuses a schedule that will never fire.) See the
 [root README](../README.md) for the full job spec, schedule shapes, alerts, and the
 one-time `run_at` semantics.
