@@ -11,7 +11,7 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
-import { basename, join } from "node:path";
+import { basename, join, relative } from "node:path";
 import { setFrontmatterKey, setShellFrontmatterKey } from "./frontmatter.ts";
 import {
   discoverJobs,
@@ -324,21 +324,30 @@ async function cmdSync(): Promise<void> {
   // "sync"-class sentinel filenames written this run. Anything still on disk
   // from a prior sync that ISN'T in here gets reaped at the end (self-heal).
   const writtenSentinels = new Set<string>();
+  // Every job that will NOT be scheduled for a reason the author did not ask
+  // for. This is the CAD-1577 fix: a job that cannot load or cannot parse its
+  // schedule used to print one line among dozens and exit 0, so a stalled
+  // runaway-spend watchdog read exactly like a healthy one. Now it lands in a
+  // summary block, writes a durable sentinel, and makes sync exit non-zero.
+  const failures: { slug: string; reason: string }[] = [];
+  // `sentinel: false` for cases that write their own durable ("run"-class)
+  // sentinel below — a past-grace one-time must not get two files.
+  const fail = (slug: string, reason: string, sentinel = true): void => {
+    failures.push({ slug, reason });
+    if (!sentinel) return;
+    const written = writeSentinel(CRON_DIR, slug, reason, "sync");
+    writtenSentinels.add(basename(written));
+  };
+
   for (const e of errors) {
     console.error(`[cronfish] ${e.path}: ${e.message}`);
-    // Bad YAML / invalid run_at on a one-time file → sentinel. Any other
-    // discovery error lands in the .errors folder too if it's under
-    // cron/one-time/ since silent-skip is the failure mode we're killing.
-    if (e.path.includes(`/${"one-time"}/`)) {
-      const slug = e.path.split("/").pop() ?? "unknown";
-      const written = writeSentinel(
-        CRON_DIR,
-        slug,
-        `discovery error: ${e.message}`,
-        "sync",
-      );
-      writtenSentinels.add(basename(written));
-    }
+    // A file in cron/ that cannot be parsed is a job that will never run.
+    // It gets a sentinel regardless of where it sits — one-time jobs used to
+    // be the only ones covered, which is how a bad recurring job stayed quiet.
+    fail(
+      relative(CRON_DIR, e.path) || (e.path.split("/").pop() ?? "unknown"),
+      `discovery error: ${e.message}`,
+    );
   }
 
   // Warn loudly when a .md job declares a runner that isn't registered in
@@ -379,7 +388,10 @@ async function cmdSync(): Promise<void> {
       decision.reason !== "one-time: already executed"
     ) {
       console.error(`[cronfish] ${j.slug}: ${decision.reason}`);
-      if (j.oneTime && decision.reason?.startsWith("one-time past grace:")) {
+      const pastGrace =
+        !!j.oneTime && decision.reason.startsWith("one-time past grace:");
+      fail(j.slug, decision.reason, !pastGrace);
+      if (pastGrace) {
         // A past-grace one-time file would otherwise be re-discovered on
         // EVERY sync and re-write a sentinel forever. Record one durable
         // ("run"-class, never reaped) sentinel so the missed window is
@@ -481,6 +493,21 @@ async function cmdSync(): Promise<void> {
   // run (its error no longer occurs). "run"-class + foreign files survive.
   const reaped = reapStaleSentinels(CRON_DIR, writtenSentinels);
   if (reaped > 0) console.log(`[cronfish] cleared ${reaped} resolved sentinel(s)`);
+
+  if (failures.length > 0) {
+    // Loud, last, and non-zero. Silence must mean healthy — a job that will
+    // never fire can no longer be one grey line scrolled off the top.
+    console.error(
+      `\n[cronfish] ✗ sync completed with ${failures.length} job(s) that will NOT run:`,
+    );
+    for (const f of failures) console.error(`[cronfish]   ${f.slug}: ${f.reason}`);
+    console.error(
+      `[cronfish] fix the file(s) and re-run \`cronfish sync\`; \`cronfish errors\` lists the durable sentinels.\n` +
+        `[cronfish] create jobs with \`cronfish new\` — it validates the schedule and previews the fire times before writing.`,
+    );
+    process.exitCode = 1;
+    return;
+  }
 
   console.log("[cronfish] sync complete");
 }
