@@ -13,8 +13,23 @@ import {
 } from "node:fs";
 import { basename, join } from "node:path";
 import { setFrontmatterKey, setShellFrontmatterKey } from "./frontmatter.ts";
-import { discoverJobs, findJobFile, loadJob, type JobMeta } from "./jobs.ts";
+import {
+  discoverJobs,
+  findJobFile,
+  loadJob,
+  type Concurrency,
+  type JobKind,
+  type JobMeta,
+} from "./jobs.ts";
 import { dispatchSchedule, type Dispatched } from "./schedule.ts";
+import {
+  commitNewJob,
+  describeSchedule,
+  planNewJob,
+  previewFires,
+  relativeFromNow,
+  toLocalOffsetIso,
+} from "./authoring.ts";
 import {
   archiveOneTime,
   clearSentinels,
@@ -1079,29 +1094,219 @@ async function cmdAlertsTest(adapterName?: string): Promise<void> {
 function cmdNext(slug?: string, n = 5): void {
   const { jobs } = discoverJobs(CRON_DIR);
   const targets = slug ? jobs.filter((j) => j.slug === slug) : jobs;
+  if (slug && targets.length === 0) {
+    throw new Error(`no job with slug "${slug}" (see \`cronfish list\`)`);
+  }
+  const now = new Date();
+  let bad = 0;
   for (const j of targets) {
     try {
-      const d = dispatchSchedule(j.schedule);
-      if (d.kind === "manual") {
+      if (j.oneTime) {
+        if (j.runAtMs === undefined) throw new Error("missing run_at");
+        const at = new Date(j.runAtMs);
+        const note = j.executedAt ? " (already executed)" : "";
+        console.log(
+          `${j.slug}\tone-time\t→\t${toLocalOffsetIso(at)} (${relativeFromNow(at, now)})${note}`,
+        );
+        continue;
+      }
+      const fires = previewFires(j.schedule as string | number, n, now);
+      if (!fires.length) {
         console.log(`${j.slug}\tmanual (no autoschedule)`);
         continue;
       }
-      if (d.kind === "seconds") {
-        const now = Date.now();
-        const fires = Array.from({ length: n }, (_, i) =>
-          new Date(now + (i + 1) * d.value * 1000).toISOString(),
-        );
-        console.log(`${j.slug}\tevery ${d.value}s\t→\t${fires.join(", ")}`);
-        continue;
-      }
       console.log(
-        `${j.slug}\tcron "${d.expr}" (preview not implemented for cron)`,
+        `${j.slug}\t${describeSchedule(j.schedule as string | number)}\t→\t${fires
+          .map((f) => `${toLocalOffsetIso(f)} (${relativeFromNow(f, now)})`)
+          .join(", ")}`,
       );
     } catch (e) {
+      bad++;
       console.error(`${j.slug}: ${(e as Error).message}`);
     }
   }
+  // A schedule that cannot be previewed is a schedule that will never fire.
+  // Exit non-zero so a script or an agent cannot read this as "looks fine".
+  if (bad > 0) process.exitCode = 1;
 }
+
+// --- cronfish new ---
+
+function bodyFromFile(path: string): string {
+  if (path === "-") return readFileSync(0, "utf-8");
+  if (!existsSync(path)) throw new Error(`--body-file ${path}: no such file`);
+  return readFileSync(path, "utf-8");
+}
+
+function cmdNew(rest: string[]): void {
+  const flags = new Map<string, string>();
+  const bools = new Set<string>();
+  const VALUE_FLAGS = new Set([
+    "--kind",
+    "--schedule",
+    "--at",
+    "--body",
+    "--body-file",
+    "--description",
+    "--model",
+    "--timeout",
+    "--retries",
+    "--concurrency",
+    "--grace",
+    "--count",
+  ]);
+  const BOOL_FLAGS = new Set(["--disabled", "--enabled", "--force", "--dry-run", "--json"]);
+  let name: string | undefined;
+  for (let i = 0; i < rest.length; i++) {
+    const a = rest[i]!;
+    if (VALUE_FLAGS.has(a)) {
+      const v = rest[++i];
+      if (v === undefined) throw new Error(`${a} needs a value`);
+      flags.set(a, v);
+      continue;
+    }
+    if (BOOL_FLAGS.has(a)) {
+      bools.add(a);
+      continue;
+    }
+    if (a.startsWith("--")) {
+      throw new Error(
+        `unknown flag ${a} — run \`cronfish new\` with no arguments for usage`,
+      );
+    }
+    if (name !== undefined) {
+      throw new Error(
+        `unexpected extra argument "${a}" — the job name must be a single token (quote it: cronfish new "nightly backup")`,
+      );
+    }
+    name = a;
+  }
+  if (!name) {
+    console.error(NEW_USAGE);
+    process.exit(2);
+  }
+
+  const int = (f: string): number | undefined => {
+    const v = flags.get(f);
+    if (v === undefined) return undefined;
+    if (!/^\d+$/.test(v)) throw new Error(`${f} must be a non-negative integer, got "${v}"`);
+    return parseInt(v, 10);
+  };
+  const concurrency = flags.get("--concurrency");
+  if (concurrency !== undefined && concurrency !== "skip" && concurrency !== "queue") {
+    throw new Error(`--concurrency must be "skip" or "queue", got "${concurrency}"`);
+  }
+  if (flags.has("--body") && flags.has("--body-file")) {
+    throw new Error("pick one: --body or --body-file");
+  }
+
+  const plan = planNewJob(
+    CRON_DIR,
+    {
+      name,
+      kind: (flags.get("--kind") ?? "md") as JobKind,
+      schedule: flags.get("--schedule"),
+      runAt: flags.get("--at"),
+      body: flags.has("--body-file")
+        ? bodyFromFile(flags.get("--body-file")!)
+        : flags.get("--body"),
+      description: flags.get("--description"),
+      model: flags.get("--model"),
+      timeout: int("--timeout"),
+      retries: int("--retries"),
+      concurrency: concurrency as Concurrency | undefined,
+      graceSeconds: int("--grace"),
+      enabled: bools.has("--disabled") ? false : true,
+      force: bools.has("--force"),
+    },
+    int("--count") ?? 3,
+  );
+
+  const dryRun = bools.has("--dry-run");
+
+  if (bools.has("--json")) {
+    console.log(
+      JSON.stringify(
+        {
+          slug: plan.slug,
+          path: plan.path,
+          kind: plan.kind,
+          one_time: plan.oneTime,
+          enabled: plan.enabled,
+          schedule: plan.summary,
+          next_fires: plan.fires.map((f) => toLocalOffsetIso(f)),
+          written: !dryRun,
+          content: plan.content,
+        },
+        null,
+        2,
+      ),
+    );
+    if (!dryRun) commitNewJob(CRON_DIR, plan);
+    return;
+  }
+
+  // The fire times go out BEFORE the write. "I hope this parses" becomes
+  // "I watched it resolve to 2026-08-29 09:07."
+  const now = new Date();
+  console.log(`\n  ${plan.slug}  (${plan.relPath})`);
+  console.log(`  schedule: ${plan.summary}`);
+  if (plan.fires.length === 0) {
+    console.log(`  next:     never — manual jobs only fire via \`cronfish run ${plan.slug}\``);
+  } else {
+    plan.fires.forEach((f, i) => {
+      console.log(
+        `  ${i === 0 ? "next:    " : "         "} ${toLocalOffsetIso(f)}  (${relativeFromNow(f, now)})`,
+      );
+    });
+  }
+  if (!plan.enabled) {
+    console.log(
+      `  enabled:  NO${
+        flags.has("--body") || flags.has("--body-file")
+          ? ""
+          : " — placeholder body; fill it in, then `cronfish enable " + plan.slug + "`"
+      }`,
+    );
+  }
+  console.log("");
+
+  if (dryRun) {
+    console.log(plan.content);
+    console.log(`[cronfish] --dry-run: nothing written`);
+    return;
+  }
+
+  commitNewJob(CRON_DIR, plan);
+  console.log(
+    `[cronfish] wrote ${plan.relPath}${plan.overwrite ? " (overwrote)" : ""} — validated by loading it back`,
+  );
+  console.log(`[cronfish] next: \`cronfish sync\` (a live daemon picks it up within ~1s on its own)`);
+}
+
+const NEW_USAGE = `usage: cronfish new <name> (--schedule <expr> | --at <when>) [flags]
+
+  exactly one of:
+    --schedule <expr>     recurring — cron "M H DOM MON DOW", "every day at 07:20",
+                          "every monday at 9", "every 5 minutes", "5m", 300, "manual"
+    --at <when>           one-time — ISO timestamp or "+90m". Fires once, then
+                          archives itself. Written to cron/one-time/.
+
+  flags:
+    --kind md|ts|sh       job kind (default md — the body is handed to an agent CLI)
+    --body <text>         the prompt (.md) or the script (.ts/.sh)
+    --body-file <path>    read the body from a file ("-" for stdin)
+    --description <text>  one-line description
+    --model <name>        .md only (default haiku)
+    --timeout <seconds>   hard kill after N seconds
+    --retries <n>         retry a failed run N times
+    --concurrency skip|queue    what to do when the previous run is still going
+    --grace <seconds>     one-time only: how late a missed fire may still run
+    --disabled            write it, don't arm it
+    --force               overwrite an existing job of the same name
+    --dry-run             print the file and the fire times; write nothing
+    --json                machine-readable plan (for agents and scripts)
+    --count <n>           how many fire times to preview (default 3)`;
 
 // --- cronfish init ---
 
@@ -1332,9 +1537,13 @@ function usage(): void {
 
 usage:
   cronfish init                       scaffold cron/hello.md + cron/touch.ts + cron/ping.sh
+  cronfish new <name> --schedule <expr>   create a recurring job — validates, previews fire times, then writes
+  cronfish new <name> --at <when>         create a one-time job in cron/one-time/ (fires once, then archives)
+                  [--kind md|ts|sh] [--body <text> | --body-file <path>] [--dry-run] [--json]
   cronfish list                       show every job + state
-  cronfish next [slug] [N]            preview the next N fire times (default 5)
+  cronfish next [slug] [N]            preview the next N fire times (default 5); non-zero if any job can't be scheduled
   cronfish sync                       reconcile cron/ ↔ launchd (auto-prunes logs + ledger rows if retention is set)
+                                      exits non-zero if ANY job failed to load or schedule — silence means healthy
   cronfish prune [slug] [--dry-run]   delete old per-run logs + ledger rows per retention config
                   [--max-age-days N] [--max-runs N]   (override config; default max_age_days=30 if unset)
   cronfish enable <slug>              flip enabled, then sync
@@ -1379,6 +1588,9 @@ async function main(): Promise<void> {
       return;
     case "init":
       cmdInit();
+      return;
+    case "new":
+      cmdNew(rest);
       return;
     case "list":
       await cmdList();
