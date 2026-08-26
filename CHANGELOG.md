@@ -1,3 +1,10 @@
+## [0.21.1](https://github.com/goldcaddy77/cronfish/compare/v0.21.0...v0.21.1) (2026-08-26)
+
+
+### Bug Fixes
+
+* **oneTime:** load libc lazily — a top-level dlopen broke every non-macOS import ([#30](https://github.com/goldcaddy77/cronfish/issues/30)) ([11ac9e7](https://github.com/goldcaddy77/cronfish/commit/11ac9e797205a3b8800a0d5304be2d24a049b4c3))
+
 # [0.21.0](https://github.com/goldcaddy77/cronfish/compare/v0.20.0...v0.21.0) (2026-08-26)
 
 
