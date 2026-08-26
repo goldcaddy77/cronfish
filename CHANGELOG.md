@@ -1,3 +1,10 @@
+## [0.21.2](https://github.com/goldcaddy77/cronfish/compare/v0.21.1...v0.21.2) (2026-08-26)
+
+
+### Bug Fixes
+
+* **oneTime:** cast the flock symbols through unknown (TS2352 in consumers) ([#31](https://github.com/goldcaddy77/cronfish/issues/31)) ([526ad3d](https://github.com/goldcaddy77/cronfish/commit/526ad3d72078ffa303b3b9cb9999aca77493f8cb))
+
 ## [0.21.1](https://github.com/goldcaddy77/cronfish/compare/v0.21.0...v0.21.1) (2026-08-26)
 
 
