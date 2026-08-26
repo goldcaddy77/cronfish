@@ -315,6 +315,18 @@ fixed interval measured from the last run. Times accept `9`, `07:20`, `3pm`, `8:
 A few readable-looking forms are **deliberately refused** rather than guessed at, with an error
 that names the fix:
 
+### One-shot jobs wearing a recurring costume
+
+A cron with both a day-of-month and a month pinned — `7 9 29 8 *` — fires **once a year, every
+year**. Almost always the author wanted "09:07 on Aug 29" once, and reached for the only key they
+knew. It parses, installs, and passes every check, because nothing about it is invalid; it is just
+not what was meant.
+
+`cronfish new` shows it immediately (the fire-time preview reads 2026, 2027, 2028), but a
+hand-written file gets no such moment — so `cronfish sync` warns on the shape too. A warning, not
+an error: annual jobs are real. It names `--at` because the person who makes this mistake usually
+does not know one-time jobs exist.
+
 | Refused           | Why                                                             |
 | ----------------- | ---------------------------------------------------------------- |
 | `every day`       | interval-from-now or midnight? Say `every 1 days` or `every day at 0:00` |

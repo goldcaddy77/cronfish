@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { dispatchSchedule } from "../src/schedule.ts";
+import { annualCronWarning, dispatchSchedule } from "../src/schedule.ts";
 
 describe("dispatchSchedule", () => {
   test("5-field cron passes through", () => {
@@ -79,5 +79,31 @@ describe("dispatchSchedule", () => {
       expect((e as Error).message).toContain("minute");
       expect((e as Error).message).toContain("60");
     }
+  });
+});
+
+// CAD-1585: a one-shot job wearing a recurring costume. `7 9 29 8 *` parses,
+// installs, and passes every guard — it is not invalid, it is just not what
+// was meant, and it fires again every August. A create-command cannot prevent
+// it on a hand-written file, so the check looks at the OUTCOME instead.
+describe("annualCronWarning", () => {
+  test("warns when both day-of-month and month are pinned", () => {
+    expect(annualCronWarning("7 9 29 8 *")).toContain("ONCE A YEAR");
+    expect(annualCronWarning("7 9 29 8 *")).toContain("--at");
+    expect(annualCronWarning("0 0 1 1 *")).toContain("ONCE A YEAR");
+  });
+
+  test("stays quiet for monthly, weekly, daily and interval schedules", () => {
+    expect(annualCronWarning("0 9 29 * *")).toBeNull(); // 29th of every month
+    expect(annualCronWarning("0 9 * * 1")).toBeNull(); // every Monday
+    expect(annualCronWarning("0 9 * * *")).toBeNull(); // daily
+    expect(annualCronWarning("every 5 minutes")).toBeNull();
+    expect(annualCronWarning("every day at 07:20")).toBeNull();
+    expect(annualCronWarning("manual")).toBeNull();
+  });
+
+  test("stays quiet on an unparseable schedule — that is a louder problem, reported elsewhere", () => {
+    expect(annualCronWarning("every morning at 8")).toBeNull();
+    expect(annualCronWarning(undefined)).toBeNull();
   });
 });
