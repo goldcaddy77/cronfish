@@ -1119,13 +1119,21 @@ async function cmdAlertsTest(adapterName?: string): Promise<void> {
 }
 
 function cmdNext(slug?: string, n = 5): void {
-  const { jobs } = discoverJobs(CRON_DIR);
+  const { jobs, errors } = discoverJobs(CRON_DIR);
   const targets = slug ? jobs.filter((j) => j.slug === slug) : jobs;
   if (slug && targets.length === 0) {
     throw new Error(`no job with slug "${slug}" (see \`cronfish list\`)`);
   }
   const now = new Date();
   let bad = 0;
+  // A file that won't even load has no fire times to preview. Reporting only
+  // the jobs that DID load would make a broken cron/ read as a healthy one.
+  if (!slug) {
+    for (const e of errors) {
+      bad++;
+      console.error(`${relative(CRON_DIR, e.path)}: ${e.message}`);
+    }
+  }
   for (const j of targets) {
     try {
       if (j.oneTime) {
