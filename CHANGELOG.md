@@ -1,3 +1,10 @@
+## [0.21.5](https://github.com/goldcaddy77/cronfish/compare/v0.21.4...v0.21.5) (2026-08-26)
+
+
+### Bug Fixes
+
+* **daemon:** one sentinel per broken job, not two ([#34](https://github.com/goldcaddy77/cronfish/issues/34)) ([0c7c2ff](https://github.com/goldcaddy77/cronfish/commit/0c7c2ff33c81ffef05516da2e0f51b4847cbacdf))
+
 ## [0.21.4](https://github.com/goldcaddy77/cronfish/compare/v0.21.3...v0.21.4) (2026-08-26)
 
 
