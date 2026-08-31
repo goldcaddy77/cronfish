@@ -169,6 +169,7 @@ enabled: true # default true
 timeout: 300 # seconds; runner kills past this
 retries: 0 # retry count on non-zero exit
 concurrency: skip # skip | queue
+entrypoint: true # default true; false skips the claude.entrypoint_command prelude for this job
 ---
 
 Anything you'd type into a fresh Claude session — tools, files, prompts.
@@ -176,7 +177,9 @@ Anything you'd type into a fresh Claude session — tools, files, prompts.
 
 Cronfish shells to `claude --dangerously-skip-permissions --model <id> -p <body>` with `cwd =
 consumer repo root`, so the job inherits your project's `.claude/` config (tools, MCP servers,
-permissions) and your global `~/.claude/`.
+permissions) and your global `~/.claude/`. When `claude.entrypoint_command` is configured (see
+[Config](#config--cronfishjson-optional-at-repo-root)), its output is passed as
+`--append-system-prompt`; set `entrypoint: false` to opt a single job out.
 
 ### TypeScript — `cron/<slug>.ts`
 
@@ -351,6 +354,7 @@ as a single job instead of many fast fires.
   "bundle_prefix": "com.example.myapp",
   "bun_path": "/opt/homebrew/bin/bun",
   "ui": { "public_url": "https://mini.tail-xxx.ts.net:4747" },
+  "claude": { "entrypoint_command": "/Users/you/bin/print-system-prompt" },
   "alerts": {
     "on_failure": { "notify": "slack" },
     "default": "slack",
@@ -370,7 +374,31 @@ as a single job instead of many fast fires.
   (`~/.bun`) work out of the box; for asdf/mise/proto, set `bun_path` explicitly.
 - **`ui.public_url`** — base URL used to build links in alert payloads (e.g. `<base>/runs/<id>`).
   Explicit only; no Tailscale auto-detect.
+- **`claude.entrypoint_command`** — a shell command whose stdout (trimmed) is passed to the Claude
+  Code CLI as `--append-system-prompt` when running `.md` jobs. See
+  [Claude entrypoint](#claude-entrypoint--md-jobs) below.
 - **`alerts`** — see [Alerts](#alerts) below.
+
+## Claude entrypoint — `.md` jobs
+
+`.md` jobs run `claude -p` with a fresh context. If you want every job to start with a shared system
+prompt — an identity, live system state (date, host, user), or a doctrine index — set a command that
+prints it:
+
+```json
+{ "claude": { "entrypoint_command": "/Users/you/bin/print-system-prompt" } }
+```
+
+Before each `.md` run, cronfish executes that command at the consumer root (with the daemon's
+environment) and passes its trimmed stdout to the CLI as `--append-system-prompt <output>`, injected
+ahead of the job body. Because it is a command rather than a static string, the prelude can be
+computed fresh each run and kept out of the config file.
+
+- **Per-job opt-out:** set `entrypoint: false` in a job's frontmatter to run it with a bare system
+  prompt (useful for a small local model that can't absorb a large prelude). Default is `true`.
+- **Non-blocking by design:** a missing command, a non-zero exit, a >30s timeout, or empty output
+  logs one line and the run proceeds without a prelude — a broken entrypoint never fails the job.
+- **No effect** on `.ts`/`.sh` jobs, or when no `entrypoint_command` is configured.
 
 ## CLI
 

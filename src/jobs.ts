@@ -69,6 +69,13 @@ export interface JobMeta {
   // claude-cli path. Lets a single .md format target multiple engines
   // (claude CLI, Vercel AI SDK, future LangChain/Mastra, etc.).
   runner?: string;
+  // .md jobs only. Opt out of the `.cronfish.json#claude.entrypoint_command`
+  // system-prompt append for this job. Default true (append when a command is
+  // configured); set `entrypoint: false` for a job that must run with a bare
+  // system prompt (e.g. a small local model that can't absorb a large prelude).
+  // No effect when no entrypoint_command is configured. See README "Claude
+  // entrypoint".
+  entrypoint?: boolean;
   // One-shot scheduled jobs (files under `cron/one-time/`).
   oneTime?: boolean;
   runAtMs?: number;
@@ -367,6 +374,7 @@ function fromMarkdown(path: string, slug: string, isOneTime: boolean): JobMeta {
     max_cost: asPositiveNumber(path, "max_cost", frontmatter.max_cost),
     read_only: asOptionalBool(path, "read_only", frontmatter.read_only),
     runner: asString(path, "runner", frontmatter.runner),
+    entrypoint: asOptionalBool(path, "entrypoint", frontmatter.entrypoint),
   };
   applyOneTime(
     meta,
