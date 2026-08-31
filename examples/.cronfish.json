@@ -8,6 +8,11 @@
     "public_url": "http://127.0.0.1:4747"
   },
 
+  "claude": {
+    "$comment": "stdout of this command is passed to .md jobs as --append-system-prompt; opt a job out with `entrypoint: false`",
+    "entrypoint_command": "/usr/local/bin/print-system-prompt"
+  },
+
   "retention": {
     "max_age_days": 30,
     "max_runs": 100,

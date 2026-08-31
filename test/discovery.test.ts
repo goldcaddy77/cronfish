@@ -180,5 +180,26 @@ describe("security frontmatter fields on .md jobs", () => {
     expect(job.allowed_tools).toBeUndefined();
     expect(job.max_cost).toBeUndefined();
     expect(job.read_only).toBeUndefined();
+    // Absent `entrypoint` stays undefined — the runner treats undefined as "not
+    // opted out", so a configured entrypoint_command still applies by default.
+    expect(job.entrypoint).toBeUndefined();
+  });
+
+  test("entrypoint: false lands on the parsed meta (opt-out)", () => {
+    const p = join(cron, "bare.md");
+    writeFileSync(p, `---\nschedule: "5m"\nentrypoint: false\n---\nbody\n`);
+    expect(loadJob(p, "bare-md", cron).entrypoint).toBe(false);
+  });
+
+  test("entrypoint: true is accepted", () => {
+    const p = join(cron, "prelude.md");
+    writeFileSync(p, `---\nschedule: "5m"\nentrypoint: true\n---\nbody\n`);
+    expect(loadJob(p, "prelude-md", cron).entrypoint).toBe(true);
+  });
+
+  test("non-boolean entrypoint is a validation error", () => {
+    const p = join(cron, "bad-ep.md");
+    writeFileSync(p, `---\nschedule: "5m"\nentrypoint: sometimes\n---\nbody\n`);
+    expect(() => loadJob(p, "bad-ep-md", cron)).toThrow(/entrypoint/);
   });
 });

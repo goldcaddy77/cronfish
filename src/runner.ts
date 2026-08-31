@@ -41,7 +41,7 @@ import {
   writeSentinel,
   type FlockHandle,
 } from "./oneTime.ts";
-import { loadBundlePrefix } from "./config.ts";
+import { loadBundlePrefix, loadClaudeConfig } from "./config.ts";
 import { platform } from "./platform/index.ts";
 import { setFrontmatterKey, setShellFrontmatterKey } from "./frontmatter.ts";
 import { parseLastResult } from "./result.ts";
@@ -297,6 +297,7 @@ export function buildClaudeArgs(
   job: Pick<JobMeta, "allowed_tools" | "max_cost" | "read_only">,
   modelId: string,
   prompt: string,
+  appendSystemPrompt?: string,
 ): string[] {
   const cmd = [claudeBin];
   if (job.allowed_tools) {
@@ -315,8 +316,54 @@ export function buildClaudeArgs(
     // CLI stops making API calls once the budget is hit (works with -p/--print).
     cmd.push("--max-budget-usd", String(job.max_cost));
   }
+  if (appendSystemPrompt) {
+    // Consumer-supplied system-prompt prelude (see .cronfish.json claude.
+    // entrypoint_command). Injected before -p so it prepends the job body.
+    cmd.push("--append-system-prompt", appendSystemPrompt);
+  }
   cmd.push("--model", modelId, "-p", prompt);
   return cmd;
+}
+
+// Resolve the optional consumer-supplied `--append-system-prompt` value for a
+// `.md` job by running `.cronfish.json#claude.entrypoint_command` at the
+// consumer root and returning its trimmed stdout. Opt out per-job with
+// `entrypoint: false`. Non-blocking by design: an absent command, a non-zero
+// exit, a timeout, or empty output logs a line and yields undefined, so a
+// broken entrypoint degrades the run to "no prelude" rather than failing it.
+const ENTRYPOINT_TIMEOUT_MS = 30_000;
+export function resolveEntrypoint(job: JobMeta, fd: number): string | undefined {
+  if (job.entrypoint === false) return undefined;
+  const cfg = loadClaudeConfig(consumerRoot());
+  if (!cfg?.entrypoint_command) return undefined;
+  try {
+    const proc = Bun.spawnSync(["/bin/sh", "-c", cfg.entrypoint_command], {
+      cwd: consumerRoot(),
+      stdout: "pipe",
+      stderr: "pipe",
+      timeout: ENTRYPOINT_TIMEOUT_MS,
+    });
+    if (proc.exitCode !== 0) {
+      appendLog(
+        fd,
+        `[runner] claude.entrypoint_command exited ${proc.exitCode} — running without --append-system-prompt`,
+      );
+      return undefined;
+    }
+    const out = new TextDecoder().decode(proc.stdout).trim();
+    if (!out) return undefined;
+    appendLog(
+      fd,
+      `[runner] entrypoint: --append-system-prompt (${out.length} chars from claude.entrypoint_command)`,
+    );
+    return out;
+  } catch (e) {
+    appendLog(
+      fd,
+      `[runner] claude.entrypoint_command failed: ${e instanceof Error ? e.message : String(e)} — running without --append-system-prompt`,
+    );
+    return undefined;
+  }
 }
 
 async function execMarkdown(
@@ -360,7 +407,8 @@ async function execMarkdown(
   if (job.read_only) {
     appendLog(fd, `[runner] read-only: deny [${READ_ONLY_DENY.join(", ")}]`);
   }
-  const cmd = buildClaudeArgs(CLAUDE_BIN, job, model.id, prompt);
+  const appendSystemPrompt = resolveEntrypoint(job, fd);
+  const cmd = buildClaudeArgs(CLAUDE_BIN, job, model.id, prompt, appendSystemPrompt);
   const env = claudeEnvFor(model);
   if (env) {
     appendLog(

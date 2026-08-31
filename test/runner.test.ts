@@ -1,8 +1,10 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
+  closeSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
   readFileSync,
   readdirSync,
   rmSync,
@@ -10,9 +12,9 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildClaudeArgs } from "../src/runner.ts";
+import { buildClaudeArgs, resolveEntrypoint } from "../src/runner.ts";
 import { openStore } from "../src/store/index.ts";
-import { loadJob } from "../src/jobs.ts";
+import { loadJob, type JobMeta } from "../src/jobs.ts";
 
 const RUNNER = new URL("../src/runner.ts", import.meta.url).pathname;
 
@@ -422,5 +424,93 @@ describe("buildClaudeArgs — permission posture", () => {
   test("no read_only omits the deny flag", () => {
     const args = buildClaudeArgs(BIN, {}, "haiku", "p");
     expect(args).not.toContain("--disallowedTools");
+  });
+
+  test("appendSystemPrompt injects --append-system-prompt before -p", () => {
+    const args = buildClaudeArgs(BIN, {}, "haiku", "body", "SYSTEM PRELUDE");
+    const i = args.indexOf("--append-system-prompt");
+    expect(i).toBeGreaterThan(-1);
+    expect(args[i + 1]).toBe("SYSTEM PRELUDE");
+    // The prelude precedes --model ... -p, so it prepends the job body.
+    expect(i).toBeLessThan(args.indexOf("--model"));
+    expect(args[args.length - 2]).toBe("-p");
+    expect(args[args.length - 1]).toBe("body");
+  });
+
+  test("no appendSystemPrompt omits the flag (backward compatible)", () => {
+    const args = buildClaudeArgs(BIN, {}, "haiku", "p");
+    expect(args).not.toContain("--append-system-prompt");
+  });
+
+  test("empty appendSystemPrompt omits the flag", () => {
+    const args = buildClaudeArgs(BIN, {}, "haiku", "p", "");
+    expect(args).not.toContain("--append-system-prompt");
+  });
+
+  test("appendSystemPrompt composes with the capability fence", () => {
+    const args = buildClaudeArgs(
+      BIN,
+      { allowed_tools: ["Read"] },
+      "haiku",
+      "p",
+      "PRELUDE",
+    );
+    expect(args).toContain("--allowedTools");
+    const i = args.indexOf("--append-system-prompt");
+    expect(i).toBeGreaterThan(-1);
+    expect(i).toBeLessThan(args.indexOf("--model"));
+  });
+});
+
+describe("resolveEntrypoint — claude.entrypoint_command", () => {
+  let root: string;
+  let fd: number;
+  const prevConsumerRoot = process.env.CRONFISH_CONSUMER_ROOT;
+  const job = (entrypoint?: boolean) => ({ entrypoint }) as JobMeta;
+  const configure = (command: string) =>
+    writeFileSync(
+      join(root, ".cronfish.json"),
+      JSON.stringify({ claude: { entrypoint_command: command } }),
+    );
+
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "cronfish-ep-"));
+    process.env.CRONFISH_CONSUMER_ROOT = root;
+    fd = openSync(join(root, "run.log"), "a");
+  });
+  afterEach(() => {
+    closeSync(fd);
+    if (prevConsumerRoot === undefined) delete process.env.CRONFISH_CONSUMER_ROOT;
+    else process.env.CRONFISH_CONSUMER_ROOT = prevConsumerRoot;
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  test("returns the command's trimmed stdout", () => {
+    configure("printf '  PRELUDE\\n  '");
+    expect(resolveEntrypoint(job(), fd)).toBe("PRELUDE");
+  });
+
+  test("entrypoint: false opts the job out even when configured", () => {
+    configure("echo SHOULD_NOT_RUN");
+    expect(resolveEntrypoint(job(false), fd)).toBeUndefined();
+  });
+
+  test("undefined entrypoint still applies the command (default on)", () => {
+    configure("echo ON_BY_DEFAULT");
+    expect(resolveEntrypoint(job(undefined), fd)).toBe("ON_BY_DEFAULT");
+  });
+
+  test("no config → undefined", () => {
+    expect(resolveEntrypoint(job(), fd)).toBeUndefined();
+  });
+
+  test("non-zero exit → undefined (non-blocking)", () => {
+    configure("echo partial; exit 3");
+    expect(resolveEntrypoint(job(), fd)).toBeUndefined();
+  });
+
+  test("empty output → undefined", () => {
+    configure("true");
+    expect(resolveEntrypoint(job(), fd)).toBeUndefined();
   });
 });

@@ -208,3 +208,32 @@ export function loadStoreConfig(consumerRoot: string): StoreConfig {
     return DEFAULT_STORE_CONFIG;
   }
 }
+
+// --- Claude runner config ---
+
+export interface ClaudeConfig {
+  // A shell command whose stdout (trimmed) is passed to the Claude Code CLI as
+  // `--append-system-prompt` when running `.md` jobs. Runs once per `.md` job,
+  // at the consumer root, with the daemon's environment. Lets a consumer inject
+  // a dynamic system prompt (identity, live system state, a doctrine index)
+  // without hardcoding it. Per-job opt-out: `entrypoint: false` frontmatter.
+  entrypoint_command?: string;
+}
+
+// Tolerant read of the optional `claude` config block (mirrors loadStoreConfig):
+// null on a missing/unparseable file or an absent/empty command, so a broken
+// config never injects a stale prompt — the runner just proceeds without one.
+export function loadClaudeConfig(consumerRoot: string): ClaudeConfig | null {
+  const path = join(consumerRoot, ".cronfish.json");
+  if (!existsSync(path)) return null;
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf-8")) as {
+      claude?: { entrypoint_command?: unknown };
+    };
+    const cmd = parsed.claude?.entrypoint_command;
+    if (typeof cmd !== "string" || cmd.trim() === "") return null;
+    return { entrypoint_command: cmd };
+  } catch {
+    return null;
+  }
+}
