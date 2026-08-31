@@ -1,3 +1,10 @@
+# [0.23.0](https://github.com/goldcaddy77/cronfish/compare/v0.22.0...v0.23.0) (2026-08-31)
+
+
+### Features
+
+* inject a system prompt into .md jobs via claude.entrypoint_command ([e7dc8d0](https://github.com/goldcaddy77/cronfish/commit/e7dc8d075918f2561e7607736416ddc7ef3e9cc6))
+
 # [0.22.0](https://github.com/goldcaddy77/cronfish/compare/v0.21.5...v0.22.0) (2026-08-26)
 
 
