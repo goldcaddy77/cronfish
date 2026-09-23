@@ -501,4 +501,34 @@ describe.each(BACKENDS)("cron store behavior [%s]", (_name, factory) => {
       expect((await store.jobStats()).map((s) => s.slug)).toEqual(["a-md", "b-md"]);
     });
   });
+
+  describe("getPreviousFinishedStatus", () => {
+    // POS-555: manual runs never alert, so they must not count as the
+    // "previous" run, or a manual ok swallows the next scheduled recovery.
+    test("fail(schedule) -> ok(manual) -> ok(schedule) is still a recovery", async () => {
+      await store.upsertJob(meta({ slug: "rec-md" }));
+      const jobId = (await store.getJobIdBySlug("rec-md"))!;
+
+      const failed = await store.startInvocation(jobId, "schedule", "/log/1");
+      await store.finishInvocation(failed, "fail", 1);
+      const manual = await store.startInvocation(jobId, "manual", "/log/2");
+      await store.finishInvocation(manual, "ok", 0);
+
+      const next = await store.startInvocation(jobId, "schedule", "/log/3");
+      expect(await store.getPreviousFinishedStatus(jobId, next)).toBe("fail");
+    });
+
+    test("a manual fail does not open an episode for the next scheduled ok", async () => {
+      await store.upsertJob(meta({ slug: "man-md" }));
+      const jobId = (await store.getJobIdBySlug("man-md"))!;
+
+      const ok = await store.startInvocation(jobId, "schedule", "/log/1");
+      await store.finishInvocation(ok, "ok", 0);
+      const manual = await store.startInvocation(jobId, "manual", "/log/2");
+      await store.finishInvocation(manual, "fail", 1);
+
+      const next = await store.startInvocation(jobId, "schedule", "/log/3");
+      expect(await store.getPreviousFinishedStatus(jobId, next)).toBe("ok");
+    });
+  });
 });

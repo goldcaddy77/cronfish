@@ -268,8 +268,10 @@ export class SqliteStore implements CronStore {
     return row?.started_at ?? null;
   }
 
-  // Most recent finished invocation for a job (excluding the given id).
-  // Used by the runner to decide whether the current ok run is a recovery.
+  // Most recent finished SCHEDULED invocation for a job (excluding the given
+  // id). Used by the runner to decide whether the current ok run is a
+  // recovery. Manual runs never alert, so they must not count as "previous"
+  // either (POS-555).
   async getPreviousFinishedStatus(
     jobId: number,
     excludingId: number,
