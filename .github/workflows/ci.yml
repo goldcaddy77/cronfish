@@ -35,6 +35,7 @@ jobs:
       contents: write # push the release commit + tag
       issues: write # comment on released issues
       pull-requests: write # comment on released PRs
+      id-token: write # npm trusted publishing (OIDC); no long-lived NPM_TOKEN
     steps:
       - uses: actions/checkout@v4
         with:
@@ -42,14 +43,19 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          # npm >= 11.5.1 (bundled with Node 24) is required for OIDC
+          # trusted publishing.
+          node-version: 24
 
       - name: Semantic Release
         uses: cycjimmy/semantic-release-action@v4
         with:
+          # @semantic-release/npm >= 12.0.2 exchanges the GitHub OIDC token
+          # for a short-lived npm publish token. Granular npm write tokens
+          # expire after at most 90 days, which silently broke releases.
+          semantic_version: 25
           extra_plugins: |
             @semantic-release/changelog
             @semantic-release/git
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
