@@ -258,6 +258,10 @@ export interface CronStore {
   setInvocationLogPath(invocationId: number, logPath: string): Promise<void>;
   getInvocationLogPath(invocationId: number): Promise<string | null>;
   getLastOkStartedAt(jobId: number): Promise<string | null>;
+  // Status of the most recent finished invocation with trigger = 'schedule'
+  // (excluding `excludingId`). Only scheduled runs alert, so only they define
+  // the failure episode a `recovered` alert closes: a manual ok between a
+  // scheduled fail and the next scheduled ok must not swallow the recovery.
   getPreviousFinishedStatus(
     jobId: number,
     excludingId: number,

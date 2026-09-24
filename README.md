@@ -451,7 +451,7 @@ all-clear.
 
 ## Alerts
 
-Every failed (`fail` / `timeout` / `crashed`) scheduled run pings the configured adapter, and the first `ok` after a failure pings once as `recovered`. Missed schedules are caught by `cronfish watchdog` (scaffolded as `cron/watchdog.sh`, scheduled `every 5 minutes`, disabled by default — flip on after configuring `alerts`).
+Every failed (`fail` / `timeout` / `crashed`) scheduled run pings the configured adapter, and the first scheduled `ok` after a scheduled failure pings once as `recovered`. Manual runs (`cronfish run`) never alert and do not count toward this: a manual `ok` in between does not swallow the recovery. Missed schedules are caught by `cronfish watchdog` (scaffolded as `cron/watchdog.sh`, scheduled `every 5 minutes`, disabled by default — flip on after configuring `alerts`).
 
 Adapters ship with cronfish:
 

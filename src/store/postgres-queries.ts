@@ -313,8 +313,9 @@ export function buildPostgresQueries(schema: string) {
     }),
     previousFinishedStatus: (jobId: number, excludingId: number): PgQuery => ({
       text: `SELECT status FROM ${inv}
-       WHERE job_id = $1 AND id <> $2 AND finished_at IS NOT NULL
-       ORDER BY started_at DESC LIMIT 1`,
+       WHERE job_id = $1 AND id <> $2 AND trigger = 'schedule'
+         AND finished_at IS NOT NULL
+       ORDER BY started_at DESC, id DESC LIMIT 1`,
       values: [jobId, excludingId],
     }),
 

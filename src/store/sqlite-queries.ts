@@ -347,8 +347,9 @@ export const SQLITE_LAST_OK_STARTED_AT = `SELECT started_at FROM cron_invocation
 export const SQLITE_PREVIOUS_FINISHED_STATUS = `SELECT status FROM cron_invocations
    WHERE job_id = $job_id
      AND id <> $id
+     AND trigger = 'schedule'
      AND finished_at IS NOT NULL
-   ORDER BY started_at DESC LIMIT 1`;
+   ORDER BY started_at DESC, id DESC LIMIT 1`;
 
 // --- Missed-run alerts ---
 
