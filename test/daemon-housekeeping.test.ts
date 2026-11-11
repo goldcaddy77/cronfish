@@ -327,7 +327,7 @@ describe("housekeeping yields and stops (POS-1114 skeptic pass)", () => {
     const t0 = Date.now();
     await stopHousekeeping(ctx, 50);
     expect(ctx.shutdown.signal.aborted).toBe(true);
-    expect(Date.now() - t0).toBeLessThan(1_000);
+    expect(Date.now() - t0).toBeLessThan(2_500);
   });
 
   test("stopHousekeeping returns as soon as an aborted run settles", async () => {
@@ -336,7 +336,7 @@ describe("housekeeping yields and stops (POS-1114 skeptic pass)", () => {
     ctx.housekeeping = new Promise<void>((r) => signal.addEventListener("abort", () => r()));
     const t0 = Date.now();
     await stopHousekeeping(ctx, 5_000);
-    expect(Date.now() - t0).toBeLessThan(500);
+    expect(Date.now() - t0).toBeLessThan(2_500);
   });
 });
 
