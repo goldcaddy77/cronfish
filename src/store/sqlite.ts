@@ -49,8 +49,8 @@ function scheduleAsText(schedule: JobMeta["schedule"]): string {
   return String(schedule);
 }
 
-// Invocation rows deleted per statement. Small enough that one batch is a few
-// milliseconds on any disk.
+// Invocation rows deleted per statement. Bounded so one batch stays well
+// under a 1s daemon tick (tens of milliseconds on a WAL file database).
 const PRUNE_BATCH_ROWS = 5_000;
 
 export class SqliteStore implements CronStore {
@@ -543,7 +543,9 @@ export class SqliteStore implements CronStore {
     }[] = [];
     work();
     if (opts.dryRun) return report;
+    const yieldLoop = () => new Promise((r) => setImmediate(r));
     for (const { p, pInv } of targets) {
+      if (opts.signal?.aborted) break;
       this.#db.transaction(() => {
         report.missedAlerts += this.#db
           .prepare(Q.SQLITE_PRUNE_DELETE_MISSED)
@@ -561,8 +563,10 @@ export class SqliteStore implements CronStore {
           .prepare(Q.SQLITE_PRUNE_DELETE_INVOCATIONS_BATCH)
           .run(batch).changes;
         report.invocations += n;
-        if (n < PRUNE_BATCH_ROWS) break;
-        await new Promise((r) => setImmediate(r));
+        // Yield after EVERY statement, so many small jobs back to back can't
+        // hold the loop either.
+        await yieldLoop();
+        if (n < PRUNE_BATCH_ROWS || opts.signal?.aborted) break;
       }
     }
     return report;

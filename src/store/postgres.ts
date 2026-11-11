@@ -683,6 +683,7 @@ export class PostgresStore implements CronStore {
     await this.#sql.begin(async (tx) => {
       const exec = async (q: PgQuery) => tx.unsafe(q.text, q.values);
       for (const { job, cutoff } of plan) {
+        if (opts.signal?.aborted) break;
         // Bun.sql exposes affected-row count via the result array's `.count`
         // (the query returns no rows, so length is 0); read it defensively.
         const dm = await exec(this.#q.pruneDeleteMissed(job.id, cutoff));

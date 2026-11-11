@@ -203,6 +203,9 @@ export interface LedgerPruneOptions {
   dryRun?: boolean;
   // Injectable clock for tests (ms since epoch). Defaults to Date.now().
   nowMs?: number;
+  // Stop at the next job or batch boundary once aborted (daemon shutdown).
+  // Rows already deleted stay deleted; the rest go on the next run.
+  signal?: AbortSignal;
 }
 
 export interface LedgerPruneReport {

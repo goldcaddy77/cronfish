@@ -626,6 +626,7 @@ export async function runHousekeeping(ctx: DaemonCtx, now: Date): Promise<void> 
     global: retention.global,
     perSlug: retention.perSlug,
     nowMs: now.getTime(),
+    signal,
   });
   if (logs.totalDeleted > 0 || ledgerPruneTotal(ledger) > 0) {
     warn(
@@ -633,6 +634,27 @@ export async function runHousekeeping(ctx: DaemonCtx, now: Date): Promise<void> 
       `housekeeping: pruned ${logs.totalDeleted} log(s), ${ledger.invocations} invocation(s), ${ledger.runRequests} run request(s), ${ledger.missedAlerts} missed alert(s)`,
     );
   }
+}
+
+// Shutdown half: abort an in-flight run and give it a moment to reach a batch
+// boundary, so it never keeps deleting after the lock is released and the
+// store is closed. Anything it did not get to resumes on the next start.
+// runDaemon calls this BEFORE releaseDaemonLock and store.close.
+export async function stopHousekeeping(
+  ctx: DaemonCtx,
+  waitMs: number = HOUSEKEEPING_STOP_WAIT_MS,
+): Promise<void> {
+  ctx.shutdown?.abort();
+  const run = ctx.housekeeping;
+  if (!run) return;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  await Promise.race([
+    run,
+    new Promise<void>((r) => {
+      timer = setTimeout(r, waitMs);
+    }),
+  ]);
+  clearTimeout(timer);
 }
 
 export function startHousekeeping(ctx: DaemonCtx, now: Date): void {
@@ -962,13 +984,7 @@ export async function runDaemon(opts: { consumerRoot: string }): Promise<void> {
     }
     await Bun.sleep(Math.max(0, TICK_MS - elapsed));
   }
-  // Stop an in-flight housekeeping run and give it a moment to reach a batch
-  // boundary, so it never keeps deleting after the lock is released and the
-  // store is closed. Anything it did not get to resumes on the next start.
-  ctx.shutdown.abort();
-  if (ctx.housekeeping) {
-    await Promise.race([ctx.housekeeping, Bun.sleep(HOUSEKEEPING_STOP_WAIT_MS)]);
-  }
+  await stopHousekeeping(ctx);
   releaseDaemonLock(consumerRoot, process.pid);
   try {
     await store.close();

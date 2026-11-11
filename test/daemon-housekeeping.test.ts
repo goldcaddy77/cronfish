@@ -3,7 +3,12 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Database } from "bun:sqlite";
-import { tickOnce, type DaemonCtx, type SpawnRequest } from "../src/daemon.ts";
+import {
+  stopHousekeeping,
+  tickOnce,
+  type DaemonCtx,
+  type SpawnRequest,
+} from "../src/daemon.ts";
 import { SqliteStore } from "../src/store/index.ts";
 
 const DAY = 86_400_000;
@@ -260,5 +265,70 @@ describe("housekeeping stops cleanly on shutdown (POS-1114 review)", () => {
     await tickOnce(ctx, T0);
     await ctx.housekeeping;
     expect(invocationCount()).toBe(1);
+  });
+});
+
+describe("housekeeping yields and stops (POS-1114 skeptic pass)", () => {
+  function seedManyJobs(jobs: number, perJob: number): void {
+    const ins = db.prepare(
+      `INSERT INTO cron_invocations (job_id, started_at, status, trigger, log_path)
+       VALUES ($job, $started, 'ok', 'schedule', '/tmp/x.log')`,
+    );
+    for (let j = 0; j < jobs; j++) {
+      addJobWithInvocation(`job${j}-md`, 40);
+      const { id } = db
+        .query("SELECT id FROM cron_jobs WHERE slug = $s")
+        .get({ $s: `job${j}-md` }) as { id: number };
+      db.transaction(() => {
+        for (let i = 1; i < perJob; i++) ins.run({ $job: id, $started: iso(40 * DAY) });
+      })();
+    }
+  }
+
+  test("the SQLite ledger prune yields the event loop between statements", async () => {
+    seedManyJobs(50, 20);
+    let spins = 0;
+    let on = true;
+    const spin = (): void => {
+      spins++;
+      if (on) setImmediate(spin);
+    };
+    spin();
+    const report = await ctx.store.pruneLedger({ global: { maxAgeDays: 30 }, nowMs: T0.getTime() });
+    on = false;
+    expect(report.invocations).toBe(1_000);
+    // One yield per job at least: a single blocking transaction gives ~1.
+    expect(spins).toBeGreaterThan(40);
+  });
+
+  test("an aborted signal stops the SQLite ledger prune at the next boundary", async () => {
+    seedManyJobs(5, 10);
+    const ac = new AbortController();
+    ac.abort();
+    const report = await ctx.store.pruneLedger({
+      global: { maxAgeDays: 30 },
+      nowMs: T0.getTime(),
+      signal: ac.signal,
+    });
+    expect(report.invocations).toBe(0);
+    expect(invocationCount()).toBe(50);
+  });
+
+  test("stopHousekeeping aborts the run and waits at most waitMs", async () => {
+    ctx.shutdown = new AbortController();
+    ctx.housekeeping = new Promise(() => {}); // a run that never settles
+    const t0 = Date.now();
+    await stopHousekeeping(ctx, 50);
+    expect(ctx.shutdown.signal.aborted).toBe(true);
+    expect(Date.now() - t0).toBeLessThan(1_000);
+  });
+
+  test("stopHousekeeping returns as soon as an aborted run settles", async () => {
+    ctx.shutdown = new AbortController();
+    const signal = ctx.shutdown.signal;
+    ctx.housekeeping = new Promise<void>((r) => signal.addEventListener("abort", () => r()));
+    const t0 = Date.now();
+    await stopHousekeeping(ctx, 5_000);
+    expect(Date.now() - t0).toBeLessThan(500);
   });
 });
