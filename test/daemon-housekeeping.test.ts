@@ -119,3 +119,84 @@ describe("daemon housekeeping", () => {
     expect(invocationCount()).toBe(1);
   });
 });
+
+// POS-1114: on a large log tree the first tick's prune walk took minutes, and
+// it ran BEFORE the heartbeat. A supervisor that reads "no fresh heartbeat" as
+// "dead daemon" restarted it mid-walk, forever. The heartbeat must never wait
+// on housekeeping, and housekeeping must never hold the tick.
+describe("daemon housekeeping never delays the heartbeat (POS-1114)", () => {
+  function withRetention(): void {
+    writeFileSync(
+      join(root, ".cronfish.json"),
+      JSON.stringify({ retention: { max_age_days: 30 } }),
+      "utf-8",
+    );
+  }
+
+  test("the first tick beats even when housekeeping never finishes", async () => {
+    withRetention();
+    // A ledger prune that never settles stands in for a minutes-long walk.
+    ctx.store.pruneLedger = () => new Promise(() => {});
+    const tick = tickOnce(ctx, T0).then(() => "ticked");
+    const timeout = new Promise((r) => setTimeout(() => r("timed out"), 2_000));
+    expect(await Promise.race([tick, timeout])).toBe("ticked");
+    const hb = await ctx.store.getDaemonHeartbeat();
+    expect(hb?.pid).toBe(4242);
+  });
+
+  test("the heartbeat is written before housekeeping starts", async () => {
+    withRetention();
+    const calls: string[] = [];
+    const store = ctx.store;
+    const beat = store.beatDaemonHeartbeat.bind(store);
+    const prune = store.pruneLedger.bind(store);
+    store.beatDaemonHeartbeat = (o) => {
+      calls.push("beat");
+      return beat(o);
+    };
+    store.pruneLedger = (o) => {
+      calls.push("prune");
+      return prune(o);
+    };
+    await tickOnce(ctx, T0);
+    await ctx.housekeeping;
+    expect(calls).toEqual(["beat", "prune"]);
+  });
+
+  test("a large log walk runs off the tick and still prunes", async () => {
+    withRetention();
+    const slugDir = join(root, ".cronfish", "logs", "noisy-md");
+    mkdirSync(slugDir, { recursive: true });
+    const old = new Date(T0.getTime() - 40 * DAY);
+    const { utimesSync } = await import("node:fs");
+    for (let i = 0; i < 2_000; i++) {
+      const p = join(slugDir, `${i}.log`);
+      writeFileSync(p, "x");
+      utimesSync(p, old, old);
+    }
+    writeFileSync(join(slugDir, "fresh.log"), "x");
+    const { readdirSync } = await import("node:fs");
+
+    await tickOnce(ctx, T0);
+    // The tick returned while the walk is still in flight.
+    expect(ctx.housekeeping).toBeDefined();
+    expect(readdirSync(slugDir).length).toBeGreaterThan(1);
+
+    await ctx.housekeeping;
+    expect(readdirSync(slugDir)).toEqual(["fresh.log"]);
+  });
+
+  test("a housekeeping run still in flight is not started twice", async () => {
+    withRetention();
+    let calls = 0;
+    ctx.store.pruneLedger = () => {
+      calls++;
+      return new Promise(() => {});
+    };
+    await tickOnce(ctx, T0);
+    // Next UTC day while the first run is still going: no second run.
+    await tickOnce(ctx, new Date(T0.getTime() + DAY));
+    await new Promise((r) => setTimeout(r, 50));
+    expect(calls).toBe(1);
+  });
+});
