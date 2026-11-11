@@ -30,6 +30,9 @@ export interface PruneOptions {
   dryRun?: boolean;
   // Injectable clock for tests (ms since epoch). Defaults to Date.now().
   nowMs?: number;
+  // Async path only: stop between fs batches once aborted (daemon shutdown).
+  // The report then covers what was deleted before the abort.
+  signal?: AbortSignal;
 }
 
 export interface PruneSlugResult {
@@ -176,17 +179,21 @@ const ASYNC_FS_BATCH = 32;
 async function inBatches<T>(
   items: T[],
   fn: (item: T) => Promise<void>,
+  signal?: AbortSignal,
 ): Promise<void> {
   for (let i = 0; i < items.length; i += ASYNC_FS_BATCH) {
+    if (signal?.aborted) return;
     await Promise.all(items.slice(i, i + ASYNC_FS_BATCH).map(fn));
   }
 }
 
 async function collectBySlugAsync(
   logsDir: string,
+  signal?: AbortSignal,
 ): Promise<Map<string, LogFile[]>> {
   const bySlug = new Map<string, LogFile[]>();
   const visit = async (dir: string): Promise<void> => {
+    if (signal?.aborted) return;
     let entries: import("node:fs").Dirent[];
     try {
       entries = await readdir(dir, { withFileTypes: true });
@@ -209,7 +216,7 @@ async function collectBySlugAsync(
       } catch {
         // vanished mid-walk
       }
-    });
+    }, signal);
     if (list.length > 0) bySlug.set(slug, list);
   };
   await visit(logsDir);
@@ -218,7 +225,13 @@ async function collectBySlugAsync(
 
 export async function pruneLogsAsync(opts: PruneOptions): Promise<PruneReport> {
   const nowMs = opts.nowMs ?? Date.now();
-  const bySlug = await collectBySlugAsync(logsRoot(opts.consumerRoot));
+  const bySlug = await collectBySlugAsync(
+    logsRoot(opts.consumerRoot),
+    opts.signal,
+  );
+  // An aborted walk saw only part of the tree: a maxRuns cut over a partial
+  // listing could pick the wrong files, so delete nothing.
+  if (opts.signal?.aborted) return toReport([]);
   const slugs: PruneSlugResult[] = [];
   for (const { slug, files, victims } of planPrune(bySlug, opts, nowMs)) {
     let bytesFreed = 0;
@@ -233,7 +246,7 @@ export async function pruneLogsAsync(opts: PruneOptions): Promise<PruneReport> {
       }
       deleted.push(v.path);
       bytesFreed += v.size;
-    });
+    }, opts.signal);
     slugs.push({ slug, deleted, bytesFreed, kept: files.length - deleted.length });
   }
   return toReport(slugs);

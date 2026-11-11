@@ -209,3 +209,56 @@ describe("daemon housekeeping never delays the heartbeat (POS-1114)", () => {
     expect(calls).toBe(1);
   });
 });
+
+describe("housekeeping stops cleanly on shutdown (POS-1114 review)", () => {
+  test("an aborted log walk deletes nothing and skips the ledger prune", async () => {
+    writeFileSync(
+      join(root, ".cronfish.json"),
+      JSON.stringify({ retention: { max_age_days: 30 } }),
+      "utf-8",
+    );
+    const slugDir = join(root, ".cronfish", "logs", "noisy-md");
+    mkdirSync(slugDir, { recursive: true });
+    const old = new Date(T0.getTime() - 40 * DAY);
+    const { utimesSync, readdirSync } = await import("node:fs");
+    for (let i = 0; i < 500; i++) {
+      const p = join(slugDir, `${i}.log`);
+      writeFileSync(p, "x");
+      utimesSync(p, old, old);
+    }
+    let ledgerCalls = 0;
+    ctx.store.pruneLedger = async () => {
+      ledgerCalls++;
+      return { invocations: 0, runRequests: 0, missedAlerts: 0 };
+    };
+    ctx.shutdown = new AbortController();
+    await tickOnce(ctx, T0);
+    ctx.shutdown.abort();
+    await ctx.housekeeping;
+    expect(ledgerCalls).toBe(0);
+    expect(readdirSync(slugDir).length).toBe(500);
+  });
+
+  test("SQLite ledger prune deletes large backlogs in batches, all of them", async () => {
+    writeFileSync(
+      join(root, ".cronfish.json"),
+      JSON.stringify({ retention: { max_age_days: 30 } }),
+      "utf-8",
+    );
+    addJobWithInvocation("foo-md", 40);
+    const { id: jobId } = db
+      .query("SELECT id FROM cron_jobs WHERE slug = 'foo-md'")
+      .get() as { id: number };
+    const ins = db.prepare(
+      `INSERT INTO cron_invocations (job_id, started_at, status, trigger, log_path)
+       VALUES ($job, $started, 'ok', 'schedule', '/tmp/x.log')`,
+    );
+    db.transaction(() => {
+      for (let i = 0; i < 12_000; i++) ins.run({ $job: jobId, $started: iso(40 * DAY) });
+    })();
+    addJobWithInvocation("foo-md", 1); // fresh row survives
+    await tickOnce(ctx, T0);
+    await ctx.housekeeping;
+    expect(invocationCount()).toBe(1);
+  });
+});

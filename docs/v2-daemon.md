@@ -78,7 +78,9 @@ younger than 24h is always protected. No `retention` block in `.cronfish.json` â
 Housekeeping never blocks a tick. The tick starts it and moves on; the log walk is fully async, so on
 a tree of hundreds of thousands of logs the first prune after a start can take minutes while the
 heartbeat keeps beating every second. One run at a time: a run still going when the day rolls over
-skips that day.
+delays the next day's run until it finishes. SQLite ledger rows are deleted in bounded batches with a
+yield between them. On SIGTERM the run stops at the next batch boundary and the daemon waits for it
+(at most 5s) before releasing its lock; whatever was left resumes on the next start.
 
 ## Migration
 

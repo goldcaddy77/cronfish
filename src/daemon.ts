@@ -104,8 +104,11 @@ export interface DaemonCtx {
   lastHousekeepingDay?: string;
   // The housekeeping run currently in flight, if any. Housekeeping runs OFF
   // the tick (POS-1114): tickOnce starts it and moves on, and a new day's run
-  // is skipped while the previous one is still going. Tests await it.
+  // waits until the previous one has finished. Tests await it.
   housekeeping?: Promise<void>;
+  // Aborted on shutdown so an in-flight housekeeping run stops between fs
+  // batches instead of outliving the tick loop, its lock and its store.
+  shutdown?: AbortController;
   // Cold-start verdict, read on the first tick BEFORE that tick's heartbeat
   // (beating first would otherwise make every start look warm) and consumed
   // by the jitter step on the same tick.
@@ -600,17 +603,25 @@ export async function checkMissedRuns(
 // mid-walk, which began the walk again. startHousekeeping kicks the run off
 // in the background and returns at once; the log walk is fully async so it
 // yields the event loop between fs calls. One run at a time: a run still in
-// flight when the day rolls over means that day's run is skipped, and the
-// next day's gate picks it up.
+// flight when the day rolls over defers the new day's run until it finishes.
+// On shutdown the run is aborted between batches and awaited briefly.
+// Upper bound on how long shutdown waits for an aborted housekeeping run.
+// One fs batch or one ledger batch is milliseconds; this is slack, and well
+// inside launchd's default 20s exit timeout.
+export const HOUSEKEEPING_STOP_WAIT_MS = 5_000;
+
 export async function runHousekeeping(ctx: DaemonCtx, now: Date): Promise<void> {
   const retention = loadRetention(ctx.consumerRoot);
   if (!retention) return;
+  const signal = ctx.shutdown?.signal;
   const logs = await pruneLogsAsync({
     consumerRoot: ctx.consumerRoot,
     global: retention.global,
     perSlug: retention.perSlug,
     nowMs: now.getTime(),
+    signal,
   });
+  if (signal?.aborted) return;
   const ledger = await ctx.store.pruneLedger({
     global: retention.global,
     perSlug: retention.perSlug,
@@ -908,6 +919,7 @@ export async function runDaemon(opts: { consumerRoot: string }): Promise<void> {
     version: pkg.version,
   };
 
+  ctx.shutdown = new AbortController();
   let running = true;
   const stop = (sig: NodeJS.Signals): void => {
     if (!running) return;
@@ -949,6 +961,13 @@ export async function runDaemon(opts: { consumerRoot: string }): Promise<void> {
       console.error(`[daemon] slow tick: ${elapsed}ms`);
     }
     await Bun.sleep(Math.max(0, TICK_MS - elapsed));
+  }
+  // Stop an in-flight housekeeping run and give it a moment to reach a batch
+  // boundary, so it never keeps deleting after the lock is released and the
+  // store is closed. Anything it did not get to resumes on the next start.
+  ctx.shutdown.abort();
+  if (ctx.housekeeping) {
+    await Promise.race([ctx.housekeeping, Bun.sleep(HOUSEKEEPING_STOP_WAIT_MS)]);
   }
   releaseDaemonLock(consumerRoot, process.pid);
   try {

@@ -556,3 +556,9 @@ export const SQLITE_PRUNE_NULL_RUN_REQUEST_REFS = `UPDATE cron_run_requests SET 
              (SELECT id FROM cron_invocations WHERE ${SQLITE_DOOMED_INVOCATION_PREDICATE})`;
 
 export const SQLITE_PRUNE_DELETE_INVOCATIONS = `DELETE FROM cron_invocations WHERE ${SQLITE_DOOMED_INVOCATION_PREDICATE}`;
+
+// Bounded variant: at most $limit doomed rows per statement, so a first prune
+// over a ledger that grew for months never holds the (synchronous) SQLite
+// connection, and with it the daemon's event loop, for seconds (POS-1114).
+export const SQLITE_PRUNE_DELETE_INVOCATIONS_BATCH = `DELETE FROM cron_invocations WHERE id IN
+           (SELECT id FROM cron_invocations WHERE ${SQLITE_DOOMED_INVOCATION_PREDICATE} LIMIT $limit)`;

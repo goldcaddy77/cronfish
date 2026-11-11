@@ -49,6 +49,10 @@ function scheduleAsText(schedule: JobMeta["schedule"]): string {
   return String(schedule);
 }
 
+// Invocation rows deleted per statement. Small enough that one batch is a few
+// milliseconds on any disk.
+const PRUNE_BATCH_ROWS = 5_000;
+
 export class SqliteStore implements CronStore {
   #db: Database;
 
@@ -485,7 +489,7 @@ export class SqliteStore implements CronStore {
     return this.#db.query(Q.SQLITE_LAST_RESULTS).all() as LastResultRow[];
   }
 
-  // --- Ledger prune (multi-DELETE transaction is a private impl detail) ---
+  // --- Ledger prune (bounded batches are a private impl detail) ---
 
   async pruneLedger(opts: LedgerPruneOptions): Promise<LedgerPruneReport> {
     const nowMs = opts.nowMs ?? Date.now();
@@ -525,6 +529,22 @@ export class SqliteStore implements CronStore {
           continue;
         }
 
+        targets.push({ p, pInv: { ...p, $running_cutoff: runningCutoff } });
+      }
+    };
+
+    // Write path: per job, one short transaction for the small tables, then
+    // the invocation rows in bounded batches, each its own transaction, with
+    // an event-loop yield between them (POS-1114). Every step is idempotent,
+    // so a prune cut short (crash, shutdown) just resumes on the next run.
+    const targets: {
+      p: Record<string, unknown>;
+      pInv: Record<string, unknown>;
+    }[] = [];
+    work();
+    if (opts.dryRun) return report;
+    for (const { p, pInv } of targets) {
+      this.#db.transaction(() => {
         report.missedAlerts += this.#db
           .prepare(Q.SQLITE_PRUNE_DELETE_MISSED)
           .run(p).changes;
@@ -533,16 +553,18 @@ export class SqliteStore implements CronStore {
           .run(p).changes;
         // A surviving run request may still reference a doomed invocation
         // (foreign_keys=ON would abort the delete) — sever the link first.
-        const pInv = { ...p, $running_cutoff: runningCutoff };
         this.#db.prepare(Q.SQLITE_PRUNE_NULL_RUN_REQUEST_REFS).run(pInv);
-        report.invocations += this.#db
-          .prepare(Q.SQLITE_PRUNE_DELETE_INVOCATIONS)
-          .run(pInv).changes;
+      })();
+      const batch = { ...pInv, $limit: PRUNE_BATCH_ROWS };
+      for (;;) {
+        const n = this.#db
+          .prepare(Q.SQLITE_PRUNE_DELETE_INVOCATIONS_BATCH)
+          .run(batch).changes;
+        report.invocations += n;
+        if (n < PRUNE_BATCH_ROWS) break;
+        await new Promise((r) => setImmediate(r));
       }
-    };
-
-    if (opts.dryRun) work();
-    else this.#db.transaction(work)();
+    }
     return report;
   }
 }
