@@ -75,16 +75,21 @@ describe("daemon housekeeping", () => {
     addJobWithInvocation("foo-md", 40);
 
     await tickOnce(ctx, T0);
+
+    await ctx.housekeeping;
     expect(invocationCount()).toBe(0);
 
     // Same day: a newly-aged row is NOT pruned again until tomorrow.
     addJobWithInvocation("foo-md", 40);
     await tickOnce(ctx, new Date(T0.getTime() + 60_000));
+    await ctx.housekeeping;
     await tickOnce(ctx, new Date(T0.getTime() + 3_600_000));
+    await ctx.housekeeping;
     expect(invocationCount()).toBe(1);
 
     // Next UTC day (T0 is 12:00Z, +13h crosses midnight): pruned again.
     await tickOnce(ctx, new Date(T0.getTime() + 13 * 3_600_000));
+    await ctx.housekeeping;
     expect(invocationCount()).toBe(0);
   });
 
@@ -104,6 +109,8 @@ describe("daemon housekeeping", () => {
 
     await tickOnce(ctx, T0);
 
+    await ctx.housekeeping;
+
     const slugs = db
       .query(
         `SELECT j.slug FROM cron_invocations i JOIN cron_jobs j ON j.id = i.job_id`,
@@ -115,7 +122,9 @@ describe("daemon housekeeping", () => {
   test("no retention configured → no rows are ever deleted", async () => {
     addJobWithInvocation("foo-md", 400);
     await tickOnce(ctx, T0);
+    await ctx.housekeeping;
     await tickOnce(ctx, new Date(T0.getTime() + 2 * DAY));
+    await ctx.housekeeping;
     expect(invocationCount()).toBe(1);
   });
 });

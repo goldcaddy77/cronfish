@@ -1,8 +1,9 @@
 // Cronfish v2 daemon — the tick loop (docs/v2-daemon.md).
 //
-// One foreground process, 1 Hz. Each tick: mtime-scan cron/ and sync changed
-// files into the ledger, dispatch every due job by spawning the existing
-// runner as a child process, drain `cron run` requests, beat the heartbeat.
+// One foreground process, 1 Hz. Each tick: beat the heartbeat, mtime-scan
+// cron/ and sync changed files into the ledger, dispatch every due job by
+// spawning the existing runner as a child process, drain `cron run` requests,
+// and (once a day, in the background) kick off housekeeping.
 // The daemon decides WHEN a job runs; the runner keeps owning HOW (locks,
 // logs, retries, invocation rows, alerts). Job code never executes in this
 // process — a hung or OOMing job can't take the scheduler down.
@@ -31,7 +32,7 @@ import {
 } from "./store/index.ts";
 import { loadJob, slugFromPath, walkJobFiles } from "./jobs.ts";
 import { loadRetention } from "./config.ts";
-import { ledgerPruneTotal, pruneLogs } from "./prune.ts";
+import { ledgerPruneTotal, pruneLogsAsync } from "./prune.ts";
 import { computeNextRun } from "./next-run.ts";
 import { DEFAULT_GRACE_SECONDS, writeSentinel } from "./oneTime.ts";
 import { runWatchdog, type WatchdogDecision } from "./watchdog.ts";
@@ -101,6 +102,14 @@ export interface DaemonCtx {
   // UTC day (YYYY-MM-DD) the daily housekeeping last ran — the once-per-day
   // gate. In-memory on purpose: a restart re-prunes once, which is idempotent.
   lastHousekeepingDay?: string;
+  // The housekeeping run currently in flight, if any. Housekeeping runs OFF
+  // the tick (POS-1114): tickOnce starts it and moves on, and a new day's run
+  // is skipped while the previous one is still going. Tests await it.
+  housekeeping?: Promise<void>;
+  // Cold-start verdict, read on the first tick BEFORE that tick's heartbeat
+  // (beating first would otherwise make every start look warm) and consumed
+  // by the jitter step on the same tick.
+  coldStart?: boolean;
   // Set on the first tick once the cold-start catch-up jitter has been
   // considered (applied or not). In-memory on purpose: the herd only forms on
   // the FIRST tick after a start, so a restart re-evaluating once is correct.
@@ -447,7 +456,9 @@ async function dispatchDue(ctx: DaemonCtx, now: Date): Promise<void> {
 async function jitterColdStartCatchup(ctx: DaemonCtx, now: Date): Promise<void> {
   if (ctx.startupJitterApplied) return;
   ctx.startupJitterApplied = true; // strictly once, even if the checks below throw
-  if (!(await isColdStart(ctx, now))) return;
+  const cold = ctx.coldStart ?? (await isColdStart(ctx, now));
+  ctx.coldStart = undefined; // one-shot: consumed by the first tick only
+  if (!cold) return;
 
   const overdue = (await ctx.store.listDueJobs(now.toISOString())).filter(
     (j) =>
@@ -481,8 +492,9 @@ async function jitterColdStartCatchup(ctx: DaemonCtx, now: Date): Promise<void> 
 // A cold start = no heartbeat row at all (fresh db, or a restore that dropped
 // the table), or one whose last tick predates now by more than STARTUP_STALE_MS
 // (a restore carrying an ancient heartbeat, or genuinely long downtime). Our
-// own in-process heartbeat never counts — but on the first tick it hasn't been
-// beaten yet, so the row we read is always the prior instance's or absent.
+// own in-process heartbeat never counts. tickOnce reads this verdict once, at
+// the top of the first tick and before its heartbeat, so the row we read is
+// always the prior instance's or absent.
 async function isColdStart(ctx: DaemonCtx, now: Date): Promise<boolean> {
   let hb: Awaited<ReturnType<CronStore["getDaemonHeartbeat"]>>;
   try {
@@ -581,13 +593,19 @@ export async function checkMissedRuns(
 // clock, vs counting 86 400 ticks whose count drifts across restarts). No
 // retention configured → no deletion, ever. The day is stamped BEFORE the
 // work so a throwing prune can't retry at 1 Hz.
+//
+// It never blocks a tick (POS-1114). On a tree of a few hundred thousand logs
+// the first prune after a start takes minutes; run inline it held the tick,
+// so the heartbeat went stale and a supervisor restarted the "dead" daemon
+// mid-walk, which began the walk again. startHousekeeping kicks the run off
+// in the background and returns at once; the log walk is fully async so it
+// yields the event loop between fs calls. One run at a time: a run still in
+// flight when the day rolls over means that day's run is skipped, and the
+// next day's gate picks it up.
 export async function runHousekeeping(ctx: DaemonCtx, now: Date): Promise<void> {
-  const day = now.toISOString().slice(0, 10);
-  if (ctx.lastHousekeepingDay === day) return;
-  ctx.lastHousekeepingDay = day;
   const retention = loadRetention(ctx.consumerRoot);
   if (!retention) return;
-  const logs = pruneLogs({
+  const logs = await pruneLogsAsync({
     consumerRoot: ctx.consumerRoot,
     global: retention.global,
     perSlug: retention.perSlug,
@@ -606,9 +624,42 @@ export async function runHousekeeping(ctx: DaemonCtx, now: Date): Promise<void> 
   }
 }
 
+export function startHousekeeping(ctx: DaemonCtx, now: Date): void {
+  if (ctx.housekeeping) return;
+  const day = now.toISOString().slice(0, 10);
+  if (ctx.lastHousekeepingDay === day) return;
+  ctx.lastHousekeepingDay = day;
+  const run = runHousekeeping(ctx, now)
+    .catch((e) => {
+      warn(ctx, `housekeeping: ${(e as Error).message}`);
+    })
+    .finally(() => {
+      if (ctx.housekeeping === run) ctx.housekeeping = undefined;
+    });
+  ctx.housekeeping = run;
+}
+
 // One full tick. Every phase is fenced — an error in one job's sync or
-// dispatch logs to stderr and the loop keeps going.
+// dispatch logs to stderr and the loop keeps going. The heartbeat goes FIRST
+// so no slow phase can make a live daemon read as dead (POS-1114); on the
+// first tick the cold-start verdict is read just before it.
 export async function tickOnce(ctx: DaemonCtx, now: Date): Promise<void> {
+  if (!ctx.startupJitterApplied && ctx.coldStart === undefined) {
+    try {
+      ctx.coldStart = await isColdStart(ctx, now);
+    } catch {
+      ctx.coldStart = false;
+    }
+  }
+  try {
+    await ctx.store.beatDaemonHeartbeat({
+      pid: ctx.pid,
+      startedAt: ctx.startedAt,
+      version: ctx.version,
+    });
+  } catch (e) {
+    warn(ctx, `heartbeat: ${(e as Error).message}`);
+  }
   try {
     await syncFiles(ctx, now);
   } catch (e) {
@@ -630,18 +681,9 @@ export async function tickOnce(ctx: DaemonCtx, now: Date): Promise<void> {
     warn(ctx, `run requests: ${(e as Error).message}`);
   }
   try {
-    await runHousekeeping(ctx, now);
+    startHousekeeping(ctx, now);
   } catch (e) {
     warn(ctx, `housekeeping: ${(e as Error).message}`);
-  }
-  try {
-    await ctx.store.beatDaemonHeartbeat({
-      pid: ctx.pid,
-      startedAt: ctx.startedAt,
-      version: ctx.version,
-    });
-  } catch (e) {
-    warn(ctx, `heartbeat: ${(e as Error).message}`);
   }
 }
 

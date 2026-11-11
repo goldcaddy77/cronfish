@@ -63,7 +63,7 @@ rows with a `next_run` and no recurrence; the `cron/one-time/` special-casing go
 
 ## Liveness
 
-The daemon writes a heartbeat row to SQLite every tick. Missed-run alerting moves in-process (the
+The daemon writes a heartbeat row to SQLite every tick, as the tick's first step, so no slow phase can make a live daemon read as dead. Missed-run alerting moves in-process (the
 old standalone watchdog folds in). External liveness — the only outside check needed — is a
 consumer-side monitor on that single heartbeat (the CAD-688 pattern in the agents repo).
 
@@ -74,6 +74,11 @@ retention prune that `cronfish sync` runs: old per-run logs AND old ledger rows
 (`cron_invocations`, `cron_run_requests`, `cron_missed_alerts`) beyond the configured
 `max_age_days` window are deleted. `cron_jobs` rows are never deleted, and a `running` row
 younger than 24h is always protected. No `retention` block in `.cronfish.json` → no deletion.
+
+Housekeeping never blocks a tick. The tick starts it and moves on; the log walk is fully async, so on
+a tree of hundreds of thousands of logs the first prune after a start can take minutes while the
+heartbeat keeps beating every second. One run at a time: a run still going when the day rolls over
+skips that day.
 
 ## Migration
 
