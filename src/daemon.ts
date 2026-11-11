@@ -1,8 +1,9 @@
 // Cronfish v2 daemon — the tick loop (docs/v2-daemon.md).
 //
-// One foreground process, 1 Hz. Each tick: mtime-scan cron/ and sync changed
-// files into the ledger, dispatch every due job by spawning the existing
-// runner as a child process, drain `cron run` requests, beat the heartbeat.
+// One foreground process, 1 Hz. Each tick: beat the heartbeat, mtime-scan
+// cron/ and sync changed files into the ledger, dispatch every due job by
+// spawning the existing runner as a child process, drain `cron run` requests,
+// and (once a day, in the background) kick off housekeeping.
 // The daemon decides WHEN a job runs; the runner keeps owning HOW (locks,
 // logs, retries, invocation rows, alerts). Job code never executes in this
 // process — a hung or OOMing job can't take the scheduler down.
@@ -31,7 +32,7 @@ import {
 } from "./store/index.ts";
 import { loadJob, slugFromPath, walkJobFiles } from "./jobs.ts";
 import { loadRetention } from "./config.ts";
-import { ledgerPruneTotal, pruneLogs } from "./prune.ts";
+import { ledgerPruneTotal, pruneLogsAsync } from "./prune.ts";
 import { computeNextRun } from "./next-run.ts";
 import { DEFAULT_GRACE_SECONDS, writeSentinel } from "./oneTime.ts";
 import { runWatchdog, type WatchdogDecision } from "./watchdog.ts";
@@ -101,6 +102,17 @@ export interface DaemonCtx {
   // UTC day (YYYY-MM-DD) the daily housekeeping last ran — the once-per-day
   // gate. In-memory on purpose: a restart re-prunes once, which is idempotent.
   lastHousekeepingDay?: string;
+  // The housekeeping run currently in flight, if any. Housekeeping runs OFF
+  // the tick (POS-1114): tickOnce starts it and moves on, and a new day's run
+  // waits until the previous one has finished. Tests await it.
+  housekeeping?: Promise<void>;
+  // Aborted on shutdown so an in-flight housekeeping run stops between fs
+  // batches instead of outliving the tick loop, its lock and its store.
+  shutdown?: AbortController;
+  // Cold-start verdict, read on the first tick BEFORE that tick's heartbeat
+  // (beating first would otherwise make every start look warm) and consumed
+  // by the jitter step on the same tick.
+  coldStart?: boolean;
   // Set on the first tick once the cold-start catch-up jitter has been
   // considered (applied or not). In-memory on purpose: the herd only forms on
   // the FIRST tick after a start, so a restart re-evaluating once is correct.
@@ -447,7 +459,9 @@ async function dispatchDue(ctx: DaemonCtx, now: Date): Promise<void> {
 async function jitterColdStartCatchup(ctx: DaemonCtx, now: Date): Promise<void> {
   if (ctx.startupJitterApplied) return;
   ctx.startupJitterApplied = true; // strictly once, even if the checks below throw
-  if (!(await isColdStart(ctx, now))) return;
+  const cold = ctx.coldStart ?? (await isColdStart(ctx, now));
+  ctx.coldStart = undefined; // one-shot: consumed by the first tick only
+  if (!cold) return;
 
   const overdue = (await ctx.store.listDueJobs(now.toISOString())).filter(
     (j) =>
@@ -481,8 +495,9 @@ async function jitterColdStartCatchup(ctx: DaemonCtx, now: Date): Promise<void> 
 // A cold start = no heartbeat row at all (fresh db, or a restore that dropped
 // the table), or one whose last tick predates now by more than STARTUP_STALE_MS
 // (a restore carrying an ancient heartbeat, or genuinely long downtime). Our
-// own in-process heartbeat never counts — but on the first tick it hasn't been
-// beaten yet, so the row we read is always the prior instance's or absent.
+// own in-process heartbeat never counts. tickOnce reads this verdict once, at
+// the top of the first tick and before its heartbeat, so the row we read is
+// always the prior instance's or absent.
 async function isColdStart(ctx: DaemonCtx, now: Date): Promise<boolean> {
   let hb: Awaited<ReturnType<CronStore["getDaemonHeartbeat"]>>;
   try {
@@ -581,22 +596,37 @@ export async function checkMissedRuns(
 // clock, vs counting 86 400 ticks whose count drifts across restarts). No
 // retention configured → no deletion, ever. The day is stamped BEFORE the
 // work so a throwing prune can't retry at 1 Hz.
+//
+// It never blocks a tick (POS-1114). On a tree of a few hundred thousand logs
+// the first prune after a start takes minutes; run inline it held the tick,
+// so the heartbeat went stale and a supervisor restarted the "dead" daemon
+// mid-walk, which began the walk again. startHousekeeping kicks the run off
+// in the background and returns at once; the log walk is fully async so it
+// yields the event loop between fs calls. One run at a time: a run still in
+// flight when the day rolls over defers the new day's run until it finishes.
+// On shutdown the run is aborted between batches and awaited briefly.
+// Upper bound on how long shutdown waits for an aborted housekeeping run.
+// One fs batch or one ledger batch is milliseconds; this is slack, and well
+// inside launchd's default 20s exit timeout.
+export const HOUSEKEEPING_STOP_WAIT_MS = 5_000;
+
 export async function runHousekeeping(ctx: DaemonCtx, now: Date): Promise<void> {
-  const day = now.toISOString().slice(0, 10);
-  if (ctx.lastHousekeepingDay === day) return;
-  ctx.lastHousekeepingDay = day;
   const retention = loadRetention(ctx.consumerRoot);
   if (!retention) return;
-  const logs = pruneLogs({
+  const signal = ctx.shutdown?.signal;
+  const logs = await pruneLogsAsync({
     consumerRoot: ctx.consumerRoot,
     global: retention.global,
     perSlug: retention.perSlug,
     nowMs: now.getTime(),
+    signal,
   });
+  if (signal?.aborted) return;
   const ledger = await ctx.store.pruneLedger({
     global: retention.global,
     perSlug: retention.perSlug,
     nowMs: now.getTime(),
+    signal,
   });
   if (logs.totalDeleted > 0 || ledgerPruneTotal(ledger) > 0) {
     warn(
@@ -606,9 +636,63 @@ export async function runHousekeeping(ctx: DaemonCtx, now: Date): Promise<void> 
   }
 }
 
+// Shutdown half: abort an in-flight run and give it a moment to reach a batch
+// boundary, so it never keeps deleting after the lock is released and the
+// store is closed. Anything it did not get to resumes on the next start.
+// runDaemon calls this BEFORE releaseDaemonLock and store.close.
+export async function stopHousekeeping(
+  ctx: DaemonCtx,
+  waitMs: number = HOUSEKEEPING_STOP_WAIT_MS,
+): Promise<void> {
+  ctx.shutdown?.abort();
+  const run = ctx.housekeeping;
+  if (!run) return;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  await Promise.race([
+    run,
+    new Promise<void>((r) => {
+      timer = setTimeout(r, waitMs);
+    }),
+  ]);
+  clearTimeout(timer);
+}
+
+export function startHousekeeping(ctx: DaemonCtx, now: Date): void {
+  if (ctx.housekeeping) return;
+  const day = now.toISOString().slice(0, 10);
+  if (ctx.lastHousekeepingDay === day) return;
+  ctx.lastHousekeepingDay = day;
+  const run = runHousekeeping(ctx, now)
+    .catch((e) => {
+      warn(ctx, `housekeeping: ${(e as Error).message}`);
+    })
+    .finally(() => {
+      if (ctx.housekeeping === run) ctx.housekeeping = undefined;
+    });
+  ctx.housekeeping = run;
+}
+
 // One full tick. Every phase is fenced — an error in one job's sync or
-// dispatch logs to stderr and the loop keeps going.
+// dispatch logs to stderr and the loop keeps going. The heartbeat goes FIRST
+// so no slow phase can make a live daemon read as dead (POS-1114); on the
+// first tick the cold-start verdict is read just before it.
 export async function tickOnce(ctx: DaemonCtx, now: Date): Promise<void> {
+  if (!ctx.startupJitterApplied && ctx.coldStart === undefined) {
+    try {
+      ctx.coldStart = await isColdStart(ctx, now);
+    } catch {
+      ctx.coldStart = false;
+    }
+  }
+  try {
+    await ctx.store.beatDaemonHeartbeat({
+      pid: ctx.pid,
+      startedAt: ctx.startedAt,
+      version: ctx.version,
+    });
+  } catch (e) {
+    warn(ctx, `heartbeat: ${(e as Error).message}`);
+  }
   try {
     await syncFiles(ctx, now);
   } catch (e) {
@@ -630,18 +714,9 @@ export async function tickOnce(ctx: DaemonCtx, now: Date): Promise<void> {
     warn(ctx, `run requests: ${(e as Error).message}`);
   }
   try {
-    await runHousekeeping(ctx, now);
+    startHousekeeping(ctx, now);
   } catch (e) {
     warn(ctx, `housekeeping: ${(e as Error).message}`);
-  }
-  try {
-    await ctx.store.beatDaemonHeartbeat({
-      pid: ctx.pid,
-      startedAt: ctx.startedAt,
-      version: ctx.version,
-    });
-  } catch (e) {
-    warn(ctx, `heartbeat: ${(e as Error).message}`);
   }
 }
 
@@ -880,13 +955,27 @@ export async function runDaemon(opts: { consumerRoot: string }): Promise<void> {
   console.error(
     `[daemon] cronfish ${pkg.version} pid=${ctx.pid} consumer=${consumerRoot} tick=${TICK_MS}ms`,
   );
+  await runDaemonLoop(ctx, { isRunning: () => running });
+}
+
+// The wall-clock loop plus its shutdown tail, split out of runDaemon so tests
+// can drive the real path (POS-1114): ticks until isRunning() goes false,
+// then shutdownDaemon. Owns ctx.shutdown, so housekeeping is always abortable.
+export async function runDaemonLoop(
+  ctx: DaemonCtx,
+  opts: {
+    isRunning: () => boolean;
+    release?: (consumerRoot: string, pid: number) => void;
+  },
+): Promise<void> {
+  ctx.shutdown ??= new AbortController();
   let ticks = 0;
   // The missed-run check does network I/O (alert sends) — run it
   // fire-and-forget with a re-entrancy flag so a slow adapter can never
   // stall the tick loop (a stalled loop = stale heartbeat = `cron sync`
   // mistaking the daemon for dead).
   let missedCheckInFlight = false;
-  while (running) {
+  while (opts.isRunning()) {
     const t0 = Date.now();
     // MUST await: today the tick runs to completion before the next sleep,
     // serializing every ledger write on one connection. A fire-and-forget tick
@@ -906,10 +995,22 @@ export async function runDaemon(opts: { consumerRoot: string }): Promise<void> {
     if (elapsed > TICK_MS) {
       console.error(`[daemon] slow tick: ${elapsed}ms`);
     }
+    if (!opts.isRunning()) break;
     await Bun.sleep(Math.max(0, TICK_MS - elapsed));
   }
-  releaseDaemonLock(consumerRoot, process.pid);
+  await shutdownDaemon(ctx, opts.release);
+}
+
+// The tail of runDaemon, in order: stop housekeeping FIRST, then release the
+// lock, then close the store. Reversing it lets a still-running prune delete
+// after another daemon may already hold the lock, against a closed store.
+export async function shutdownDaemon(
+  ctx: DaemonCtx,
+  release: (consumerRoot: string, pid: number) => void = releaseDaemonLock,
+): Promise<void> {
+  await stopHousekeeping(ctx);
+  release(ctx.consumerRoot, ctx.pid);
   try {
-    await store.close();
+    await ctx.store.close();
   } catch {}
 }

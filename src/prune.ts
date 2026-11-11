@@ -6,6 +6,7 @@
 // would be) deleted.
 
 import { readdirSync, rmSync, statSync } from "node:fs";
+import { readdir, rm, stat } from "node:fs/promises";
 import { join, relative } from "node:path";
 import { logsRoot } from "./store/paths.ts";
 
@@ -29,6 +30,9 @@ export interface PruneOptions {
   dryRun?: boolean;
   // Injectable clock for tests (ms since epoch). Defaults to Date.now().
   nowMs?: number;
+  // Async path only: stop between fs batches once aborted (daemon shutdown).
+  // The report then covers what was deleted before the abort.
+  signal?: AbortSignal;
 }
 
 export interface PruneSlugResult {
@@ -106,12 +110,15 @@ function selectVictims(
   return [...doomed];
 }
 
-export function pruneLogs(opts: PruneOptions): PruneReport {
-  const logsDir = logsRoot(opts.consumerRoot);
-  const nowMs = opts.nowMs ?? Date.now();
-  const bySlug = collectBySlug(logsDir);
-
-  const slugs: PruneSlugResult[] = [];
+// Which slugs to touch and which of their files go, for one prune pass.
+// Shared by the sync CLI path and the async daemon path so both decide the
+// same way.
+function planPrune(
+  bySlug: Map<string, LogFile[]>,
+  opts: PruneOptions,
+  nowMs: number,
+): { slug: string; files: LogFile[]; victims: LogFile[] }[] {
+  const plan: { slug: string; files: LogFile[]; victims: LogFile[] }[] = [];
   for (const [slug, files] of [...bySlug.entries()].sort()) {
     if (opts.onlySlug && slug !== opts.onlySlug) continue;
     const retention = opts.perSlug?.[slug] ?? opts.global;
@@ -120,7 +127,24 @@ export function pruneLogs(opts: PruneOptions): PruneReport {
       continue;
     }
     const victims = selectVictims(files, retention, nowMs);
-    if (victims.length === 0) continue;
+    if (victims.length > 0) plan.push({ slug, files, victims });
+  }
+  return plan;
+}
+
+function toReport(slugs: PruneSlugResult[]): PruneReport {
+  return {
+    slugs,
+    totalDeleted: slugs.reduce((n, s) => n + s.deleted.length, 0),
+    totalBytes: slugs.reduce((n, s) => n + s.bytesFreed, 0),
+  };
+}
+
+export function pruneLogs(opts: PruneOptions): PruneReport {
+  const nowMs = opts.nowMs ?? Date.now();
+  const plan = planPrune(collectBySlug(logsRoot(opts.consumerRoot)), opts, nowMs);
+  const slugs: PruneSlugResult[] = [];
+  for (const { slug, files, victims } of plan) {
     let bytesFreed = 0;
     const deleted: string[] = [];
     for (const v of victims) {
@@ -134,19 +158,98 @@ export function pruneLogs(opts: PruneOptions): PruneReport {
       deleted.push(v.path);
       bytesFreed += v.size;
     }
-    slugs.push({
-      slug,
-      deleted,
-      bytesFreed,
-      kept: files.length - deleted.length,
-    });
+    slugs.push({ slug, deleted, bytesFreed, kept: files.length - deleted.length });
   }
+  return toReport(slugs);
+}
 
-  return {
-    slugs,
-    totalDeleted: slugs.reduce((n, s) => n + s.deleted.length, 0),
-    totalBytes: slugs.reduce((n, s) => n + s.bytesFreed, 0),
+// --- Async pruning (the daemon's path, POS-1114) ---
+//
+// pruneLogs is synchronous: on a tree of a few hundred thousand logs its walk
+// holds the event loop for minutes, and the daemon's 1 Hz tick (and with it
+// the heartbeat) stalls for the whole walk. The async twin does every stat and
+// unlink through fs/promises, so each await hands the event loop back and the
+// tick keeps running while the walk grinds on in the background. Same
+// selection, same report.
+
+// Concurrent fs operations in flight per batch. Enough to keep the libuv pool
+// busy, small enough not to flood it.
+const ASYNC_FS_BATCH = 32;
+
+async function inBatches<T>(
+  items: T[],
+  fn: (item: T) => Promise<void>,
+  signal?: AbortSignal,
+): Promise<void> {
+  for (let i = 0; i < items.length; i += ASYNC_FS_BATCH) {
+    if (signal?.aborted) return;
+    await Promise.all(items.slice(i, i + ASYNC_FS_BATCH).map(fn));
+  }
+}
+
+async function collectBySlugAsync(
+  logsDir: string,
+  signal?: AbortSignal,
+): Promise<Map<string, LogFile[]>> {
+  const bySlug = new Map<string, LogFile[]>();
+  const visit = async (dir: string): Promise<void> => {
+    if (signal?.aborted) return;
+    let entries: import("node:fs").Dirent[];
+    try {
+      entries = await readdir(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    const slug = relative(logsDir, dir).split("\\").join("/");
+    const logs: string[] = [];
+    for (const e of entries) {
+      const full = join(dir, e.name);
+      if (e.isDirectory()) await visit(full);
+      else if (slug !== "" && e.name.endsWith(".log")) logs.push(full);
+    }
+    if (logs.length === 0) return;
+    const list = bySlug.get(slug) ?? [];
+    await inBatches(logs, async (full) => {
+      try {
+        const st = await stat(full);
+        list.push({ path: full, mtimeMs: st.mtimeMs, size: st.size });
+      } catch {
+        // vanished mid-walk
+      }
+    }, signal);
+    if (list.length > 0) bySlug.set(slug, list);
   };
+  await visit(logsDir);
+  return bySlug;
+}
+
+export async function pruneLogsAsync(opts: PruneOptions): Promise<PruneReport> {
+  const nowMs = opts.nowMs ?? Date.now();
+  const bySlug = await collectBySlugAsync(
+    logsRoot(opts.consumerRoot),
+    opts.signal,
+  );
+  // An aborted walk saw only part of the tree: a maxRuns cut over a partial
+  // listing could pick the wrong files, so delete nothing.
+  if (opts.signal?.aborted) return toReport([]);
+  const slugs: PruneSlugResult[] = [];
+  for (const { slug, files, victims } of planPrune(bySlug, opts, nowMs)) {
+    let bytesFreed = 0;
+    const deleted: string[] = [];
+    await inBatches(victims, async (v) => {
+      if (!opts.dryRun) {
+        try {
+          await rm(v.path);
+        } catch {
+          return; // already gone / racing runner — skip silently
+        }
+      }
+      deleted.push(v.path);
+      bytesFreed += v.size;
+    }, opts.signal);
+    slugs.push({ slug, deleted, bytesFreed, kept: files.length - deleted.length });
+  }
+  return toReport(slugs);
 }
 
 // --- Ledger row pruning ---

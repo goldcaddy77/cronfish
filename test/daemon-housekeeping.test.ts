@@ -3,7 +3,14 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Database } from "bun:sqlite";
-import { tickOnce, type DaemonCtx, type SpawnRequest } from "../src/daemon.ts";
+import {
+  runDaemonLoop,
+  shutdownDaemon,
+  stopHousekeeping,
+  tickOnce,
+  type DaemonCtx,
+  type SpawnRequest,
+} from "../src/daemon.ts";
 import { SqliteStore } from "../src/store/index.ts";
 
 const DAY = 86_400_000;
@@ -75,16 +82,21 @@ describe("daemon housekeeping", () => {
     addJobWithInvocation("foo-md", 40);
 
     await tickOnce(ctx, T0);
+
+    await ctx.housekeeping;
     expect(invocationCount()).toBe(0);
 
     // Same day: a newly-aged row is NOT pruned again until tomorrow.
     addJobWithInvocation("foo-md", 40);
     await tickOnce(ctx, new Date(T0.getTime() + 60_000));
+    await ctx.housekeeping;
     await tickOnce(ctx, new Date(T0.getTime() + 3_600_000));
+    await ctx.housekeeping;
     expect(invocationCount()).toBe(1);
 
     // Next UTC day (T0 is 12:00Z, +13h crosses midnight): pruned again.
     await tickOnce(ctx, new Date(T0.getTime() + 13 * 3_600_000));
+    await ctx.housekeeping;
     expect(invocationCount()).toBe(0);
   });
 
@@ -104,6 +116,8 @@ describe("daemon housekeeping", () => {
 
     await tickOnce(ctx, T0);
 
+    await ctx.housekeeping;
+
     const slugs = db
       .query(
         `SELECT j.slug FROM cron_invocations i JOIN cron_jobs j ON j.id = i.job_id`,
@@ -115,7 +129,333 @@ describe("daemon housekeeping", () => {
   test("no retention configured → no rows are ever deleted", async () => {
     addJobWithInvocation("foo-md", 400);
     await tickOnce(ctx, T0);
+    await ctx.housekeeping;
     await tickOnce(ctx, new Date(T0.getTime() + 2 * DAY));
+    await ctx.housekeeping;
     expect(invocationCount()).toBe(1);
+  });
+});
+
+// POS-1114: on a large log tree the first tick's prune walk took minutes, and
+// it ran BEFORE the heartbeat. A supervisor that reads "no fresh heartbeat" as
+// "dead daemon" restarted it mid-walk, forever. The heartbeat must never wait
+// on housekeeping, and housekeeping must never hold the tick.
+describe("daemon housekeeping never delays the heartbeat (POS-1114)", () => {
+  function withRetention(): void {
+    writeFileSync(
+      join(root, ".cronfish.json"),
+      JSON.stringify({ retention: { max_age_days: 30 } }),
+      "utf-8",
+    );
+  }
+
+  test("the first tick beats even when housekeeping never finishes", async () => {
+    withRetention();
+    // A ledger prune that never settles stands in for a minutes-long walk.
+    ctx.store.pruneLedger = () => new Promise(() => {});
+    const tick = tickOnce(ctx, T0).then(() => "ticked");
+    const timeout = new Promise((r) => setTimeout(() => r("timed out"), 2_000));
+    expect(await Promise.race([tick, timeout])).toBe("ticked");
+    const hb = await ctx.store.getDaemonHeartbeat();
+    expect(hb?.pid).toBe(4242);
+  });
+
+  test("the heartbeat is written before housekeeping starts", async () => {
+    withRetention();
+    const calls: string[] = [];
+    const store = ctx.store;
+    const beat = store.beatDaemonHeartbeat.bind(store);
+    const prune = store.pruneLedger.bind(store);
+    store.beatDaemonHeartbeat = (o) => {
+      calls.push("beat");
+      return beat(o);
+    };
+    store.pruneLedger = (o) => {
+      calls.push("prune");
+      return prune(o);
+    };
+    await tickOnce(ctx, T0);
+    await ctx.housekeeping;
+    expect(calls).toEqual(["beat", "prune"]);
+  });
+
+  test("a large log walk runs off the tick and still prunes", async () => {
+    withRetention();
+    const slugDir = join(root, ".cronfish", "logs", "noisy-md");
+    mkdirSync(slugDir, { recursive: true });
+    const old = new Date(T0.getTime() - 40 * DAY);
+    const { utimesSync } = await import("node:fs");
+    for (let i = 0; i < 2_000; i++) {
+      const p = join(slugDir, `${i}.log`);
+      writeFileSync(p, "x");
+      utimesSync(p, old, old);
+    }
+    writeFileSync(join(slugDir, "fresh.log"), "x");
+    const { readdirSync } = await import("node:fs");
+
+    await tickOnce(ctx, T0);
+    // The tick returned while the walk is still in flight.
+    expect(ctx.housekeeping).toBeDefined();
+    expect(readdirSync(slugDir).length).toBeGreaterThan(1);
+
+    await ctx.housekeeping;
+    expect(readdirSync(slugDir)).toEqual(["fresh.log"]);
+  });
+
+  test("a housekeeping run still in flight is not started twice", async () => {
+    withRetention();
+    let calls = 0;
+    let reached!: () => void;
+    const firstCall = new Promise<void>((r) => (reached = r));
+    ctx.store.pruneLedger = () => {
+      calls++;
+      reached();
+      return new Promise(() => {});
+    };
+    await tickOnce(ctx, T0);
+    await firstCall; // the first run is now parked inside the ledger prune
+    const first = ctx.housekeeping;
+    // Next UTC day while the first run is still going: no second run.
+    await tickOnce(ctx, new Date(T0.getTime() + DAY));
+    expect(ctx.housekeeping).toBe(first);
+    expect(calls).toBe(1);
+  });
+});
+
+describe("housekeeping stops cleanly on shutdown (POS-1114 review)", () => {
+  test("an aborted log walk deletes nothing and skips the ledger prune", async () => {
+    writeFileSync(
+      join(root, ".cronfish.json"),
+      JSON.stringify({ retention: { max_age_days: 30 } }),
+      "utf-8",
+    );
+    const slugDir = join(root, ".cronfish", "logs", "noisy-md");
+    mkdirSync(slugDir, { recursive: true });
+    const old = new Date(T0.getTime() - 40 * DAY);
+    const { utimesSync, readdirSync } = await import("node:fs");
+    for (let i = 0; i < 500; i++) {
+      const p = join(slugDir, `${i}.log`);
+      writeFileSync(p, "x");
+      utimesSync(p, old, old);
+    }
+    let ledgerCalls = 0;
+    ctx.store.pruneLedger = async () => {
+      ledgerCalls++;
+      return { invocations: 0, runRequests: 0, missedAlerts: 0 };
+    };
+    ctx.shutdown = new AbortController();
+    await tickOnce(ctx, T0);
+    ctx.shutdown.abort();
+    await ctx.housekeeping;
+    expect(ledgerCalls).toBe(0);
+    expect(readdirSync(slugDir).length).toBe(500);
+  });
+
+  test("SQLite ledger prune deletes large backlogs in batches, all of them", async () => {
+    writeFileSync(
+      join(root, ".cronfish.json"),
+      JSON.stringify({ retention: { max_age_days: 30 } }),
+      "utf-8",
+    );
+    addJobWithInvocation("foo-md", 40);
+    const { id: jobId } = db
+      .query("SELECT id FROM cron_jobs WHERE slug = 'foo-md'")
+      .get() as { id: number };
+    const ins = db.prepare(
+      `INSERT INTO cron_invocations (job_id, started_at, status, trigger, log_path)
+       VALUES ($job, $started, 'ok', 'schedule', '/tmp/x.log')`,
+    );
+    db.transaction(() => {
+      for (let i = 0; i < 12_000; i++) ins.run({ $job: jobId, $started: iso(40 * DAY) });
+    })();
+    addJobWithInvocation("foo-md", 1); // fresh row survives
+    await tickOnce(ctx, T0);
+    await ctx.housekeeping;
+    expect(invocationCount()).toBe(1);
+  });
+});
+
+describe("housekeeping yields and stops (POS-1114 skeptic pass)", () => {
+  function seedManyJobs(jobs: number, perJob: number): void {
+    const ins = db.prepare(
+      `INSERT INTO cron_invocations (job_id, started_at, status, trigger, log_path)
+       VALUES ($job, $started, 'ok', 'schedule', '/tmp/x.log')`,
+    );
+    for (let j = 0; j < jobs; j++) {
+      addJobWithInvocation(`job${j}-md`, 40);
+      const { id } = db
+        .query("SELECT id FROM cron_jobs WHERE slug = $s")
+        .get({ $s: `job${j}-md` }) as { id: number };
+      db.transaction(() => {
+        for (let i = 1; i < perJob; i++) ins.run({ $job: id, $started: iso(40 * DAY) });
+      })();
+    }
+  }
+
+  test("the SQLite ledger prune yields the event loop between statements", async () => {
+    seedManyJobs(50, 20);
+    let spins = 0;
+    let on = true;
+    const spin = (): void => {
+      spins++;
+      if (on) setImmediate(spin);
+    };
+    spin();
+    const report = await ctx.store.pruneLedger({ global: { maxAgeDays: 30 }, nowMs: T0.getTime() });
+    on = false;
+    expect(report.invocations).toBe(1_000);
+    // One yield per job at least: a single blocking transaction gives ~1.
+    expect(spins).toBeGreaterThan(40);
+  });
+
+  test("an aborted signal stops the SQLite ledger prune at the next boundary", async () => {
+    seedManyJobs(5, 10);
+    const ac = new AbortController();
+    ac.abort();
+    const report = await ctx.store.pruneLedger({
+      global: { maxAgeDays: 30 },
+      nowMs: T0.getTime(),
+      signal: ac.signal,
+    });
+    expect(report.invocations).toBe(0);
+    expect(invocationCount()).toBe(50);
+  });
+
+  test("stopHousekeeping aborts the run and waits at most waitMs", async () => {
+    ctx.shutdown = new AbortController();
+    ctx.housekeeping = new Promise(() => {}); // a run that never settles
+    const t0 = Date.now();
+    await stopHousekeeping(ctx, 50);
+    expect(ctx.shutdown.signal.aborted).toBe(true);
+    expect(Date.now() - t0).toBeLessThan(2_500);
+  });
+
+  test("stopHousekeeping returns as soon as an aborted run settles", async () => {
+    ctx.shutdown = new AbortController();
+    const signal = ctx.shutdown.signal;
+    ctx.housekeeping = new Promise<void>((r) => signal.addEventListener("abort", () => r()));
+    const t0 = Date.now();
+    await stopHousekeeping(ctx, 5_000);
+    expect(Date.now() - t0).toBeLessThan(2_500);
+  });
+});
+
+describe("housekeeping shutdown wiring (POS-1114 third pass)", () => {
+  test("the daemon hands its shutdown signal to the ledger prune", async () => {
+    writeFileSync(
+      join(root, ".cronfish.json"),
+      JSON.stringify({ retention: { max_age_days: 30 } }),
+      "utf-8",
+    );
+    let seen: AbortSignal | undefined;
+    ctx.store.pruneLedger = async (o) => {
+      seen = o.signal;
+      return { invocations: 0, runRequests: 0, missedAlerts: 0 };
+    };
+    ctx.shutdown = new AbortController();
+    await tickOnce(ctx, T0);
+    await ctx.housekeeping;
+    expect(seen).toBe(ctx.shutdown.signal);
+  });
+
+  test("an abort mid-job stops the SQLite prune after the current batch", async () => {
+    addJobWithInvocation("big-md", 40);
+    const { id } = db
+      .query("SELECT id FROM cron_jobs WHERE slug = 'big-md'")
+      .get() as { id: number };
+    const ins = db.prepare(
+      `INSERT INTO cron_invocations (job_id, started_at, status, trigger, log_path)
+       VALUES ($job, $started, 'ok', 'schedule', '/tmp/x.log')`,
+    );
+    db.transaction(() => {
+      for (let i = 1; i < 12_000; i++) ins.run({ $job: id, $started: iso(40 * DAY) });
+    })();
+    const ac = new AbortController();
+    setImmediate(() => ac.abort()); // fires during the first batch's yield
+    const report = await ctx.store.pruneLedger({
+      global: { maxAgeDays: 30 },
+      nowMs: T0.getTime(),
+      signal: ac.signal,
+    });
+    expect(report.invocations).toBe(5_000);
+    expect(invocationCount()).toBe(7_000);
+  });
+
+  test("stopHousekeeping clears its wait timer once the run settles", async () => {
+    ctx.shutdown = new AbortController();
+    ctx.housekeeping = Promise.resolve();
+    const real = globalThis.clearTimeout;
+    let cleared = 0;
+    globalThis.clearTimeout = ((h: Parameters<typeof clearTimeout>[0]) => {
+      if (h !== undefined) cleared++;
+      return real(h);
+    }) as typeof clearTimeout;
+    try {
+      await stopHousekeeping(ctx, 60_000);
+    } finally {
+      globalThis.clearTimeout = real;
+    }
+    expect(cleared).toBe(1);
+  });
+
+  test("shutdown waits for housekeeping before releasing the lock and closing the store", async () => {
+    const order: string[] = [];
+    ctx.shutdown = new AbortController();
+    const signal = ctx.shutdown.signal;
+    ctx.housekeeping = new Promise<void>((r) =>
+      signal.addEventListener("abort", () =>
+        setTimeout(() => {
+          order.push("housekeeping settled");
+          r();
+        }, 20),
+      ),
+    );
+    const close = ctx.store.close.bind(ctx.store);
+    ctx.store.close = async () => {
+      order.push("store closed");
+    };
+    await shutdownDaemon(ctx, () => order.push("lock released"));
+    ctx.store.close = close;
+    expect(order).toEqual(["housekeeping settled", "lock released", "store closed"]);
+  });
+});
+
+describe("the real daemon loop shuts down in order (POS-1114 fourth pass)", () => {
+  test("runDaemonLoop aborts housekeeping and waits for it before release and close", async () => {
+    writeFileSync(
+      join(root, ".cronfish.json"),
+      JSON.stringify({ retention: { max_age_days: 30 } }),
+      "utf-8",
+    );
+    const order: string[] = [];
+    let reached!: () => void;
+    const inLedger = new Promise<void>((r) => (reached = r));
+    ctx.store.pruneLedger = (o) =>
+      new Promise((r) => {
+        reached();
+        const done = () => {
+          order.push("housekeeping settled");
+          r({ invocations: 0, runRequests: 0, missedAlerts: 0 });
+        };
+        if (!o.signal) {
+          order.push("no shutdown signal"); // the loop must own ctx.shutdown
+          return done();
+        }
+        o.signal.addEventListener("abort", () => setTimeout(done, 20));
+      });
+    const close = ctx.store.close.bind(ctx.store);
+    ctx.store.close = async () => {
+      order.push("store closed");
+    };
+    let running = true;
+    const loop = runDaemonLoop(ctx, {
+      isRunning: () => running,
+      release: () => order.push("lock released"),
+    });
+    await inLedger;
+    running = false;
+    await loop;
+    ctx.store.close = close;
+    expect(order).toEqual(["housekeeping settled", "lock released", "store closed"]);
   });
 });
