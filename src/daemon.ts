@@ -984,9 +984,19 @@ export async function runDaemon(opts: { consumerRoot: string }): Promise<void> {
     }
     await Bun.sleep(Math.max(0, TICK_MS - elapsed));
   }
+  await shutdownDaemon(ctx);
+}
+
+// The tail of runDaemon, in order: stop housekeeping FIRST, then release the
+// lock, then close the store. Reversing it lets a still-running prune delete
+// after another daemon may already hold the lock, against a closed store.
+export async function shutdownDaemon(
+  ctx: DaemonCtx,
+  release: (consumerRoot: string, pid: number) => void = releaseDaemonLock,
+): Promise<void> {
   await stopHousekeeping(ctx);
-  releaseDaemonLock(consumerRoot, process.pid);
+  release(ctx.consumerRoot, ctx.pid);
   try {
-    await store.close();
+    await ctx.store.close();
   } catch {}
 }

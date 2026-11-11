@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Database } from "bun:sqlite";
 import {
+  shutdownDaemon,
   stopHousekeeping,
   tickOnce,
   type DaemonCtx,
@@ -330,5 +331,85 @@ describe("housekeeping yields and stops (POS-1114 skeptic pass)", () => {
     const t0 = Date.now();
     await stopHousekeeping(ctx, 5_000);
     expect(Date.now() - t0).toBeLessThan(500);
+  });
+});
+
+describe("housekeeping shutdown wiring (POS-1114 third pass)", () => {
+  test("the daemon hands its shutdown signal to the ledger prune", async () => {
+    writeFileSync(
+      join(root, ".cronfish.json"),
+      JSON.stringify({ retention: { max_age_days: 30 } }),
+      "utf-8",
+    );
+    let seen: AbortSignal | undefined;
+    ctx.store.pruneLedger = async (o) => {
+      seen = o.signal;
+      return { invocations: 0, runRequests: 0, missedAlerts: 0 };
+    };
+    ctx.shutdown = new AbortController();
+    await tickOnce(ctx, T0);
+    await ctx.housekeeping;
+    expect(seen).toBe(ctx.shutdown.signal);
+  });
+
+  test("an abort mid-job stops the SQLite prune after the current batch", async () => {
+    addJobWithInvocation("big-md", 40);
+    const { id } = db
+      .query("SELECT id FROM cron_jobs WHERE slug = 'big-md'")
+      .get() as { id: number };
+    const ins = db.prepare(
+      `INSERT INTO cron_invocations (job_id, started_at, status, trigger, log_path)
+       VALUES ($job, $started, 'ok', 'schedule', '/tmp/x.log')`,
+    );
+    db.transaction(() => {
+      for (let i = 1; i < 12_000; i++) ins.run({ $job: id, $started: iso(40 * DAY) });
+    })();
+    const ac = new AbortController();
+    setImmediate(() => ac.abort()); // fires during the first batch's yield
+    const report = await ctx.store.pruneLedger({
+      global: { maxAgeDays: 30 },
+      nowMs: T0.getTime(),
+      signal: ac.signal,
+    });
+    expect(report.invocations).toBe(5_000);
+    expect(invocationCount()).toBe(7_000);
+  });
+
+  test("stopHousekeeping clears its wait timer once the run settles", async () => {
+    ctx.shutdown = new AbortController();
+    ctx.housekeeping = Promise.resolve();
+    const real = globalThis.clearTimeout;
+    let cleared = 0;
+    globalThis.clearTimeout = ((h: Parameters<typeof clearTimeout>[0]) => {
+      if (h !== undefined) cleared++;
+      return real(h);
+    }) as typeof clearTimeout;
+    try {
+      await stopHousekeeping(ctx, 60_000);
+    } finally {
+      globalThis.clearTimeout = real;
+    }
+    expect(cleared).toBe(1);
+  });
+
+  test("shutdown waits for housekeeping before releasing the lock and closing the store", async () => {
+    const order: string[] = [];
+    ctx.shutdown = new AbortController();
+    const signal = ctx.shutdown.signal;
+    ctx.housekeeping = new Promise<void>((r) =>
+      signal.addEventListener("abort", () =>
+        setTimeout(() => {
+          order.push("housekeeping settled");
+          r();
+        }, 20),
+      ),
+    );
+    const close = ctx.store.close.bind(ctx.store);
+    ctx.store.close = async () => {
+      order.push("store closed");
+    };
+    await shutdownDaemon(ctx, () => order.push("lock released"));
+    ctx.store.close = close;
+    expect(order).toEqual(["housekeeping settled", "lock released", "store closed"]);
   });
 });
