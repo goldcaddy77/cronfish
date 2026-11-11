@@ -214,9 +214,10 @@ describe("daemon housekeeping never delays the heartbeat (POS-1114)", () => {
     };
     await tickOnce(ctx, T0);
     await firstCall; // the first run is now parked inside the ledger prune
+    const first = ctx.housekeeping;
     // Next UTC day while the first run is still going: no second run.
     await tickOnce(ctx, new Date(T0.getTime() + DAY));
-    await new Promise((r) => setImmediate(r));
+    expect(ctx.housekeeping).toBe(first);
     expect(calls).toBe(1);
   });
 });
