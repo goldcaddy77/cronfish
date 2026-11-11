@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Database } from "bun:sqlite";
 import {
+  runDaemonLoop,
   shutdownDaemon,
   stopHousekeeping,
   tickOnce,
@@ -204,14 +205,18 @@ describe("daemon housekeeping never delays the heartbeat (POS-1114)", () => {
   test("a housekeeping run still in flight is not started twice", async () => {
     withRetention();
     let calls = 0;
+    let reached!: () => void;
+    const firstCall = new Promise<void>((r) => (reached = r));
     ctx.store.pruneLedger = () => {
       calls++;
+      reached();
       return new Promise(() => {});
     };
     await tickOnce(ctx, T0);
+    await firstCall; // the first run is now parked inside the ledger prune
     // Next UTC day while the first run is still going: no second run.
     await tickOnce(ctx, new Date(T0.getTime() + DAY));
-    await new Promise((r) => setTimeout(r, 50));
+    await new Promise((r) => setImmediate(r));
     expect(calls).toBe(1);
   });
 });
@@ -409,6 +414,43 @@ describe("housekeeping shutdown wiring (POS-1114 third pass)", () => {
       order.push("store closed");
     };
     await shutdownDaemon(ctx, () => order.push("lock released"));
+    ctx.store.close = close;
+    expect(order).toEqual(["housekeeping settled", "lock released", "store closed"]);
+  });
+});
+
+describe("the real daemon loop shuts down in order (POS-1114 fourth pass)", () => {
+  test("runDaemonLoop aborts housekeeping and waits for it before release and close", async () => {
+    writeFileSync(
+      join(root, ".cronfish.json"),
+      JSON.stringify({ retention: { max_age_days: 30 } }),
+      "utf-8",
+    );
+    const order: string[] = [];
+    let reached!: () => void;
+    const inLedger = new Promise<void>((r) => (reached = r));
+    ctx.store.pruneLedger = (o) =>
+      new Promise((r) => {
+        reached();
+        const done = () => {
+          order.push("housekeeping settled");
+          r({ invocations: 0, runRequests: 0, missedAlerts: 0 });
+        };
+        if (!o.signal) return done(); // no signal wired: settles too early
+        o.signal.addEventListener("abort", () => setTimeout(done, 20));
+      });
+    const close = ctx.store.close.bind(ctx.store);
+    ctx.store.close = async () => {
+      order.push("store closed");
+    };
+    let running = true;
+    const loop = runDaemonLoop(ctx, {
+      isRunning: () => running,
+      release: () => order.push("lock released"),
+    });
+    await inLedger;
+    running = false;
+    await loop;
     ctx.store.close = close;
     expect(order).toEqual(["housekeeping settled", "lock released", "store closed"]);
   });

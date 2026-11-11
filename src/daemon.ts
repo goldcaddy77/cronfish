@@ -941,7 +941,6 @@ export async function runDaemon(opts: { consumerRoot: string }): Promise<void> {
     version: pkg.version,
   };
 
-  ctx.shutdown = new AbortController();
   let running = true;
   const stop = (sig: NodeJS.Signals): void => {
     if (!running) return;
@@ -956,13 +955,27 @@ export async function runDaemon(opts: { consumerRoot: string }): Promise<void> {
   console.error(
     `[daemon] cronfish ${pkg.version} pid=${ctx.pid} consumer=${consumerRoot} tick=${TICK_MS}ms`,
   );
+  await runDaemonLoop(ctx, { isRunning: () => running });
+}
+
+// The wall-clock loop plus its shutdown tail, split out of runDaemon so tests
+// can drive the real path (POS-1114): ticks until isRunning() goes false,
+// then shutdownDaemon. Owns ctx.shutdown, so housekeeping is always abortable.
+export async function runDaemonLoop(
+  ctx: DaemonCtx,
+  opts: {
+    isRunning: () => boolean;
+    release?: (consumerRoot: string, pid: number) => void;
+  },
+): Promise<void> {
+  ctx.shutdown ??= new AbortController();
   let ticks = 0;
   // The missed-run check does network I/O (alert sends) — run it
   // fire-and-forget with a re-entrancy flag so a slow adapter can never
   // stall the tick loop (a stalled loop = stale heartbeat = `cron sync`
   // mistaking the daemon for dead).
   let missedCheckInFlight = false;
-  while (running) {
+  while (opts.isRunning()) {
     const t0 = Date.now();
     // MUST await: today the tick runs to completion before the next sleep,
     // serializing every ledger write on one connection. A fire-and-forget tick
@@ -982,9 +995,10 @@ export async function runDaemon(opts: { consumerRoot: string }): Promise<void> {
     if (elapsed > TICK_MS) {
       console.error(`[daemon] slow tick: ${elapsed}ms`);
     }
+    if (!opts.isRunning()) break;
     await Bun.sleep(Math.max(0, TICK_MS - elapsed));
   }
-  await shutdownDaemon(ctx);
+  await shutdownDaemon(ctx, opts.release);
 }
 
 // The tail of runDaemon, in order: stop housekeeping FIRST, then release the
