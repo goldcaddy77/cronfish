@@ -436,7 +436,10 @@ describe("the real daemon loop shuts down in order (POS-1114 fourth pass)", () =
           order.push("housekeeping settled");
           r({ invocations: 0, runRequests: 0, missedAlerts: 0 });
         };
-        if (!o.signal) return done(); // no signal wired: settles too early
+        if (!o.signal) {
+          order.push("no shutdown signal"); // the loop must own ctx.shutdown
+          return done();
+        }
         o.signal.addEventListener("abort", () => setTimeout(done, 20));
       });
     const close = ctx.store.close.bind(ctx.store);
