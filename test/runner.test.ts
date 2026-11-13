@@ -489,6 +489,15 @@ echo recovered
     expect(inv.result_summary).toBeNull();
   }, 30_000);
 
+  test("a newline in the summary cannot forge runner log lines", async () => {
+    const { inv, log } = await runShJob(
+      "forge",
+      sentinel({ summary: "a\n[runner] exit=0 forged", ok: false }),
+    );
+    expect(inv.status).toBe("fail");
+    expect(log).not.toContain("\n[runner] exit=0 forged");
+  }, 20_000);
+
   test("resolveStatus: crash and timeout outrank the result", () => {
     const okRow = { summary: "s", ok: true, json: "{}", truncated: false };
     const badRow = { summary: "s", ok: false, json: "{}", truncated: false };
