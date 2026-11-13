@@ -57,6 +57,38 @@ interface BunSql extends BunSqlTx {
   >;
 }
 
+// Connection pool bounds. `idleTimeout` is in seconds (Bun.sql's unit).
+export const DEFAULT_POOL_MAX = 2;
+export const DEFAULT_POOL_IDLE_TIMEOUT_S = 20;
+
+export interface PostgresStoreOptions {
+  url: string;
+  schema: string;
+  // Maximum pooled connections. Default DEFAULT_POOL_MAX.
+  max?: number;
+  // Seconds an idle connection stays open before it is closed.
+  // Default DEFAULT_POOL_IDLE_TIMEOUT_S.
+  idleTimeout?: number;
+}
+
+interface BunSqlOptions {
+  url: string;
+  max: number;
+  idleTimeout: number;
+}
+
+// The exact options handed to Bun.sql, with defaults applied. Exported so a
+// test can assert what reaches the pool without opening a connection.
+export function poolOptions(
+  opts: Pick<PostgresStoreOptions, "url" | "max" | "idleTimeout">,
+): BunSqlOptions {
+  return {
+    url: opts.url,
+    max: opts.max ?? DEFAULT_POOL_MAX,
+    idleTimeout: opts.idleTimeout ?? DEFAULT_POOL_IDLE_TIMEOUT_S,
+  };
+}
+
 function nowIso(): string {
   return new Date().toISOString();
 }
@@ -90,12 +122,18 @@ export class PostgresStore implements CronStore {
 
   // Connect and migrate. `schema` is validated as an identifier inside
   // buildPostgresQueries, so an injection attempt throws here, before any DDL.
-  static async open(opts: {
-    url: string;
-    schema: string;
-  }): Promise<PostgresStore> {
-    const SQL = (Bun as unknown as { SQL: new (url: string) => BunSql }).SQL;
-    const sql = new SQL(opts.url);
+  //
+  // The pool is deliberately small. Bun's default is 10 connections with no idle
+  // timeout, and it fills every slot shortly after the first query, so each
+  // short-lived job process would pin 10 backends for its whole life. A store
+  // issues sequential statements, and its transactions only ever use the
+  // connection they reserved, so 2 never deadlocks: at most one long
+  // transaction (the daemon's ledger prune) and the tick's statements share it,
+  // and extra statements queue rather than fail. Callers may override both.
+  static async open(opts: PostgresStoreOptions): Promise<PostgresStore> {
+    const SQL = (Bun as unknown as { SQL: new (o: BunSqlOptions) => BunSql })
+      .SQL;
+    const sql = new SQL(poolOptions(opts));
     const store = new PostgresStore(sql, opts.schema);
     await store.migrate();
     return store;

@@ -5,6 +5,11 @@
 
 import { describe, expect, test } from "bun:test";
 import { PostgresStore } from "../src/store/index.ts";
+import {
+  DEFAULT_POOL_IDLE_TIMEOUT_S,
+  DEFAULT_POOL_MAX,
+  poolOptions,
+} from "../src/store/postgres.ts";
 import { assertPgIdentifier } from "../src/store/postgres-queries.ts";
 
 interface BunSqlLike {
@@ -54,6 +59,25 @@ describe("postgres identifier guard", () => {
     ]) {
       expect(() => assertPgIdentifier(bad)).toThrow();
     }
+  });
+});
+
+// The pool bound is pure too: defaults are small, callers can override.
+describe("postgres pool options", () => {
+  test("defaults are a small pool with an idle timeout", () => {
+    expect(DEFAULT_POOL_MAX).toBe(2);
+    expect(DEFAULT_POOL_IDLE_TIMEOUT_S).toBe(20);
+    expect(poolOptions({ url: "postgres://x/y" })).toEqual({
+      url: "postgres://x/y",
+      max: 2,
+      idleTimeout: 20,
+    });
+  });
+
+  test("caller overrides reach the pool options", () => {
+    expect(
+      poolOptions({ url: "postgres://x/y", max: 5, idleTimeout: 3 }),
+    ).toEqual({ url: "postgres://x/y", max: 5, idleTimeout: 3 });
   });
 });
 
@@ -133,6 +157,42 @@ if (!PG_URL) {
         }
       } finally {
         await second.close();
+        await dropSchema(schema);
+      }
+    });
+
+    test("a store holds at most the pool max in backends and releases them when idle", async () => {
+      const schema = ephemeral();
+      // Tag this store's backends so other sessions on a shared test database
+      // cannot skew the count.
+      const tagged = `${url}${url.includes("?") ? "&" : "?"}application_name=${schema}`;
+      const store = await PostgresStore.open({
+        url: tagged,
+        schema,
+        max: 2,
+        idleTimeout: 1,
+      });
+      const probe = newBunSql(url);
+      const count = async () =>
+        Number(
+          (
+            await probe.unsafe(
+              "SELECT count(*) AS c FROM pg_stat_activity WHERE application_name = $1",
+              [schema],
+            )
+          )[0]!.c,
+        );
+      try {
+        // Concurrent statements must queue on the small pool, not fail.
+        await Promise.all(
+          Array.from({ length: 8 }, () => store.listEnabledJobs()),
+        );
+        expect(await count()).toBeLessThanOrEqual(2);
+        await Bun.sleep(2500);
+        expect(await count()).toBe(0);
+      } finally {
+        await probe.end();
+        await store.close();
         await dropSchema(schema);
       }
     });
