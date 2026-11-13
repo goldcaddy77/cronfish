@@ -14,6 +14,7 @@ import {
   closeSync,
   existsSync,
   mkdirSync,
+  fstatSync,
   openSync,
   readFileSync,
   rmSync,
@@ -603,9 +604,10 @@ const FAILURE_STATUSES = new Set<InvocationStatus>([
 async function tryParseResult(
   logPath: string,
   exitCode: number,
+  fromOffset = 0,
 ): Promise<InvocationResultRow> {
   try {
-    const { result, truncated } = await parseLastResult(logPath);
+    const { result, truncated } = await parseLastResult(logPath, fromOffset);
     if (!result) return { summary: null, ok: null, json: null, truncated };
     const ok = result.ok ?? exitCode === 0;
     return {
@@ -911,6 +913,7 @@ async function main(): Promise<void> {
   // 1-based count of attempts actually made — recorded on the invocation row
   // at finish so `cron history` shows real retry data, not a constant 1.
   let attemptsUsed = 1;
+  let attemptStartOffset = 0;
   try {
     for (let attempt = 0; attempt <= retries; attempt++) {
       if (attempt > 0) {
@@ -922,6 +925,8 @@ async function main(): Promise<void> {
         await Bun.sleep(delay * 1000);
       }
       attemptsUsed = attempt + 1;
+      // Only the final attempt's output may decide the run's result.
+      attemptStartOffset = fstatSync(fd).size;
       lastResult = await execOnce(job, fd, timeoutS);
       if (lastResult.code === 0) break;
     }
@@ -936,12 +941,16 @@ async function main(): Promise<void> {
     appendLog(fd, `\n[runner] exit=${lastResult.code} duration=${dur}s`);
     // The job's own verdict. Read before the log fd closes so a reported
     // failure can be written to the log tail the alert payload carries.
-    const resultRow = await tryParseResult(logFile, lastResult.code);
+    const resultRow = await tryParseResult(
+      logFile,
+      lastResult.code,
+      attemptStartOffset,
+    );
     const status = resolveStatus(crashed, lastResult, resultRow);
     if (status === "fail" && lastResult.code === 0) {
       appendLog(
         fd,
-        `[runner] job reported ok=false: ${resultRow.summary ?? "(no summary)"}; recording the run as failed`,
+        `[runner] job reported ok=false: ${JSON.stringify(resultRow.summary ?? "(no summary)")}; recording the run as failed`,
       );
     }
     // One-time completion: write executed_at + archive BEFORE we close the

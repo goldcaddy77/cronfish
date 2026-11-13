@@ -591,7 +591,9 @@ exit code decided. Report `ok: true` (or omit `ok`) when a run had nothing to do
 > **Behavior change:** previously, `ok: false` on a clean exit was stored only in the result columns
 > and the run still counted as `ok`, so no failure alert fired. A job that prints `ok: false` on
 > purpose will now alert. There is no setting to turn this off: have the job report `ok: true` (or
-> leave `ok` out) when the outcome is not a failure.
+> leave `ok` out) when the outcome is not a failure. The process exit code is still the job's own
+> (0), so `cronfish run` exits 0 for such a run, and a job that reports `ok: false` on every run
+> stops advancing its "last ok" time, so the missed-run watchdog can also fire for it.
 
 - `concurrency: skip` — if a prior run is still in flight, exit 0 immediately.
 - `concurrency: queue` — poll every 2s for the lock, up to the job's `timeout`.

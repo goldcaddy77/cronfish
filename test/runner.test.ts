@@ -390,7 +390,7 @@ exit ${code}
     expect(inv.exit_code).toBe(0);
     expect(inv.result_ok).toBe(0);
     expect(inv.result_summary).toBe("upstream rejected 3 items");
-    expect(log).toContain("job reported ok=false: upstream rejected 3 items");
+    expect(log).toContain('job reported ok=false: "upstream rejected 3 items"');
   }, 20_000);
 
   test("exit 0 with ok:true is ok", async () => {
@@ -452,8 +452,42 @@ ${sentinel({ summary: "nothing to do", ok: false })}
     expect(r.code).toBe(0);
     const log = latestLog(root, "noretry-sh");
     expect(log).not.toContain("[runner] retry");
-    expect(log).toContain("job reported ok=false: nothing to do");
+    expect(log).toContain('job reported ok=false: "nothing to do"');
   }, 20_000);
+
+  test("a retry that succeeds is not failed by an earlier attempt's ok:false", async () => {
+    const flag = join(root, "attempted");
+    const job = writeJob(
+      root,
+      "retryok.sh",
+      `#!/bin/bash
+# ---
+# schedule: manual
+# enabled: true
+# timeout: 20
+# retries: 1
+# ---
+if [ ! -e ${JSON.stringify(flag)} ]; then
+  touch ${JSON.stringify(flag)}
+  ${sentinel({ summary: "transient upstream error", ok: false })}
+  exit 1
+fi
+echo recovered
+`,
+    );
+    const r = spawnRunner(root, job, { CRONFISH_TRIGGER: "manual" });
+    expect(r.code).toBe(0);
+    const store = await openStore(root);
+    const inv = store
+      .rawHandleForTests()
+      .query(
+        "SELECT status, result_summary FROM cron_invocations ORDER BY id DESC LIMIT 1",
+      )
+      .get() as { status: string; result_summary: string | null };
+    await store.close();
+    expect(inv.status).toBe("ok");
+    expect(inv.result_summary).toBeNull();
+  }, 30_000);
 
   test("resolveStatus: crash and timeout outrank the result", () => {
     const okRow = { summary: "s", ok: true, json: "{}", truncated: false };
