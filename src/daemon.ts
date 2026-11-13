@@ -612,6 +612,9 @@ export async function checkMissedRuns(
 export const HOUSEKEEPING_STOP_WAIT_MS = 5_000;
 
 export async function runHousekeeping(ctx: DaemonCtx, now: Date): Promise<void> {
+  // Daily, independent of retention config: a runner killed by a reboot leaves
+  // a row too young for the boot pass to call orphaned, so re-check here.
+  await reconcileOrphanedRuns(ctx.store, { now });
   const retention = loadRetention(ctx.consumerRoot);
   if (!retention) return;
   const signal = ctx.shutdown?.signal;
@@ -933,7 +936,13 @@ export function releaseDaemonLock(consumerRoot: string, pid: number): void {
 // result over 'crashed', and the store never rewrites a row that already
 // finished. Logs one line with the count when it repaired anything; silent
 // otherwise. The same routine repairs rows stranded by older versions, so there
-// is no separate one-time sweep.
+// is no separate one-time sweep, and it re-runs with the daily housekeeping so
+// a young dead row is repaired within a day without another restart.
+//
+// Known limit: the ceiling is computed from the job's CURRENT timeout/retries.
+// If the job file was edited to a lower timeout while a run was in flight, the
+// live run can be marked 'crashed' early; its real result still replaces that
+// when it finishes.
 export async function reconcileOrphanedRuns(
   store: CronStore,
   opts: { now?: Date; log?: (msg: string) => void } = {},

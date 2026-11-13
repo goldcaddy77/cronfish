@@ -280,6 +280,7 @@ export interface CronStore {
   reconcileRunningInvocations(
     isOrphan: (row: RunningInvocationRow) => boolean,
   ): Promise<number>;
+  setInvocationLogPath(invocationId: number, logPath: string): Promise<void>;
   getInvocationLogPath(invocationId: number): Promise<string | null>;
   getLastOkStartedAt(jobId: number): Promise<string | null>;
   // Status of the most recent finished invocation with trigger = 'schedule'

@@ -3,7 +3,14 @@
 // reachable) via the shared harness.
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { maxRunMs } from "../src/runner.ts";
-import { reconcileOrphanedRuns } from "../src/daemon.ts";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
+  reconcileOrphanedRuns,
+  runHousekeeping,
+  type DaemonCtx,
+} from "../src/daemon.ts";
 import type { CronStore } from "../src/store/index.ts";
 import type { JobMeta } from "../src/jobs.ts";
 import { BACKENDS, type StoreKit } from "./support/store-harness.ts";
@@ -129,5 +136,29 @@ describe.each(BACKENDS)("boot reconcile [%s]", (_name, factory) => {
     expect(await reconcileOrphanedRuns(store, { log })).toBe(1);
     expect(await reconcileOrphanedRuns(store, { log })).toBe(0);
     expect(logs).toHaveLength(1);
+  });
+});
+
+describe.each(BACKENDS)("daily housekeeping reconcile [%s]", (_name, factory) => {
+  test("runHousekeeping repairs an aged orphan even with no retention config", async () => {
+    const { store, kit, dispose } = await factory();
+    try {
+      await store.upsertJob(meta({ slug: "h-md" }));
+      const jobId = (await store.getJobIdBySlug("h-md"))!;
+      await kit.seedInvocation(jobId, {
+        startedAt: ago(2 * HOUR_MS),
+        status: "running",
+      });
+      const root = mkdtempSync(join(tmpdir(), "cronfish-hk-"));
+      try {
+        await runHousekeeping({ store, consumerRoot: root } as DaemonCtx, new Date());
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+      const id = (await kit.invocationIds())[0]!;
+      expect((await kit.invocationFields(id, ["status"]))!.status).toBe("crashed");
+    } finally {
+      await dispose();
+    }
   });
 });
