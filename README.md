@@ -572,6 +572,29 @@ same prune automatically once per day when `retention` is configured.
 
 - `retries:` — on non-zero exit, retry up to N more times with exponential backoff (5s, 15s, 45s,
   capped at 60s). Retry lines append to the same log.
+  Retries follow the exit code only. A run that exits 0 and reports `ok: false` (see
+  [Run results and status](#run-results-and-status)) is recorded as failed but is not retried.
+
+## Run results and status
+
+A run's recorded status (`ok`, `fail`, `timeout`, `crashed`) is decided in this order: a crash or
+timeout wins; then a non-zero exit code is `fail`; then, for a run that exited 0, the job's own
+result. A job may print one line `__CRONFISH_RESULT_V1__::{"summary":"...","ok":true}` (summary up to
+140 chars; `ok`, `metrics` and `links` are optional). **If the parsed result has `ok: false`, the run
+is recorded as `fail` even though it exited 0**, with the result's `summary` as the reason (it is
+also written to the run log, so it appears in the alert's log tail). Alerts, recovery notices and
+`cronfish history` all treat it like any other failure.
+
+A result with no `ok` field, a missing or malformed result line, or `ok: true` leaves the run as the
+exit code decided. Report `ok: true` (or omit `ok`) when a run had nothing to do.
+
+> **Behavior change:** previously, `ok: false` on a clean exit was stored only in the result columns
+> and the run still counted as `ok`, so no failure alert fired. A job that prints `ok: false` on
+> purpose will now alert. There is no setting to turn this off: have the job report `ok: true` (or
+> leave `ok` out) when the outcome is not a failure. The process exit code is still the job's own
+> (0), so `cronfish run` exits 0 for such a run, and a job that reports `ok: false` on every run
+> stops advancing its "last ok" time, so the missed-run watchdog can also fire for it.
+
 - `concurrency: skip` — if a prior run is still in flight, exit 0 immediately.
 - `concurrency: queue` — poll every 2s for the lock, up to the job's `timeout`.
 

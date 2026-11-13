@@ -59,24 +59,32 @@ function validate(raw: unknown): JobResult | null {
   return out;
 }
 
-function readTail(logPath: string): { text: string; truncated: boolean } {
+function readTail(
+  logPath: string,
+  fromOffset: number,
+): { text: string; truncated: boolean } {
   const fd = openSync(logPath, "r");
   try {
     const size = fstatSync(fd).size;
-    const start = Math.max(0, size - TAIL_BYTES);
+    const start = Math.max(fromOffset, size - TAIL_BYTES);
     const len = size - start;
     const buf = Buffer.alloc(len);
     readSync(fd, buf, 0, len, start);
-    return { text: buf.toString("utf-8"), truncated: start > 0 };
+    return { text: buf.toString("utf-8"), truncated: start > fromOffset };
   } finally {
     closeSync(fd);
   }
 }
 
-export async function parseLastResult(logPath: string): Promise<ParsedResult> {
+// `fromOffset` (a line-aligned byte offset) limits the scan to what the log
+// gained after it, so a retry attempt never reads an earlier attempt's result.
+export async function parseLastResult(
+  logPath: string,
+  fromOffset = 0,
+): Promise<ParsedResult> {
   let tail: { text: string; truncated: boolean };
   try {
-    tail = readTail(logPath);
+    tail = readTail(logPath, fromOffset);
   } catch (e) {
     warn(`read ${logPath} failed: ${(e as Error).message}`);
     return { result: null, truncated: false };

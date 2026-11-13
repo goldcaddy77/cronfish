@@ -12,7 +12,11 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildClaudeArgs, resolveEntrypoint } from "../src/runner.ts";
+import {
+  buildClaudeArgs,
+  resolveEntrypoint,
+  resolveStatus,
+} from "../src/runner.ts";
 import { openStore } from "../src/store/index.ts";
 import { loadJob, type JobMeta } from "../src/jobs.ts";
 
@@ -126,9 +130,9 @@ export default async function run() {
       f.endsWith(".txt"),
     );
     expect(errs).toHaveLength(1);
-    expect(readFileSync(join(root, "cron", ".errors", errs[0]!), "utf-8")).toContain(
-      "runtime past grace",
-    );
+    expect(
+      readFileSync(join(root, "cron", ".errors", errs[0]!), "utf-8"),
+    ).toContain("runtime past grace");
   });
 
   test("concurrency=skip with live lock exits 0 without running", () => {
@@ -327,6 +331,188 @@ export default async function run() {
   }, 15_000);
 });
 
+describe("runner — reported result decides status", () => {
+  let root: string;
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "cronfish-result-"));
+  });
+  afterEach(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  // Runs a .sh job that prints `body` and exits with `code`, then returns the
+  // ledger row the runner wrote for it.
+  async function runShJob(name: string, body: string, code = 0) {
+    const job = writeJob(
+      root,
+      `${name}.sh`,
+      `#!/bin/bash
+# ---
+# schedule: manual
+# enabled: true
+# timeout: 10
+# ---
+${body}
+exit ${code}
+`,
+    );
+    const r = spawnRunner(root, job, { CRONFISH_TRIGGER: "manual" });
+    const store = await openStore(root);
+    const inv = store
+      .rawHandleForTests()
+      .query(
+        `SELECT i.status, i.exit_code, i.result_ok, i.result_summary, j.last_status
+           FROM cron_invocations i JOIN cron_jobs j ON j.id = i.job_id
+          WHERE j.slug = $slug ORDER BY i.id DESC LIMIT 1`,
+      )
+      .get({ $slug: `${name}-sh` }) as {
+      status: string;
+      exit_code: number;
+      result_ok: number | null;
+      result_summary: string | null;
+      last_status: string;
+    };
+    await store.close();
+    return { r, inv, log: latestLog(root, `${name}-sh`) };
+  }
+
+  const sentinel = (o: object) =>
+    `echo '__CRONFISH_RESULT_V1__::${JSON.stringify(o)}'`;
+
+  test("exit 0 with ok:false is recorded as a failure, with the reason", async () => {
+    const { r, inv, log } = await runShJob(
+      "softfail",
+      sentinel({ summary: "upstream rejected 3 items", ok: false }),
+    );
+    expect(r.code).toBe(0);
+    expect(inv.status).toBe("fail");
+    expect(inv.last_status).toBe("fail");
+    expect(inv.exit_code).toBe(0);
+    expect(inv.result_ok).toBe(0);
+    expect(inv.result_summary).toBe("upstream rejected 3 items");
+    expect(log).toContain('job reported ok=false: "upstream rejected 3 items"');
+  }, 20_000);
+
+  test("exit 0 with ok:true is ok", async () => {
+    const { inv } = await runShJob(
+      "softok",
+      sentinel({ summary: "all good", ok: true }),
+    );
+    expect(inv.status).toBe("ok");
+    expect(inv.last_status).toBe("ok");
+  }, 20_000);
+
+  test("exit 0 with a result that has no ok field is ok", async () => {
+    const { inv } = await runShJob(
+      "nook",
+      sentinel({ summary: "no verdict given" }),
+    );
+    expect(inv.status).toBe("ok");
+  }, 20_000);
+
+  test("exit 0 with no parsed result is ok", async () => {
+    const { inv } = await runShJob("noresult", "echo just some output");
+    expect(inv.status).toBe("ok");
+    expect(inv.result_summary).toBeNull();
+  }, 20_000);
+
+  test("exit 0 with malformed result output is ok", async () => {
+    const { inv } = await runShJob(
+      "badresult",
+      `echo '__CRONFISH_RESULT_V1__::{not json'`,
+    );
+    expect(inv.status).toBe("ok");
+  }, 20_000);
+
+  test("non-zero exit is a failure regardless of a reported ok:true", async () => {
+    const { inv } = await runShJob(
+      "hardfail",
+      sentinel({ summary: "claimed fine", ok: true }),
+      3,
+    );
+    expect(inv.status).toBe("fail");
+    expect(inv.exit_code).toBe(3);
+  }, 20_000);
+
+  test("ok:false does not trigger retries (retries follow the exit code)", async () => {
+    const job = writeJob(
+      root,
+      "noretry.sh",
+      `#!/bin/bash
+# ---
+# schedule: manual
+# enabled: true
+# timeout: 10
+# retries: 2
+# ---
+${sentinel({ summary: "nothing to do", ok: false })}
+`,
+    );
+    const r = spawnRunner(root, job, { CRONFISH_TRIGGER: "manual" });
+    expect(r.code).toBe(0);
+    const log = latestLog(root, "noretry-sh");
+    expect(log).not.toContain("[runner] retry");
+    expect(log).toContain('job reported ok=false: "nothing to do"');
+  }, 20_000);
+
+  test("a retry that succeeds is not failed by an earlier attempt's ok:false", async () => {
+    const flag = join(root, "attempted");
+    const job = writeJob(
+      root,
+      "retryok.sh",
+      `#!/bin/bash
+# ---
+# schedule: manual
+# enabled: true
+# timeout: 20
+# retries: 1
+# ---
+if [ ! -e ${JSON.stringify(flag)} ]; then
+  touch ${JSON.stringify(flag)}
+  ${sentinel({ summary: "transient upstream error", ok: false })}
+  exit 1
+fi
+echo recovered
+`,
+    );
+    const r = spawnRunner(root, job, { CRONFISH_TRIGGER: "manual" });
+    expect(r.code).toBe(0);
+    const store = await openStore(root);
+    const inv = store
+      .rawHandleForTests()
+      .query(
+        "SELECT status, result_summary FROM cron_invocations ORDER BY id DESC LIMIT 1",
+      )
+      .get() as { status: string; result_summary: string | null };
+    await store.close();
+    expect(inv.status).toBe("ok");
+    expect(inv.result_summary).toBeNull();
+  }, 30_000);
+
+  test("a newline in the summary cannot forge runner log lines", async () => {
+    const { inv, log } = await runShJob(
+      "forge",
+      sentinel({ summary: "a\n[runner] exit=0 forged", ok: false }),
+    );
+    expect(inv.status).toBe("fail");
+    expect(log).not.toContain("\n[runner] exit=0 forged");
+  }, 20_000);
+
+  test("resolveStatus: crash and timeout outrank the result", () => {
+    const okRow = { summary: "s", ok: true, json: "{}", truncated: false };
+    const badRow = { summary: "s", ok: false, json: "{}", truncated: false };
+    expect(resolveStatus(true, { code: 0, timedOut: false }, okRow)).toBe(
+      "crashed",
+    );
+    expect(resolveStatus(false, { code: 124, timedOut: true }, okRow)).toBe(
+      "timeout",
+    );
+    expect(resolveStatus(false, { code: 0, timedOut: false }, badRow)).toBe(
+      "fail",
+    );
+  });
+});
+
 describe("buildClaudeArgs — permission posture", () => {
   const BIN = "/usr/bin/claude";
 
@@ -480,7 +666,8 @@ describe("resolveEntrypoint — claude.entrypoint_command", () => {
   });
   afterEach(() => {
     closeSync(fd);
-    if (prevConsumerRoot === undefined) delete process.env.CRONFISH_CONSUMER_ROOT;
+    if (prevConsumerRoot === undefined)
+      delete process.env.CRONFISH_CONSUMER_ROOT;
     else process.env.CRONFISH_CONSUMER_ROOT = prevConsumerRoot;
     rmSync(root, { recursive: true, force: true });
   });
