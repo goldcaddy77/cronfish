@@ -36,6 +36,7 @@ import type {
   RunHistoryRow,
   RunRequestRow,
   RunRequestStatusRow,
+  RunningInvocationRow,
 } from "./interface.ts";
 import { RUN_REQUEST_EXPIRY_MS } from "./interface.ts";
 import * as Q from "./sqlite-queries.ts";
@@ -237,6 +238,24 @@ export class SqliteStore implements CronStore {
       $result_json: result?.json ?? null,
       $result_truncated: result?.truncated ? 1 : 0,
     });
+  }
+
+  // See CronStore.reconcileRunningInvocations.
+  async reconcileRunningInvocations(
+    isOrphan: (row: RunningInvocationRow) => boolean,
+  ): Promise<number> {
+    const rows = this.#db
+      .query(Q.SQLITE_LIST_RUNNING)
+      .all() as RunningInvocationRow[];
+    const stmt = this.#db.prepare(Q.SQLITE_RECONCILE_RUNNING);
+    const now = nowIso();
+    let flipped = 0;
+    for (const row of rows) {
+      if (isOrphan(row)) {
+        flipped += stmt.run({ $id: row.id, $now: now }).changes;
+      }
+    }
+    return flipped;
   }
 
   async setInvocationAlert(

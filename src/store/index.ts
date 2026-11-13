@@ -24,6 +24,7 @@ export type {
   RunHistoryRow,
   RunRequestRow,
   RunRequestStatusRow,
+  RunningInvocationRow,
 } from "./interface.ts";
 export { RUN_REQUEST_EXPIRY_MS } from "./interface.ts";
 export { SqliteStore } from "./sqlite.ts";

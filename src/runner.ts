@@ -52,7 +52,28 @@ import {
   type DispatchOutcome,
 } from "./alerts/dispatch.ts";
 
-const DEFAULT_TIMEOUT_S = 300;
+export const DEFAULT_TIMEOUT_S = 300;
+
+// Seconds the runner waits before retry `attempt` (1-based).
+function retryDelayS(attempt: number): number {
+  return Math.min(5 * Math.pow(3, attempt - 1), 60);
+}
+
+// Slack on top of the computed ceiling: process-group kill, log flush, ledger
+// write.
+const RUN_CEILING_GRACE_MS = 60_000;
+
+// The longest a single invocation can legitimately stay 'running': every
+// attempt may use its full timeout (the runner kills the process group at
+// timeoutS), plus the waits between retries, plus a grace. A 'running' row
+// older than this cannot belong to a live runner. The daemon's boot reconcile
+// uses it as its orphan test.
+export function maxRunMs(timeoutS: number | null, retries: number): number {
+  const t = timeoutS ?? DEFAULT_TIMEOUT_S;
+  let s = (retries + 1) * t;
+  for (let a = 1; a <= retries; a++) s += retryDelayS(a);
+  return s * 1000 + RUN_CEILING_GRACE_MS;
+}
 
 const MD_RESULT_FOOTER = `---
 When finished, print exactly one line, then nothing after it:
@@ -917,7 +938,7 @@ async function main(): Promise<void> {
   try {
     for (let attempt = 0; attempt <= retries; attempt++) {
       if (attempt > 0) {
-        const delay = Math.min(5 * Math.pow(3, attempt - 1), 60);
+        const delay = retryDelayS(attempt);
         appendLog(
           fd,
           `\n[runner] retry ${attempt}/${retries} — waiting ${delay}s`,

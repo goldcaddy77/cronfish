@@ -38,6 +38,7 @@ import type {
   RunHistoryRow,
   RunRequestRow,
   RunRequestStatusRow,
+  RunningInvocationRow,
 } from "./interface.ts";
 import { RUN_REQUEST_EXPIRY_MS } from "./interface.ts";
 import { buildPostgresQueries, type PgQuery } from "./postgres-queries.ts";
@@ -342,6 +343,30 @@ export class PostgresStore implements CronStore {
         result_truncated: result?.truncated ? 1 : 0,
       }),
     );
+  }
+
+  // See CronStore.reconcileRunningInvocations. The flip count comes from
+  // Bun.sql's affected-row `.count` (no RETURNING, so the array is empty).
+  async reconcileRunningInvocations(
+    isOrphan: (row: RunningInvocationRow) => boolean,
+  ): Promise<number> {
+    const rows = await this.run(this.#q.listRunning());
+    const now = nowIso();
+    let flipped = 0;
+    for (const r of rows) {
+      const row: RunningInvocationRow = {
+        id: reqNum(r.id),
+        slug: String(r.slug),
+        started_at: String(r.started_at),
+        timeout_s: num(r.timeout_s),
+        retries: num(r.retries) ?? 0,
+      };
+      if (!isOrphan(row)) continue;
+      flipped += affected(
+        await this.run(this.#q.reconcileRunning(row.id, now)),
+      );
+    }
+    return flipped;
   }
 
   async setInvocationAlert(

@@ -289,6 +289,24 @@ export function buildPostgresQueries(schema: string) {
         p.result_summary, p.result_ok, p.result_json, p.result_truncated, p.id,
       ],
     }),
+    listRunning: (): PgQuery => ({
+      text: `SELECT i.id, j.slug, i.started_at, j.timeout_s, j.retries
+       FROM ${inv} i
+       JOIN ${jobs} j ON j.id = i.job_id
+       WHERE i.status = 'running'`,
+      values: [],
+    }),
+    // Flip one row to 'crashed'. The status guard leaves a row that finished
+    // since it was listed alone; duration floored at 0, exit_code nulled.
+    reconcileRunning: (id: number, now: string): PgQuery => ({
+      text: `UPDATE ${inv}
+         SET status = 'crashed',
+             finished_at = $1,
+             duration_ms = GREATEST(0, ${durMs("started_at", "$2")}),
+             exit_code = NULL
+         WHERE id = $3 AND status = 'running'`,
+      values: [now, now, id],
+    }),
     setInvocationAlert: (
       id: number,
       status: string,
