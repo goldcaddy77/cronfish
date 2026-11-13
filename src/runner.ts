@@ -56,7 +56,7 @@ const DEFAULT_TIMEOUT_S = 300;
 const MD_RESULT_FOOTER = `---
 When finished, print exactly one line, then nothing after it:
 __CRONFISH_RESULT_V1__::{"summary":"...","ok":true|false,"metrics":{...}}
-Set ok to false if the work did not complete (errors, blocked, skipped). Summary ≤140 chars. No markdown, no code fences.`;
+Set ok to false only if the work failed or could not complete (errors, blocked): cronfish records the run as failed. If there was nothing to do, set ok to true. Summary ≤140 chars. No markdown, no code fences.`;
 const LOCK_POLL_MS = 2_000;
 const KILL_GRACE_MS = 5_000;
 
@@ -332,7 +332,10 @@ export function buildClaudeArgs(
 // exit, a timeout, or empty output logs a line and yields undefined, so a
 // broken entrypoint degrades the run to "no prelude" rather than failing it.
 const ENTRYPOINT_TIMEOUT_MS = 30_000;
-export function resolveEntrypoint(job: JobMeta, fd: number): string | undefined {
+export function resolveEntrypoint(
+  job: JobMeta,
+  fd: number,
+): string | undefined {
   if (job.entrypoint === false) return undefined;
   const cfg = loadClaudeConfig(consumerRoot());
   if (!cfg?.entrypoint_command) return undefined;
@@ -408,7 +411,13 @@ async function execMarkdown(
     appendLog(fd, `[runner] read-only: deny [${READ_ONLY_DENY.join(", ")}]`);
   }
   const appendSystemPrompt = resolveEntrypoint(job, fd);
-  const cmd = buildClaudeArgs(CLAUDE_BIN, job, model.id, prompt, appendSystemPrompt);
+  const cmd = buildClaudeArgs(
+    CLAUDE_BIN,
+    job,
+    model.id,
+    prompt,
+    appendSystemPrompt,
+  );
   const env = claudeEnvFor(model);
   if (env) {
     appendLog(
@@ -534,7 +543,13 @@ async function tryFinishInvocation(
 ): Promise<void> {
   if (!store || invocationId === null) return;
   try {
-    await store.finishInvocation(invocationId, status, exitCode, result, attempt);
+    await store.finishInvocation(
+      invocationId,
+      status,
+      exitCode,
+      result,
+      attempt,
+    );
   } catch (e) {
     warn(`finishInvocation failed: ${(e as Error).message}`);
   }
@@ -605,6 +620,21 @@ async function tryParseResult(
   }
 }
 
+// A run's recorded status. The exit code decides first (crash, timeout, non-zero
+// exit). A clean exit is then overruled by the job's own parsed result: an
+// explicit `ok: false` is a failure. A missing `ok`, or no parsed result at all,
+// leaves the exit-code verdict untouched.
+export function resolveStatus(
+  crashed: boolean,
+  run: SpawnResult,
+  result: InvocationResultRow,
+): InvocationStatus {
+  if (crashed) return "crashed";
+  if (run.timedOut) return "timeout";
+  if (run.code !== 0) return "fail";
+  return result.ok === false ? "fail" : "ok";
+}
+
 // --- One-shot completion ---
 //
 // On any termination of a one-time job (success or failure), stamp
@@ -655,7 +685,10 @@ function completeOneTime(job: JobMeta, fd: number): void {
   try {
     stampExecutedAt(job, iso);
   } catch (e) {
-    appendLog(fd, `[runner] one-time: stampExecutedAt failed: ${(e as Error).message}`);
+    appendLog(
+      fd,
+      `[runner] one-time: stampExecutedAt failed: ${(e as Error).message}`,
+    );
     try {
       writeSentinel(
         join(consumerRoot(), "cron"),
@@ -901,6 +934,16 @@ async function main(): Promise<void> {
   } finally {
     const dur = ((Date.now() - start) / 1000).toFixed(1);
     appendLog(fd, `\n[runner] exit=${lastResult.code} duration=${dur}s`);
+    // The job's own verdict. Read before the log fd closes so a reported
+    // failure can be written to the log tail the alert payload carries.
+    const resultRow = await tryParseResult(logFile, lastResult.code);
+    const status = resolveStatus(crashed, lastResult, resultRow);
+    if (status === "fail" && lastResult.code === 0) {
+      appendLog(
+        fd,
+        `[runner] job reported ok=false: ${resultRow.summary ?? "(no summary)"}; recording the run as failed`,
+      );
+    }
     // One-time completion: write executed_at + archive BEFORE we close the
     // log fd, so the archive line lands in the log. Then release flock.
     if (job.oneTime) {
@@ -909,14 +952,6 @@ async function main(): Promise<void> {
     }
     closeSync(fd);
     if (job.concurrency) releaseLock(job.slug);
-    const status: InvocationStatus = crashed
-      ? "crashed"
-      : lastResult.timedOut
-        ? "timeout"
-        : lastResult.code === 0
-          ? "ok"
-          : "fail";
-    const resultRow = await tryParseResult(logFile, lastResult.code);
     await tryFinishInvocation(
       store,
       invocationId,
@@ -973,11 +1008,8 @@ async function maybeFireAlert(input: AlertFireInput): Promise<void> {
   const isRecovery =
     input.status === "ok" &&
     FAILURE_STATUSES.has(
-      (await tryPrevStatus(
-        input.store,
-        input.job.slug,
-        input.invocationId,
-      )) ?? ("ok" as InvocationStatus),
+      (await tryPrevStatus(input.store, input.job.slug, input.invocationId)) ??
+        ("ok" as InvocationStatus),
     );
   if (!isFailure && !isRecovery) return;
   try {
