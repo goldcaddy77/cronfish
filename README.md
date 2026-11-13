@@ -575,6 +575,18 @@ same prune automatically once per day when `retention` is configured.
   Retries follow the exit code only. A run that exits 0 and reports `ok: false` (see
   [Run results and status](#run-results-and-status)) is recorded as failed but is not retried.
 
+### Runs that outlive a daemon restart
+
+A run is its own process, so restarting the daemon does not stop it: it finishes and records its own
+result. If its ledger row is still `running` after a restart (the runner died, or the machine went
+down), the daemon repairs it on boot. A `running` row is treated as orphaned only when it is older
+than the longest that job can legitimately run: each attempt's `timeout` (default 300s), plus the
+retry waits, plus a 60s grace. Past that the runner has already been killed by its own timeout, so
+a live run is never touched. Orphans are marked `crashed`. If a runner finishes after its row was
+marked, its real result replaces `crashed`; a row that already finished is never rewritten. The
+daemon logs one line with the count when it repairs anything, and nothing otherwise. Rows stranded
+by older versions are repaired by the same routine on the first boot after upgrading.
+
 ## Run results and status
 
 A run's recorded status (`ok`, `fail`, `timeout`, `crashed`) is decided in this order: a crash or

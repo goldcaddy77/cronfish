@@ -85,6 +85,16 @@ export interface RunRequestStatusRow {
   expired_at: string | null;
 }
 
+// A ledger row still marked 'running', with the owning job's limits. The input
+// to CronStore.reconcileRunningInvocations' orphan predicate.
+export interface RunningInvocationRow {
+  id: number;
+  slug: string;
+  started_at: string;
+  timeout_s: number | null;
+  retries: number;
+}
+
 export interface DaemonHeartbeatRow {
   pid: number;
   started_at: string;
@@ -258,6 +268,18 @@ export interface CronStore {
     status: AlertLedgerStatus,
     error: string | null,
   ): Promise<void>;
+  // Repair rows left 'running' by a runner that is gone. Loads every 'running'
+  // row, asks `isOrphan` about each, and flips the ones it accepts to 'crashed'
+  // (finished_at = now, duration_ms = max(0, now - started_at), exit_code
+  // NULL). Returns the number of rows actually flipped. The UPDATE is guarded
+  // by status = 'running', so a row that finished between the read and the
+  // write keeps its real result: a reconcile never overwrites a finished row.
+  // The reverse order is safe too: finishInvocation writes unconditionally, so
+  // a runner that finishes after being reconciled replaces 'crashed' with its
+  // real status. Idempotent.
+  reconcileRunningInvocations(
+    isOrphan: (row: RunningInvocationRow) => boolean,
+  ): Promise<number>;
   setInvocationLogPath(invocationId: number, logPath: string): Promise<void>;
   getInvocationLogPath(invocationId: number): Promise<string | null>;
   getLastOkStartedAt(jobId: number): Promise<string | null>;

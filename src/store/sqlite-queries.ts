@@ -330,6 +330,23 @@ export const SQLITE_FINISH_INVOCATION = `UPDATE cron_invocations
        result_truncated = $result_truncated
    WHERE id = $id`;
 
+// Rows still 'running', joined to the job's limits, for the boot reconcile.
+export const SQLITE_LIST_RUNNING = `SELECT i.id AS id, j.slug AS slug,
+       i.started_at AS started_at, j.timeout_s AS timeout_s, j.retries AS retries
+   FROM cron_invocations i
+   JOIN cron_jobs j ON j.id = i.job_id
+   WHERE i.status = 'running'`;
+
+// Flip one row to 'crashed'. The status guard means a row that finished since
+// it was listed is left alone (never overwrite a real result). duration_ms is
+// now - started_at floored at 0, exit_code nulled to match the crash path.
+export const SQLITE_RECONCILE_RUNNING = `UPDATE cron_invocations
+   SET status = 'crashed',
+       finished_at = $now,
+       duration_ms = MAX(0, CAST(ROUND((julianday($now) - julianday(started_at)) * 86400000) AS INTEGER)),
+       exit_code = NULL
+   WHERE id = $id AND status = 'running'`;
+
 export const SQLITE_SET_INVOCATION_ALERT = `UPDATE cron_invocations
    SET alert_status = $status, alert_error = $error
    WHERE id = $id`;

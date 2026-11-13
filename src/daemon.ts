@@ -31,6 +31,7 @@ import {
   type JobSyncStateRow,
 } from "./store/index.ts";
 import { loadJob, slugFromPath, walkJobFiles } from "./jobs.ts";
+import { maxRunMs } from "./runner.ts";
 import { loadRetention } from "./config.ts";
 import { ledgerPruneTotal, pruneLogsAsync } from "./prune.ts";
 import { computeNextRun } from "./next-run.ts";
@@ -611,6 +612,9 @@ export async function checkMissedRuns(
 export const HOUSEKEEPING_STOP_WAIT_MS = 5_000;
 
 export async function runHousekeeping(ctx: DaemonCtx, now: Date): Promise<void> {
+  // Daily, independent of retention config: a runner killed by a reboot leaves
+  // a row too young for the boot pass to call orphaned, so re-check here.
+  await reconcileOrphanedRuns(ctx.store, { now });
   const retention = loadRetention(ctx.consumerRoot);
   if (!retention) return;
   const signal = ctx.shutdown?.signal;
@@ -917,6 +921,47 @@ export function releaseDaemonLock(consumerRoot: string, pid: number): void {
   } catch {}
 }
 
+// Boot repair for ledger rows a previous daemon life left 'running'.
+//
+// A runner is its own process: it outlives a daemon restart and writes its own
+// result, so at boot a 'running' row is NOT proof of a dead run. (Every restart
+// leaves live runners going.) The ledger records no runner pid, so the rule
+// uses what it does record: a row is orphaned only when it is older than the
+// longest a run of that job can last (maxRunMs: every attempt's timeout plus
+// retry waits plus a grace). Past that, the runner has already been killed by
+// its own timeout, so it cannot be alive. A younger row is left alone even if
+// its runner is dead; the next boot repairs it once it ages past the ceiling.
+//
+// Orphans become 'crashed'. A runner that finishes later still writes its real
+// result over 'crashed', and the store never rewrites a row that already
+// finished. Logs one line with the count when it repaired anything; silent
+// otherwise. The same routine repairs rows stranded by older versions, so there
+// is no separate one-time sweep, and it re-runs with the daily housekeeping so
+// a young dead row is repaired within a day without another restart.
+//
+// Known limit: the ceiling is computed from the job's CURRENT timeout/retries.
+// If the job file was edited to a lower timeout while a run was in flight, the
+// live run can be marked 'crashed' early; its real result still replaces that
+// when it finishes.
+export async function reconcileOrphanedRuns(
+  store: CronStore,
+  opts: { now?: Date; log?: (msg: string) => void } = {},
+): Promise<number> {
+  const nowMs = (opts.now ?? new Date()).getTime();
+  const log = opts.log ?? ((m) => console.error(m));
+  const repaired = await store.reconcileRunningInvocations((row) => {
+    const startedMs = Date.parse(row.started_at);
+    if (Number.isNaN(startedMs)) return false;
+    return nowMs - startedMs > maxRunMs(row.timeout_s, row.retries);
+  });
+  if (repaired > 0) {
+    log(
+      `[daemon] reconciled ${repaired} orphaned run(s) left running by a previous daemon`,
+    );
+  }
+  return repaired;
+}
+
 // Foreground loop for `cronfish daemon`. SIGTERM/SIGINT stop the ticking and
 // exit; in-flight children are independent runner processes and are left
 // running (they hold their own locks and finish their own ledger rows).
@@ -930,6 +975,13 @@ export async function runDaemon(opts: { consumerRoot: string }): Promise<void> {
       await store.close();
     } catch {}
     process.exit(1);
+  }
+  // Lock held, store open, before the first tick: repair rows stranded by a
+  // previous daemon. A failure here must not stop the daemon from scheduling.
+  try {
+    await reconcileOrphanedRuns(store);
+  } catch (e) {
+    console.error(`[daemon] orphan reconcile failed: ${(e as Error).message}`);
   }
   const ctx: DaemonCtx = {
     store,

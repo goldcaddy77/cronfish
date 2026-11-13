@@ -52,7 +52,28 @@ import {
   type DispatchOutcome,
 } from "./alerts/dispatch.ts";
 
-const DEFAULT_TIMEOUT_S = 300;
+export const DEFAULT_TIMEOUT_S = 300;
+
+// Seconds the runner waits before retry `attempt` (1-based).
+function retryDelayS(attempt: number): number {
+  return Math.min(5 * Math.pow(3, attempt - 1), 60);
+}
+
+// Slack on top of the computed ceiling: process-group kill, log flush, ledger
+// write.
+const RUN_CEILING_GRACE_MS = 60_000;
+
+// The longest a single invocation can legitimately stay 'running': every
+// attempt may use its full timeout (the runner kills the process group at
+// timeoutS), plus the waits between retries, plus a grace. A 'running' row
+// older than this cannot belong to a live runner. The daemon's boot reconcile
+// uses it as its orphan test.
+export function maxRunMs(timeoutS: number | null, retries: number): number {
+  const t = timeoutS ?? DEFAULT_TIMEOUT_S;
+  let s = (retries + 1) * t;
+  for (let a = 1; a <= retries; a++) s += retryDelayS(a);
+  return s * 1000 + RUN_CEILING_GRACE_MS;
+}
 
 const MD_RESULT_FOOTER = `---
 When finished, print exactly one line, then nothing after it:
@@ -883,17 +904,10 @@ async function main(): Promise<void> {
     //
     // DIALECT CAVEAT (Postgres, CAD-790): with an async PostgresStore this
     // crash-status write is a network round-trip that will NOT complete before
-    // process.exit — the invocation row stays 'running'. There is currently NO
-    // repair path that reconciles an orphaned 'running' row to 'crashed' on
-    // restart: repairLostOnce (daemon.ts) only re-schedules lost one-time JOBS,
-    // and the watchdog only detects MISSED runs — neither touches a stuck
-    // 'running' invocation. prune.ts protects fresh 'running' rows and
-    // eventually DELETES stale ones (RUNNING_PROTECT_MS) but never re-statuses
-    // them. So under Postgres a SIGTERM'd run leaves a permanent 'running' row
-    // until it ages out of retention. Scope-3 cutover (CAD-790) must add a
-    // startup reconcile that flips daemon-supervised orphaned 'running' rows to
-    // 'crashed', OR make this handler await the write (SIGTERM has a grace
-    // period). Sync bun:sqlite is unaffected — the write lands before exit.
+    // process.exit — the invocation row stays 'running'. The repair is the
+    // daemon's reconcileOrphanedRuns (daemon.ts): at boot and daily it marks a
+    // 'running' row 'crashed' once it is older than maxRunMs. Sync bun:sqlite is
+    // unaffected — the write lands before exit.
     void tryFinishInvocation(
       store,
       invocationId,
@@ -917,7 +931,7 @@ async function main(): Promise<void> {
   try {
     for (let attempt = 0; attempt <= retries; attempt++) {
       if (attempt > 0) {
-        const delay = Math.min(5 * Math.pow(3, attempt - 1), 60);
+        const delay = retryDelayS(attempt);
         appendLog(
           fd,
           `\n[runner] retry ${attempt}/${retries} — waiting ${delay}s`,
