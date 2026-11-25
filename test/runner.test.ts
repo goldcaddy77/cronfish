@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
   closeSync,
+  linkSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -16,6 +17,7 @@ import {
   buildClaudeArgs,
   resolveEntrypoint,
   resolveStatus,
+  LOCK_WRITE_GRACE_MS,
   tryAcquirePidLock,
 } from "../src/runner.ts";
 import { openStore } from "../src/store/index.ts";
@@ -118,6 +120,43 @@ describe("tryAcquirePidLock", () => {
     // And it still excludes a second caller.
     expect(tryAcquirePidLock(path, { link: noLinks })).toBe(false);
     expect(readdirSync(dir)).toEqual(["runner.pid"]);
+  });
+
+  test("a fresh lock with no pid yet is held, not stolen", () => {
+    // A create-then-write holder between its create and its write.
+    const path = join(dir, "runner.pid");
+    writeFileSync(path, "");
+    const noLinks = (): never => {
+      throw Object.assign(new Error("ENOTSUP"), { code: "ENOTSUP" });
+    };
+    expect(tryAcquirePidLock(path, { link: noLinks })).toBe(false);
+    expect(tryAcquirePidLock(path)).toBe(false);
+    expect(readFileSync(path, "utf-8")).toBe("");
+  });
+
+  test("an old lock with no pid is taken over", () => {
+    const path = join(dir, "runner.pid");
+    writeFileSync(path, "");
+    const later = () => Date.now() + LOCK_WRITE_GRACE_MS + 1000;
+    expect(tryAcquirePidLock(path, { now: later })).toBe(true);
+    expect(readFileSync(path, "utf-8")).toBe(String(process.pid));
+  });
+
+  test("a lock released mid-check is retried, not a crash", () => {
+    const path = join(dir, "runner.pid");
+    writeFileSync(path, String(process.ppid));
+    let first = true;
+    // The holder releases right as our link attempt fails.
+    const link = (from: string, to: string): void => {
+      if (first) {
+        first = false;
+        rmSync(to);
+        throw Object.assign(new Error("EEXIST"), { code: "EEXIST" });
+      }
+      linkSync(from, to);
+    };
+    expect(tryAcquirePidLock(path, { link })).toBe(true);
+    expect(readFileSync(path, "utf-8")).toBe(String(process.pid));
   });
 
   test("refuses a lock a live process holds", () => {

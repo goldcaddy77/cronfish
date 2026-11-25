@@ -19,6 +19,7 @@ import {
   openSync,
   readFileSync,
   rmSync,
+  statSync,
   writeFileSync,
   writeSync,
 } from "node:fs";
@@ -133,20 +134,34 @@ let heldLockPath: string | null = null;
 // staging file first, which is then hard-linked into place: link() fails if
 // the lock exists, so the lock appears already holding a pid. Creating the
 // lock and then writing it left a window where a second runner read an empty
-// file, took it for corrupt, removed it and ran concurrently. A filesystem
-// without hard links falls back to create-then-write, which still excludes,
-// just with that narrow window. Test seams: `onVisible` runs the instant the
-// lock exists at `path`; `link` replaces linkSync.
+// file, took it for corrupt, removed it and ran concurrently.
+//
+// A filesystem without hard links falls back to create-then-write. Its brief
+// empty window is covered by the rule below: a lock with no readable pid is
+// only taken over once it is older than LOCK_WRITE_GRACE_MS, so a holder that
+// has created the file but not yet written it is treated as holding it.
+//
+// Test seams: `onVisible` runs the instant the lock exists at `path`; `link`
+// replaces linkSync; `now` replaces Date.now.
 export interface PidLockSeams {
   onVisible?: () => void;
   link?: (from: string, to: string) => void;
+  now?: () => number;
 }
+
+export const LOCK_WRITE_GRACE_MS = 2000;
 
 export function tryAcquirePidLock(
   path: string,
   seams: PidLockSeams = {},
+  attempt = 0,
 ): boolean {
+  // Each retry follows a lock that vanished or was taken over; a few is
+  // plenty, and the cap stops a filesystem that refuses every create from
+  // looping forever.
+  if (attempt > 3) return false;
   const link = seams.link ?? linkSync;
+  const now = seams.now ?? Date.now;
   const tmp = `${path}.${process.pid}.tmp`;
   writeFileSync(tmp, String(process.pid));
   try {
@@ -156,24 +171,40 @@ export function tryAcquirePidLock(
       if ((e as NodeJS.ErrnoException).code === "EEXIST") throw e;
       // No hard links here: exclusive create, then write.
       const fd = openSync(path, "wx");
-      writeSync(fd, String(process.pid));
+      try {
+        writeSync(fd, String(process.pid));
+      } catch (we) {
+        closeSync(fd);
+        safeRm(path);
+        throw we;
+      }
       closeSync(fd);
     }
     seams.onVisible?.();
     return true;
   } catch {
-    if (!existsSync(path)) return false;
-    const pid = parseInt(readFileSync(path, "utf-8").trim(), 10);
+    let text: string;
+    let mtimeMs: number;
+    try {
+      text = readFileSync(path, "utf-8");
+      mtimeMs = statSync(path).mtimeMs;
+    } catch {
+      // The lock went away between our attempt and this read: try again.
+      return tryAcquirePidLock(path, seams, attempt + 1);
+    }
+    const pid = parseInt(text.trim(), 10);
     if (Number.isNaN(pid)) {
+      // Possibly a holder mid-write (create-then-write fallback): held.
+      if (now() - mtimeMs < LOCK_WRITE_GRACE_MS) return false;
       safeRm(path);
-      return tryAcquirePidLock(path, seams);
+      return tryAcquirePidLock(path, seams, attempt + 1);
     }
     try {
       process.kill(pid, 0);
       return false;
     } catch {
       safeRm(path);
-      return tryAcquirePidLock(path, seams);
+      return tryAcquirePidLock(path, seams, attempt + 1);
     }
   } finally {
     safeRm(tmp);
