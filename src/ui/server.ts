@@ -5,7 +5,11 @@
 
 import { existsSync, statSync } from "node:fs";
 import { extname, join, normalize, resolve } from "node:path";
-import { openStore, type DaemonHeartbeatRow } from "../store/index.ts";
+import {
+  openStore,
+  type CronStore,
+  type DaemonHeartbeatRow,
+} from "../store/index.ts";
 import { dispatchSchedule } from "../schedule.ts";
 
 export interface UiServerOptions {
@@ -195,79 +199,83 @@ function parseRange(
   return { start, end };
 }
 
+// One store per consumer for the life of the server. The dashboard polls (the
+// daemon banner every 10s, an open log every 2s), and opening a store per
+// request meant a fresh Postgres pool, its connections and a migration check
+// on every poll. A failed open is forgotten so the next request retries.
+const uiStores = new Map<string, Promise<CronStore>>();
+
+function uiStore(consumerRoot: string): Promise<CronStore> {
+  let p = uiStores.get(consumerRoot);
+  if (!p) {
+    p = openStore(consumerRoot);
+    uiStores.set(consumerRoot, p);
+    p.catch(() => uiStores.delete(consumerRoot));
+  }
+  return p;
+}
+
 async function serveLog(
   consumerRoot: string,
   invocationId: number,
   rangeHeader: string | null,
 ): Promise<Response> {
-  const store = await openStore(consumerRoot);
-  try {
-    const path = await store.getInvocationLogPath(invocationId);
-    if (path === null) return notFound("invocation not found");
-    if (!existsSync(path)) {
-      return new Response("[log file missing]\n", {
-        status: 200,
-        headers: { "content-type": "text/plain; charset=utf-8" },
-      });
-    }
-    const st = statSync(path);
-    const size = st.size;
-    const range = parseRange(rangeHeader, size);
-    const file = Bun.file(path);
-    if (range) {
-      const sliced = file.slice(range.start, range.end + 1);
-      return new Response(sliced, {
-        status: 206,
-        headers: {
-          "content-type": "text/plain; charset=utf-8",
-          "content-range": `bytes ${range.start}-${range.end}/${size}`,
-          "content-length": String(range.end - range.start + 1),
-          "accept-ranges": "bytes",
-          "cache-control": "no-store",
-        },
-      });
-    }
-    return new Response(file, {
+  const store = await uiStore(consumerRoot);
+  const path = await store.getInvocationLogPath(invocationId);
+  if (path === null) return notFound("invocation not found");
+  if (!existsSync(path)) {
+    return new Response("[log file missing]\n", {
+      status: 200,
+      headers: { "content-type": "text/plain; charset=utf-8" },
+    });
+  }
+  const st = statSync(path);
+  const size = st.size;
+  const range = parseRange(rangeHeader, size);
+  const file = Bun.file(path);
+  if (range) {
+    const sliced = file.slice(range.start, range.end + 1);
+    return new Response(sliced, {
+      status: 206,
       headers: {
         "content-type": "text/plain; charset=utf-8",
-        "content-length": String(size),
+        "content-range": `bytes ${range.start}-${range.end}/${size}`,
+        "content-length": String(range.end - range.start + 1),
         "accept-ranges": "bytes",
         "cache-control": "no-store",
       },
     });
-  } finally {
-    await store.close();
   }
+  return new Response(file, {
+    headers: {
+      "content-type": "text/plain; charset=utf-8",
+      "content-length": String(size),
+      "accept-ranges": "bytes",
+      "cache-control": "no-store",
+    },
+  });
 }
 
 async function listJobs(consumerRoot: string): Promise<unknown> {
-  const store = await openStore(consumerRoot);
-  try {
-    const jobs = await store.listJobsWithLastInvocation();
-    return jobs.map((j) => ({
-      ...j,
-      filename: filenameFromSlug(j.slug),
-      next_run: jobNextRun(j, j.last_started_at),
-    }));
-  } finally {
-    await store.close();
-  }
+  const store = await uiStore(consumerRoot);
+  const jobs = await store.listJobsWithLastInvocation();
+  return jobs.map((j) => ({
+    ...j,
+    filename: filenameFromSlug(j.slug),
+    next_run: jobNextRun(j, j.last_started_at),
+  }));
 }
 
 async function getJob(consumerRoot: string, slug: string): Promise<unknown> {
-  const store = await openStore(consumerRoot);
-  try {
-    const job = await store.getJobBySlug(slug);
-    if (!job) return null;
-    const lastStartedAt = await store.getLastInvocationStartedAt(slug);
-    return {
-      ...job,
-      filename: filenameFromSlug(job.slug),
-      next_run: jobNextRun(job, lastStartedAt),
-    };
-  } finally {
-    await store.close();
-  }
+  const store = await uiStore(consumerRoot);
+  const job = await store.getJobBySlug(slug);
+  if (!job) return null;
+  const lastStartedAt = await store.getLastInvocationStartedAt(slug);
+  return {
+    ...job,
+    filename: filenameFromSlug(job.slug),
+    next_run: jobNextRun(job, lastStartedAt),
+  };
 }
 
 // log_path holds an absolute filesystem path on the host (e.g.
@@ -285,39 +293,27 @@ async function listInvocations(
   slug: string,
   limit: number,
 ): Promise<unknown> {
-  const store = await openStore(consumerRoot);
-  try {
-    const rows = await store.listInvocationsForSlug(slug, limit);
-    return rows.map(stripLogPath);
-  } finally {
-    await store.close();
-  }
+  const store = await uiStore(consumerRoot);
+  const rows = await store.listInvocationsForSlug(slug, limit);
+  return rows.map(stripLogPath);
 }
 
 async function listAllInvocations(
   consumerRoot: string,
   limit: number,
 ): Promise<unknown> {
-  const store = await openStore(consumerRoot);
-  try {
-    const rows = await store.listAllInvocations(limit);
-    return rows.map(stripLogPath);
-  } finally {
-    await store.close();
-  }
+  const store = await uiStore(consumerRoot);
+  const rows = await store.listAllInvocations(limit);
+  return rows.map(stripLogPath);
 }
 
 async function getInvocation(
   consumerRoot: string,
   id: number,
 ): Promise<unknown> {
-  const store = await openStore(consumerRoot);
-  try {
-    const row = await store.getInvocationWithDuration(id);
-    return row ? stripLogPath(row) : null;
-  } finally {
-    await store.close();
-  }
+  const store = await uiStore(consumerRoot);
+  const row = await store.getInvocationWithDuration(id);
+  return row ? stripLogPath(row) : null;
 }
 
 // A daemon is "live" when its last tick is at most this old — mirrors
@@ -330,16 +326,12 @@ export async function daemonStatus(consumerRoot: string): Promise<{
   heartbeat: DaemonHeartbeatRow | null;
   now: string;
 }> {
-  const store = await openStore(consumerRoot);
-  try {
-    const heartbeat = await store.getDaemonHeartbeat();
-    const live =
-      !!heartbeat &&
-      Date.now() - Date.parse(heartbeat.last_tick_at) <= DAEMON_FRESH_MS;
-    return { live, heartbeat, now: new Date().toISOString() };
-  } finally {
-    await store.close();
-  }
+  const store = await uiStore(consumerRoot);
+  const heartbeat = await store.getDaemonHeartbeat();
+  const live =
+    !!heartbeat &&
+    Date.now() - Date.parse(heartbeat.last_tick_at) <= DAEMON_FRESH_MS;
+  return { live, heartbeat, now: new Date().toISOString() };
 }
 
 export async function startUiServer(opts: UiServerOptions): Promise<string> {
