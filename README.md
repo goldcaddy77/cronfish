@@ -378,6 +378,18 @@ as a single job instead of many fast fires.
   Code CLI as `--append-system-prompt` when running `.md` jobs. See
   [Claude entrypoint](#claude-entrypoint--md-jobs) below.
 - **`alerts`** — see [Alerts](#alerts) below.
+- **`store`** — where the run ledger lives. Omit it for the default SQLite file at
+  `.cronfish/db.sqlite`. For Postgres (Bun's built-in `Bun.sql`, no extra dependency):
+
+  ```json
+  { "store": { "type": "postgres", "url_env": "CRONFISH_PG_URL", "schema": "cron" } }
+  ```
+
+  `url_env` names an environment variable holding the connection URL (or pass `url` inline);
+  `schema` defaults to `cron` and is created and migrated on first open. Connection use is kept
+  small on purpose: the daemon, CLI and dashboard each use a pool of at most 2 connections that
+  close after 20s idle, and each job run opens exactly one connection, holds it for the run, and
+  closes it when the run ends.
 
 ## Claude entrypoint — `.md` jobs
 
