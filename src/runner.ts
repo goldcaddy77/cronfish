@@ -129,35 +129,46 @@ function lockPath(slug: string): string {
 // never removes a lock another runner holds.
 let heldLockPath: string | null = null;
 
-function tryAcquireLock(slug: string): boolean {
-  const path = lockPath(slug);
-  // Write the pid to a private file, then hard-link it into place: link()
-  // fails if the lock exists, and a lock that does appear already holds a pid.
-  // Creating the lock and then writing it left a window where a second runner
-  // read an empty file, took it for corrupt, removed it and ran concurrently.
+// Take the pid lock at `path` for this process. The pid goes into a private
+// staging file first, which is then hard-linked into place: link() fails if
+// the lock exists, so the lock appears already holding a pid. Creating the
+// lock and then writing it left a window where a second runner read an empty
+// file, took it for corrupt, removed it and ran concurrently. `onVisible` is a
+// test seam that runs the instant the lock exists at `path`.
+export function tryAcquirePidLock(
+  path: string,
+  onVisible?: () => void,
+): boolean {
   const tmp = `${path}.${process.pid}.tmp`;
   writeFileSync(tmp, String(process.pid));
   try {
     linkSync(tmp, path);
-    heldLockPath = path;
+    onVisible?.();
     return true;
   } catch {
     if (!existsSync(path)) return false;
     const pid = parseInt(readFileSync(path, "utf-8").trim(), 10);
     if (Number.isNaN(pid)) {
       safeRm(path);
-      return tryAcquireLock(slug);
+      return tryAcquirePidLock(path, onVisible);
     }
     try {
       process.kill(pid, 0);
       return false;
     } catch {
       safeRm(path);
-      return tryAcquireLock(slug);
+      return tryAcquirePidLock(path, onVisible);
     }
   } finally {
     safeRm(tmp);
   }
+}
+
+function tryAcquireLock(slug: string): boolean {
+  const path = lockPath(slug);
+  if (!tryAcquirePidLock(path)) return false;
+  heldLockPath = path;
+  return true;
 }
 
 function releaseLock(): void {

@@ -16,6 +16,7 @@ import {
   buildClaudeArgs,
   resolveEntrypoint,
   resolveStatus,
+  tryAcquirePidLock,
 } from "../src/runner.ts";
 import { openStore } from "../src/store/index.ts";
 import { loadJob, type JobMeta } from "../src/jobs.ts";
@@ -70,6 +71,48 @@ function latestLog(root: string, slug: string): string {
 function lockPath(root: string, slug: string): string {
   return join(root, ".cronfish", "locks", slug, "runner.pid");
 }
+
+describe("tryAcquirePidLock", () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "cronfish-lock-"));
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("the lock holds its owner's pid the instant it exists", () => {
+    const path = join(dir, "runner.pid");
+    let seen: string | null = null;
+    let rival: boolean | null = null;
+    const got = tryAcquirePidLock(path, () => {
+      // A second runner arriving right now must see a held lock, not an
+      // empty file it would take for corrupt and steal.
+      seen = readFileSync(path, "utf-8");
+      rival = tryAcquirePidLock(path);
+    });
+    expect(got).toBe(true);
+    expect(seen).toBe(String(process.pid));
+    expect(rival).toBe(false);
+    expect(readFileSync(path, "utf-8")).toBe(String(process.pid));
+    expect(readdirSync(dir)).toEqual(["runner.pid"]);
+  });
+
+  test("takes over a lock whose owner is gone", () => {
+    const path = join(dir, "runner.pid");
+    const dead = Bun.spawnSync(["true"]).pid;
+    writeFileSync(path, String(dead));
+    expect(tryAcquirePidLock(path)).toBe(true);
+    expect(readFileSync(path, "utf-8")).toBe(String(process.pid));
+  });
+
+  test("refuses a lock a live process holds", () => {
+    const path = join(dir, "runner.pid");
+    writeFileSync(path, String(process.ppid));
+    expect(tryAcquirePidLock(path)).toBe(false);
+    expect(readFileSync(path, "utf-8")).toBe(String(process.ppid));
+  });
+});
 
 describe("runner", () => {
   let root: string;
