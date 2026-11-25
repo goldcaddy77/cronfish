@@ -39,6 +39,13 @@ function defaultRun(
       if (code === 0) resolve();
       else reject(new Error(`shell adapter: command exited ${code}`));
     });
+    // The JSON payload on stdin is optional for the command; one that exits
+    // without reading it (a notifier that uses only the env vars) breaks the
+    // pipe under the write. That EPIPE is expected and harmless; the exit
+    // code still decides success. Unhandled, it crashed the caller.
+    child.stdin.on("error", (e: NodeJS.ErrnoException) => {
+      if (e.code !== "EPIPE") reject(e);
+    });
     child.stdin.end(stdin);
   });
 }
