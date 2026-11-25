@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
+  chmodSync,
   closeSync,
   existsSync,
   mkdirSync,
@@ -16,7 +17,9 @@ import {
   buildClaudeArgs,
   resolveEntrypoint,
   resolveStatus,
+  tryAcquireJobLock,
 } from "../src/runner.ts";
+import { releaseFlock } from "../src/oneTime.ts";
 import { openStore } from "../src/store/index.ts";
 import { loadJob, type JobMeta } from "../src/jobs.ts";
 
@@ -70,6 +73,140 @@ function latestLog(root: string, slug: string): string {
 function lockPath(root: string, slug: string): string {
   return join(root, ".cronfish", "locks", slug, "runner.pid");
 }
+
+// The pid a lock file names (its leading digits, as any runner reads it).
+function lockPid(path: string): number {
+  return parseInt(readFileSync(path, "utf-8"), 10);
+}
+
+// Is the job lock at `path` free right now? Takes and drops it.
+function lockIsFree(path: string): boolean {
+  const h = tryAcquireJobLock(path);
+  if (!h) return false;
+  releaseFlock(h);
+  return true;
+}
+
+// A child process that takes the lock at `path`, prints the outcome, and
+// holds it until killed.
+function spawnLockHolder(path: string): Bun.Subprocess<"ignore", "pipe", "inherit"> {
+  const code = `
+    const { tryAcquireJobLock } = await import(${JSON.stringify(RUNNER)});
+    const h = tryAcquireJobLock(${JSON.stringify(path)});
+    console.log(h ? "held" : "refused");
+    setInterval(() => {}, 1000);
+  `;
+  return Bun.spawn(["bun", "-e", code], { stdout: "pipe", stderr: "inherit" });
+}
+
+async function firstLine(proc: Bun.Subprocess<"ignore", "pipe", "inherit">): Promise<string> {
+  const reader = proc.stdout.getReader();
+  let buf = "";
+  while (!buf.includes("\n")) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += new TextDecoder().decode(value);
+  }
+  reader.releaseLock();
+  return buf.trim();
+}
+
+describe("tryAcquireJobLock", () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "cronfish-lock-"));
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("excludes a second holder until released, and records the pid", () => {
+    const path = join(dir, "runner.pid");
+    const h = tryAcquireJobLock(path);
+    expect(h).not.toBeNull();
+    expect(lockPid(path)).toBe(process.pid);
+    expect(tryAcquireJobLock(path)).toBeNull();
+    releaseFlock(h!);
+    expect(lockIsFree(path)).toBe(true);
+  });
+
+  test("a lock file this process cannot open throws, not 'held'", () => {
+    const path = join(dir, "runner.pid");
+    writeFileSync(path, "");
+    chmodSync(path, 0o200);
+    expect(() => tryAcquireJobLock(path)).toThrow();
+  });
+
+  test("a live bare pid from an older pid-file runner counts as held", () => {
+    const path = join(dir, "runner.pid");
+    writeFileSync(path, String(process.ppid));
+    expect(tryAcquireJobLock(path)).toBeNull();
+    expect(readFileSync(path, "utf-8")).toBe(String(process.ppid));
+  });
+
+  test("a dead bare pid is simply overwritten", () => {
+    const path = join(dir, "runner.pid");
+    writeFileSync(path, String(Bun.spawnSync(["true"]).pid));
+    const h = tryAcquireJobLock(path);
+    expect(h).not.toBeNull();
+    expect(lockPid(path)).toBe(process.pid);
+    releaseFlock(h!);
+  });
+
+  test("a flock runner's record is not mistaken for a pid-file holder", () => {
+    // Left by a flock runner that has since exited, naming a pid that is now
+    // some unrelated live process: the flock, not the content, decides.
+    const path = join(dir, "runner.pid");
+    writeFileSync(path, `${process.ppid}\nflock\n`);
+    const h = tryAcquireJobLock(path);
+    expect(h).not.toBeNull();
+    releaseFlock(h!);
+  });
+
+  test("an older pid-file runner sees a held lock as running", async () => {
+    const path = join(dir, "runner.pid");
+    const holder = spawnLockHolder(path);
+    try {
+      expect(await firstLine(holder)).toBe("held");
+      // The pid-file runner's own check, verbatim: O_EXCL create fails, then
+      // parseInt of the content and a liveness probe decide.
+      expect(() => openSync(path, "wx")).toThrow();
+      const pid = parseInt(readFileSync(path, "utf-8").trim(), 10);
+      expect(pid).toBe(holder.pid);
+      expect(() => process.kill(pid, 0)).not.toThrow();
+    } finally {
+      holder.kill("SIGKILL");
+      await holder.exited;
+    }
+  }, 15_000);
+
+  test("a holder killed with SIGKILL frees the lock at once", async () => {
+    const path = join(dir, "runner.pid");
+    const holder = spawnLockHolder(path);
+    expect(await firstLine(holder)).toBe("held");
+    expect(lockIsFree(path)).toBe(false);
+    holder.kill("SIGKILL");
+    await holder.exited;
+    // No stale lock to detect or take over: the kernel released it.
+    expect(lockIsFree(path)).toBe(true);
+  }, 15_000);
+
+  test("of many processes racing for the lock, exactly one gets it", async () => {
+    const path = join(dir, "runner.pid");
+    // Start from a file a dead run left behind, the case a pid-file lock
+    // had to take over.
+    writeFileSync(path, String(Bun.spawnSync(["true"]).pid));
+    const racers = Array.from({ length: 6 }, () => spawnLockHolder(path));
+    try {
+      const outcomes = await Promise.all(racers.map(firstLine));
+      expect(outcomes.filter((o) => o === "held").length).toBe(1);
+      expect(outcomes.filter((o) => o === "refused").length).toBe(5);
+    } finally {
+      for (const r of racers) r.kill("SIGKILL");
+      await Promise.all(racers.map((r) => r.exited));
+    }
+  }, 30_000);
+});
 
 describe("runner", () => {
   let root: string;
@@ -152,19 +289,51 @@ export default async function run() {
 }
 `,
     );
-    // Pre-create lock pointing at this test process (definitely alive).
+    // This test process holds the lock.
     const lp = lockPath(root, "skip-ts");
     mkdirSync(join(root, ".cronfish", "locks", "skip-ts"), { recursive: true });
-    writeFileSync(lp, String(process.pid), "utf-8");
+    const held = tryAcquireJobLock(lp)!;
+    try {
+      const r = spawnRunner(root, job);
+      expect(r.code).toBe(0);
+      expect(r.out + r.err).toContain("concurrency=skip");
+      expect(existsSync(sentinel)).toBe(false);
+      // The runner did not claim it.
+      expect(lockPid(lp)).toBe(process.pid);
+    } finally {
+      releaseFlock(held);
+    }
+  });
+
+  test("a skip job yields to a live run of an older pid-file runner", () => {
+    const sentinel = join(root, "ran.txt");
+    const job = writeJob(
+      root,
+      "legacy.ts",
+      `export const config = {
+  schedule: "manual",
+  enabled: true,
+  concurrency: "skip",
+  timeout: 5,
+};
+export default async function run() {
+  const fs = await import("node:fs");
+  fs.writeFileSync(${JSON.stringify(sentinel)}, "ran");
+}
+`,
+    );
+    // An older runner's lock: a bare live pid and no flock.
+    const lp = lockPath(root, "legacy-ts");
+    mkdirSync(join(root, ".cronfish", "locks", "legacy-ts"), { recursive: true });
+    writeFileSync(lp, String(process.ppid));
     const r = spawnRunner(root, job);
     expect(r.code).toBe(0);
     expect(r.out + r.err).toContain("concurrency=skip");
     expect(existsSync(sentinel)).toBe(false);
-    // Pre-existing lock left in place — runner did not claim it.
-    expect(readFileSync(lp, "utf-8")).toBe(String(process.pid));
+    expect(readFileSync(lp, "utf-8")).toBe(String(process.ppid));
   });
 
-  test("stale PID lock is claimed and job runs", () => {
+  test("a lock file left by an old run does not block the job", () => {
     const sentinel = join(root, "ran.txt");
     const job = writeJob(
       root,
@@ -181,18 +350,73 @@ export default async function run() {
 }
 `,
     );
-    // Find a definitively dead PID by spawning sleep 0 and reading its pid.
-    const dead = Bun.spawnSync(["true"]);
-    const deadPid = dead.pid;
+    // A previous run's file, with a pid, but no process holding the flock.
     mkdirSync(join(root, ".cronfish", "locks", "stale-ts"), {
       recursive: true,
     });
-    writeFileSync(lockPath(root, "stale-ts"), String(deadPid), "utf-8");
+    writeFileSync(
+      lockPath(root, "stale-ts"),
+      String(Bun.spawnSync(["true"]).pid),
+      "utf-8",
+    );
     const r = spawnRunner(root, job);
     expect(r.code).toBe(0);
     expect(existsSync(sentinel)).toBe(true);
-    // Runner released its own lock on exit.
-    expect(existsSync(lockPath(root, "stale-ts"))).toBe(false);
+    // Released on exit.
+    expect(lockIsFree(lockPath(root, "stale-ts"))).toBe(true);
+  });
+
+  test("two runs of a skip job started together: exactly one runs", async () => {
+    const ran = join(root, "ran.txt");
+    const job = writeJob(
+      root,
+      "pair.ts",
+      `export const config = {
+  schedule: "manual",
+  enabled: true,
+  concurrency: "skip",
+  timeout: 30,
+};
+export default async function run() {
+  const fs = await import("node:fs");
+  fs.appendFileSync(${JSON.stringify(ran)}, "x");
+  await new Promise((r) => setTimeout(r, 3000));
+}
+`,
+    );
+    // A smoke test (process start-up is far slower than any lock window):
+    // from a previous run's file, two simultaneous runs still yield one.
+    mkdirSync(join(root, ".cronfish", "locks", "pair-ts"), { recursive: true });
+    writeFileSync(lockPath(root, "pair-ts"), String(Bun.spawnSync(["true"]).pid));
+    const spawnOne = () =>
+      Bun.spawn(["bun", RUNNER, job], {
+        stdout: "ignore",
+        stderr: "ignore",
+        cwd: root,
+        env: { ...process.env, CRONFISH_CONSUMER_ROOT: root },
+      });
+    const procs = [spawnOne(), spawnOne()];
+    const codes = await Promise.all(procs.map((p) => p.exited));
+    expect(codes).toEqual([0, 0]);
+    expect(readFileSync(ran, "utf-8")).toBe("x");
+  }, 30_000);
+
+  test("a one-time job whose file cannot be opened fails loudly", () => {
+    const dirOT = join(root, "cron", "one-time");
+    mkdirSync(dirOT, { recursive: true });
+    const job = join(dirOT, "ro.ts");
+    const runAt = new Date(Date.now() + 60_000).toISOString();
+    writeFileSync(
+      job,
+      `export const config = { run_at: ${JSON.stringify(runAt)}, enabled: true };
+export default async function run() {}
+`,
+    );
+    chmodSync(job, 0o444);
+    const r = spawnRunner(root, job, { HOME: root });
+    // Not "lock held by another process", which would exit 0 silently.
+    expect(r.code).not.toBe(0);
+    expect(r.out + r.err).toContain("EACCES");
   });
 
   test("SIGTERM releases the lock", async () => {
@@ -222,10 +446,61 @@ export default async function run() {
     while (!existsSync(lp) && Date.now() < deadline) {
       await Bun.sleep(50);
     }
-    expect(existsSync(lp)).toBe(true);
+    // The runner writes its pid only after it holds the flock, so wait for
+    // that before probing (a probe in between would take the lock itself).
+    const held = Date.now() + 5000;
+    const holds = () => {
+      try {
+        return lockPid(lp) === proc.pid;
+      } catch {
+        return false;
+      }
+    };
+    while (!holds() && Date.now() < held) await Bun.sleep(50);
+    expect(holds()).toBe(true);
+    expect(lockIsFree(lp)).toBe(false);
     proc.kill("SIGTERM");
     await proc.exited;
-    expect(existsSync(lp)).toBe(false);
+    expect(lockIsFree(lp)).toBe(true);
+  }, 15_000);
+
+  test("SIGTERM while queued for the lock leaves the holder's lock alone", async () => {
+    const job = writeJob(
+      root,
+      "queued.ts",
+      `export const config = {
+  schedule: "manual",
+  enabled: true,
+  concurrency: "queue",
+  timeout: 60,
+};
+export default async function run() {}
+`,
+    );
+    // Another process (this test runner) holds the lock.
+    const lp = lockPath(root, "queued-ts");
+    mkdirSync(join(root, ".cronfish", "locks", "queued-ts"), {
+      recursive: true,
+    });
+    const held = tryAcquireJobLock(lp)!;
+    try {
+      const proc = Bun.spawn(["bun", RUNNER, job], {
+        stdout: "ignore",
+        stderr: "ignore",
+        cwd: root,
+        env: { ...process.env, CRONFISH_CONSUMER_ROOT: root },
+      });
+      // Let the runner reach the lock wait, then stop it there.
+      await Bun.sleep(1500);
+      proc.kill("SIGTERM");
+      const code = await proc.exited;
+      expect(code).toBe(143);
+      // Still ours: the queued runner neither took nor disturbed it.
+      expect(lockIsFree(lp)).toBe(false);
+      expect(lockPid(lp)).toBe(process.pid);
+    } finally {
+      releaseFlock(held);
+    }
   }, 15_000);
 
   test("daemon env: links the run request, records scheduled_for, stamps last_run", async () => {

@@ -8,9 +8,11 @@ import { PostgresStore } from "../src/store/index.ts";
 import {
   DEFAULT_POOL_IDLE_TIMEOUT_S,
   DEFAULT_POOL_MAX,
+  RUNNER_POOL,
   poolOptions,
 } from "../src/store/postgres.ts";
 import { assertPgIdentifier } from "../src/store/postgres-queries.ts";
+import { resolvePgUrl, waitFor } from "./support/store-harness.ts";
 
 interface BunSqlLike {
   unsafe(text: string, values?: unknown[]): Promise<Record<string, unknown>[]>;
@@ -21,28 +23,7 @@ function newBunSql(url: string): BunSqlLike {
   return new SQL(url);
 }
 
-async function reachablePgUrl(): Promise<string | null> {
-  const explicit = process.env.CRONFISH_TEST_PG_URL;
-  const candidates = explicit
-    ? [explicit]
-    : [
-        "postgres://localhost:5432/postgres",
-        "postgres://localhost:5432/agent",
-      ];
-  for (const url of candidates) {
-    try {
-      const sql = newBunSql(url);
-      await sql.unsafe("SELECT 1");
-      await sql.end();
-      return url;
-    } catch {
-      /* next */
-    }
-  }
-  return null;
-}
-
-const PG_URL = await reachablePgUrl();
+const PG_URL = await resolvePgUrl();
 
 // The injection guard is pure — validate it even without a live Postgres.
 describe("postgres identifier guard", () => {
@@ -62,6 +43,19 @@ describe("postgres identifier guard", () => {
   });
 });
 
+// The test database is opt-in, and a configured one must be reachable.
+describe("test postgres resolution", () => {
+  test("no CRONFISH_TEST_PG_URL means no Postgres tests", async () => {
+    expect(await resolvePgUrl("")).toBeNull();
+  });
+
+  test("a set but unreachable URL fails loudly", async () => {
+    await expect(
+      resolvePgUrl("postgres://127.0.0.1:1/postgres"),
+    ).rejects.toThrow("CRONFISH_TEST_PG_URL is set but unreachable");
+  });
+});
+
 // The pool bound is pure too: defaults are small, callers can override.
 describe("postgres pool options", () => {
   test("defaults are a small pool with an idle timeout", () => {
@@ -71,6 +65,15 @@ describe("postgres pool options", () => {
       url: "postgres://x/y",
       max: 2,
       idleTimeout: 20,
+    });
+  });
+
+  test("the runner pool is one connection that never idles out", () => {
+    expect(RUNNER_POOL).toEqual({ max: 1, idleTimeout: 0 });
+    expect(poolOptions({ url: "postgres://x/y", ...RUNNER_POOL })).toEqual({
+      url: "postgres://x/y",
+      max: 1,
+      idleTimeout: 0,
     });
   });
 
@@ -196,6 +199,63 @@ if (!PG_URL) {
         await dropSchema(schema);
       }
     });
+
+    test("a runner-pool store does a whole run's ledger work on one backend", async () => {
+      const schema = ephemeral();
+      const tagged = `${url}${url.includes("?") ? "&" : "?"}application_name=${schema}`;
+      const probe = newBunSql(url);
+      const backends = async () =>
+        (
+          await probe.unsafe(
+            "SELECT pid FROM pg_stat_activity WHERE application_name = $1",
+            [schema],
+          )
+        ).map((r) => Number(r.pid));
+      // A fresh schema, so open() also runs the migration transaction.
+      const store = await PostgresStore.open({
+        url: tagged,
+        schema,
+        ...RUNNER_POOL,
+      });
+      try {
+        const opened = await backends();
+        expect(opened.length).toBe(1);
+
+        // The runner's ledger sequence, start to finish, with concurrent
+        // statements thrown in: they must queue on the one slot, not fail.
+        await store.upsertJob({
+          slug: "pool-probe",
+          path: "/tmp/pool-probe.ts",
+          kind: "ts",
+          enabled: true,
+          schedule: "manual",
+        });
+        const jobId = (await store.getJobIdBySlug("pool-probe"))!;
+        const inv = await store.startInvocation(jobId, "manual", "/tmp/x.log");
+        await Promise.all([
+          store.setInvocationLogPath(inv, "/tmp/y.log"),
+          store.listEnabledJobs(),
+          store.getJobIdBySlug("pool-probe"),
+        ]);
+        // Idle past a short timeout: the runner pool must keep its backend
+        // rather than close it and reconnect for the finish writes.
+        await Bun.sleep(1500);
+        await store.finishInvocation(inv, "ok", 0);
+        await store.setJobLastRun(jobId, new Date().toISOString(), "ok");
+        await store.getPreviousFinishedStatus(jobId, inv);
+
+        expect(await backends()).toEqual(opened);
+        await store.close();
+        // A backend leaves pg_stat_activity shortly after its client hangs up.
+        expect(await waitFor(async () => (await backends()).length === 0)).toBe(
+          true,
+        );
+      } finally {
+        await store.close();
+        await probe.end();
+        await dropSchema(schema);
+      }
+    }, 15_000);
 
     test("an invalid schema name is rejected before any DDL runs", async () => {
       await expect(

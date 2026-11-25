@@ -8,3 +8,4 @@ tmp/
 ui/node_modules/
 ui/.vite/
 ui/dist/.vite/
+.worktrees/

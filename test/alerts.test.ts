@@ -206,6 +206,9 @@ describe("slack_bot adapter", () => {
 });
 
 describe("shell adapter", () => {
+  const oversized = (): AlertPayload =>
+    ({ ...payload(), padding: "x".repeat(1 << 20) }) as AlertPayload;
+
   test("passes env vars + JSON stdin to command", async () => {
     let captured:
       | { command: string; env: Record<string, string>; stdin: string }
@@ -224,6 +227,21 @@ describe("shell adapter", () => {
     expect(captured!.env.CRONFISH_ALERT_SLUG).toBe("test-job");
     const stdinParsed = JSON.parse(captured!.stdin) as AlertPayload;
     expect(stdinParsed.slug).toBe("test-job");
+  });
+
+  test("a command that never reads stdin still succeeds", async () => {
+    // A stdin payload bigger than the pipe buffer guarantees the write
+    // outlives the command, so the pipe breaks under the adapter every time.
+    // The padding rides in a field the env vars do not carry.
+    const adapter = createShellAdapter({ command: "exit 0" });
+    await adapter.notify(oversized());
+  });
+
+  test("a failing command that never reads stdin reports its exit", async () => {
+    const adapter = createShellAdapter({ command: "exit 3" });
+    await expect(
+      adapter.notify(oversized()),
+    ).rejects.toThrow("command exited 3");
   });
 
   test("throws when command not configured", async () => {

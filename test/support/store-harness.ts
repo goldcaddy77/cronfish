@@ -375,28 +375,40 @@ function pgKit(sql: BunSqlLike, schema: string): StoreKit {
   };
 }
 
-// Resolve the test Postgres URL: explicit env var wins, else probe the two
-// common local defaults. Returns null (with a skip log) when none connect, so
-// the suite still passes without Postgres.
-async function resolvePgUrl(): Promise<string | null> {
-  const explicit = process.env.CRONFISH_TEST_PG_URL;
-  const candidates = explicit
-    ? [explicit]
-    : [
-        "postgres://localhost:5432/postgres",
-        "postgres://localhost:5432/agent",
-      ];
-  for (const url of candidates) {
-    try {
-      const sql = newBunSql(url);
-      await sql.unsafe("SELECT 1");
-      await sql.end();
-      return url;
-    } catch {
-      // try next candidate
-    }
+// The test Postgres URL, or null to skip the Postgres tests. Opt-in only:
+// set CRONFISH_TEST_PG_URL to a disposable database. The tests create and
+// drop throwaway `cronfish_test_*` schemas and spawn real runners against it,
+// so they never guess at whatever server happens to listen on localhost.
+// A URL that is set but unreachable throws: a typo or a stopped server must
+// fail the run, not pass it green with the Postgres tests skipped.
+export async function resolvePgUrl(
+  url: string | undefined = process.env.CRONFISH_TEST_PG_URL,
+): Promise<string | null> {
+  if (!url) return null;
+  const sql = newBunSql(url);
+  try {
+    await sql.unsafe("SELECT 1");
+  } catch (e) {
+    throw new Error(
+      `CRONFISH_TEST_PG_URL is set but unreachable: ${(e as Error).message}`,
+    );
+  } finally {
+    await sql.end().catch(() => {});
   }
-  return null;
+  return url;
+}
+
+// Poll `check` until it holds or `timeoutMs` passes. Returns the last result.
+export async function waitFor(
+  check: () => Promise<boolean>,
+  timeoutMs = 5000,
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (await check()) return true;
+    if (Date.now() >= deadline) return false;
+    await Bun.sleep(50);
+  }
 }
 
 // A per-run ephemeral schema so tests never pollute a real schema and parallel
@@ -439,7 +451,7 @@ if (pgUrl) {
 } else {
   // One line so a run without Postgres is self-explanatory, not silently sqlite-only.
   console.log(
-    "[store-harness] Postgres not reachable (set CRONFISH_TEST_PG_URL) — skipping postgres backend tests.",
+    "[store-harness] CRONFISH_TEST_PG_URL not set; skipping postgres backend tests.",
   );
 }
 

@@ -6,7 +6,7 @@
 // WorkingDirectory), so no shell pre-step is needed.
 //
 // Per-run log: <consumer>/.cronfish/logs/<slug>/<invocation-id>.log
-// Concurrency lock: <consumer>/.cronfish/locks/<slug>/runner.pid (atomic O_EXCL).
+// Concurrency lock: <consumer>/.cronfish/locks/<slug>/runner.pid (flock(2)).
 // Ledger DB: <consumer>/.cronfish/db.sqlite (failure-safe — DB errors warn
 // once and never block the run).
 
@@ -15,13 +15,15 @@ import {
   existsSync,
   mkdirSync,
   fstatSync,
+  ftruncateSync,
   openSync,
   readFileSync,
-  rmSync,
+  writeFileSync,
   writeSync,
 } from "node:fs";
 import { extname, join, resolve } from "node:path";
 import {
+  RUNNER_POOL,
   tryOpenStore as tryOpenStoreImpl,
   type AlertLedgerStatus,
   type CronStore,
@@ -114,44 +116,87 @@ function warn(msg: string): void {
   console.error(`[runner] WARN: ${msg}`);
 }
 
-// --- Concurrency lock (atomic create-or-fail) ---
+// --- Concurrency lock (flock) ---
+//
+// One lock file per job, held with flock(2) for the life of the run. The
+// kernel releases a flock when its holder exits, however it exits (SIGKILL
+// and crashes included), so there is never a stale lock to detect or take
+// over. That removes the races a pid-file lock has: two runners both taking
+// over the same stale lock, or a rival reading a lock before its pid is
+// written. The file is never removed (removing a flocked file lets a later
+// runner lock a fresh inode while another still holds the old one).
+//
+// Compatibility with runners from before the flock (an O_EXCL pid file at the
+// same path): a flock holder writes "<pid>\n<FLOCK_MARK>\n", whose leading
+// digits an older runner reads as a live pid and so skips; and a file holding
+// a bare pid was written by an older runner, which holds no flock, so a live
+// bare pid also counts as held. Only a run that straddles an upgrade ever
+// meets the other kind, and between the two kinds the guarantee is the older
+// runner's own: its create-then-write pid file has brief windows (a file seen
+// before its pid is written) in which two pid-file runners can both proceed,
+// and those same windows exist between a pid-file runner and a flock runner.
+
+const FLOCK_MARK = "flock";
 
 function lockPath(slug: string): string {
   return join(locksJobDir(slug), "runner.pid");
 }
 
-function tryAcquireLock(slug: string): boolean {
-  const path = lockPath(slug);
+// The concurrency lock this process holds, or null. Set in the same
+// synchronous step that takes it, so a signal handler (which only runs
+// between event-loop turns) always sees it in step with the kernel.
+let heldLock: FlockHandle | null = null;
+
+// The live pid an older, pid-file runner holds this lock under, or null.
+function pidFileHolder(content: string): number | null {
+  if (!/^\d+$/.test(content.trim())) return null;
+  const pid = parseInt(content.trim(), 10);
+  if (pid <= 0 || pid === process.pid) return null;
   try {
-    const fd = openSync(path, "wx");
-    writeSync(fd, String(process.pid));
-    closeSync(fd);
-    return true;
+    process.kill(pid, 0);
+    return pid;
   } catch {
-    if (!existsSync(path)) return false;
-    const pid = parseInt(readFileSync(path, "utf-8").trim(), 10);
-    if (Number.isNaN(pid)) {
-      safeRm(path);
-      return tryAcquireLock(slug);
-    }
-    try {
-      process.kill(pid, 0);
-      return false;
-    } catch {
-      safeRm(path);
-      return tryAcquireLock(slug);
-    }
+    return null;
   }
 }
 
-function releaseLock(slug: string): void {
-  safeRm(lockPath(slug));
+// Take the lock on `path` (created if missing). Returns the handle, or null
+// when another runner holds it. A lock file this process cannot open throws
+// rather than reading as "held": a skip-mode job would otherwise skip forever
+// with only a misleading "already running" line.
+export function tryAcquireJobLock(path: string): FlockHandle | null {
+  writeFileSync(path, "", { flag: "a" });
+  closeSync(openSync(path, "r+"));
+  const h = tryFlockExclusive(path);
+  if (!h) return null;
+  let content = "";
+  try {
+    content = readFileSync(path, "utf-8");
+  } catch {}
+  if (pidFileHolder(content) !== null) {
+    releaseFlock(h);
+    return null;
+  }
+  try {
+    ftruncateSync(h.fd, 0);
+    writeSync(h.fd, `${process.pid}\n${FLOCK_MARK}\n`, 0);
+  } catch {
+    // The pid is for humans and older runners; the flock is the lock.
+  }
+  return h;
 }
 
-function safeRm(path: string): void {
-  try {
-    rmSync(path);
-  } catch {}
+function tryAcquireLock(slug: string): boolean {
+  const h = tryAcquireJobLock(lockPath(slug));
+  if (!h) return false;
+  heldLock = h;
+  return true;
+}
+
+function releaseLock(): void {
+  if (heldLock === null) return;
+  releaseFlock(heldLock);
+  heldLock = null;
 }
 
 async function waitForLock(
@@ -498,7 +543,8 @@ async function execOnce(
 // --- Ledger helpers (failure-safe) ---
 
 async function tryOpenStore(): Promise<CronStore | null> {
-  const store = await tryOpenStoreImpl(consumerRoot());
+  // One connection for the whole run (RUNNER_POOL), closed in main's finally.
+  const store = await tryOpenStoreImpl(consumerRoot(), { pool: RUNNER_POOL });
   if (!store) warn(`open ledger DB failed`);
   return store;
 }
@@ -769,6 +815,26 @@ async function main(): Promise<void> {
   // unsleep / crash recovery can't double-fire the job. Lock is held for
   // the lifetime of this process; release is implicit on exit.
   let oneTimeLock: FlockHandle | null = null;
+
+  // Install signal handlers BEFORE any lock is taken, so a SIGTERM anywhere in
+  // the setup between taking a lock and registering the full `cleanup`
+  // handler (lock wait, DB open, log open) releases locks explicitly and exits
+  // 143/130. Both locks are flocks, which the kernel also frees on any exit,
+  // so this is belt and braces rather than the only release path. The handler
+  // only releases what this process actually holds (heldLock, oneTimeLock),
+  // so a SIGTERM while still queued leaves the holder's lock alone.
+  // Superseded by `cleanup` once the invocation state exists.
+  let releasing = false;
+  const earlyCleanup = (sig: NodeJS.Signals): void => {
+    if (releasing) return;
+    releasing = true;
+    releaseLock();
+    if (oneTimeLock) releaseFlock(oneTimeLock);
+    process.exit(sig === "SIGTERM" ? 143 : 130);
+  };
+  process.on("SIGTERM", earlyCleanup);
+  process.on("SIGINT", earlyCleanup);
+
   if (job.oneTime) {
     if (job.executedAt) {
       console.log(
@@ -776,6 +842,8 @@ async function main(): Promise<void> {
       );
       process.exit(0);
     }
+    // An unopenable job file must fail loudly, not read as "held elsewhere".
+    closeSync(openSync(abs, "r+"));
     oneTimeLock = tryFlockExclusive(abs);
     if (!oneTimeLock) {
       console.log(
@@ -838,23 +906,6 @@ async function main(): Promise<void> {
     }
   }
 
-  // Install lock-release signal handlers the instant a lock exists. There is
-  // real setup below (DB init, log open) before the full `cleanup` handler is
-  // registered, and a SIGTERM in that window would otherwise kill the process
-  // by default disposition — no handler runs, and the concurrency lockfile is
-  // orphaned (unlike the flock, it is not reclaimed by the OS on exit). This
-  // minimal handler is superseded by `cleanup` once the invocation state exists.
-  let releasing = false;
-  const earlyCleanup = (sig: NodeJS.Signals): void => {
-    if (releasing) return;
-    releasing = true;
-    if (job.concurrency) releaseLock(job.slug);
-    if (oneTimeLock) releaseFlock(oneTimeLock);
-    process.exit(sig === "SIGTERM" ? 143 : 130);
-  };
-  process.on("SIGTERM", earlyCleanup);
-  process.on("SIGINT", earlyCleanup);
-
   const store = await tryOpenStore();
 
   // Open the log file BEFORE we know the invocation id (we need a real
@@ -914,7 +965,7 @@ async function main(): Promise<void> {
       "crashed",
       sig === "SIGTERM" ? 143 : 130,
     );
-    if (job.concurrency) releaseLock(job.slug);
+    releaseLock();
     if (oneTimeLock) releaseFlock(oneTimeLock);
     process.exit(sig === "SIGTERM" ? 143 : 130);
   };
@@ -974,7 +1025,7 @@ async function main(): Promise<void> {
       if (oneTimeLock) releaseFlock(oneTimeLock);
     }
     closeSync(fd);
-    if (job.concurrency) releaseLock(job.slug);
+    releaseLock();
     await tryFinishInvocation(
       store,
       invocationId,

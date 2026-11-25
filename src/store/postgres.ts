@@ -62,15 +62,33 @@ interface BunSql extends BunSqlTx {
 export const DEFAULT_POOL_MAX = 2;
 export const DEFAULT_POOL_IDLE_TIMEOUT_S = 20;
 
-export interface PostgresStoreOptions {
-  url: string;
-  schema: string;
+export interface PostgresPoolOptions {
   // Maximum pooled connections. Default DEFAULT_POOL_MAX.
   max?: number;
-  // Seconds an idle connection stays open before it is closed.
-  // Default DEFAULT_POOL_IDLE_TIMEOUT_S.
+  // Seconds an idle connection stays open before it is closed; 0 keeps it
+  // open until the store closes. Default DEFAULT_POOL_IDLE_TIMEOUT_S.
   idleTimeout?: number;
 }
+
+export interface PostgresStoreOptions extends PostgresPoolOptions {
+  url: string;
+  schema: string;
+}
+
+// The pool a job runner opens: exactly one connection for the life of the run.
+//
+// A runner is a short-lived process that writes its ledger rows one statement
+// at a time and never runs two queries at once, so a second slot is pure cost:
+// Bun.sql opens every slot it is allowed, and each new Postgres connection is a
+// fresh server backend. With many runs an hour that churn adds up, so the
+// runner takes one slot. It also never lets that slot idle out: a run that
+// outlives the idle timeout would otherwise close it mid-job and open a new one
+// at finish. Holding one quiet connection for the run is cheaper than
+// reconnecting, and `close()` at the end of the run releases it.
+export const RUNNER_POOL: Readonly<Required<PostgresPoolOptions>> = {
+  max: 1,
+  idleTimeout: 0,
+};
 
 interface BunSqlOptions {
   url: string;
