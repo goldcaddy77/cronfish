@@ -8,6 +8,7 @@ import { PostgresStore } from "../src/store/index.ts";
 import {
   DEFAULT_POOL_IDLE_TIMEOUT_S,
   DEFAULT_POOL_MAX,
+  RUNNER_POOL,
   poolOptions,
 } from "../src/store/postgres.ts";
 import { assertPgIdentifier } from "../src/store/postgres-queries.ts";
@@ -71,6 +72,15 @@ describe("postgres pool options", () => {
       url: "postgres://x/y",
       max: 2,
       idleTimeout: 20,
+    });
+  });
+
+  test("the runner pool is one connection that never idles out", () => {
+    expect(RUNNER_POOL).toEqual({ max: 1, idleTimeout: 0 });
+    expect(poolOptions({ url: "postgres://x/y", ...RUNNER_POOL })).toEqual({
+      url: "postgres://x/y",
+      max: 1,
+      idleTimeout: 0,
     });
   });
 
@@ -193,6 +203,62 @@ if (!PG_URL) {
       } finally {
         await probe.end();
         await store.close();
+        await dropSchema(schema);
+      }
+    });
+
+    test("a runner-pool store does a whole run's ledger work on one backend", async () => {
+      const schema = ephemeral();
+      const tagged = `${url}${url.includes("?") ? "&" : "?"}application_name=${schema}`;
+      const probe = newBunSql(url);
+      const backends = async () =>
+        (
+          await probe.unsafe(
+            "SELECT pid FROM pg_stat_activity WHERE application_name = $1",
+            [schema],
+          )
+        ).map((r) => Number(r.pid));
+      // A fresh schema, so open() also runs the migration transaction.
+      const store = await PostgresStore.open({
+        url: tagged,
+        schema,
+        ...RUNNER_POOL,
+      });
+      try {
+        const opened = await backends();
+        expect(opened.length).toBe(1);
+
+        // The runner's ledger sequence, start to finish, with concurrent
+        // statements thrown in: they must queue on the one slot, not fail.
+        await store.upsertJob({
+          slug: "pool-probe",
+          path: "/tmp/pool-probe.ts",
+          kind: "ts",
+          enabled: true,
+          schedule: "manual",
+        });
+        const jobId = (await store.getJobIdBySlug("pool-probe"))!;
+        const inv = await store.startInvocation(jobId, "manual", "/tmp/x.log");
+        await Promise.all([
+          store.setInvocationLogPath(inv, "/tmp/y.log"),
+          store.listEnabledJobs(),
+          store.getJobIdBySlug("pool-probe"),
+        ]);
+        // Idle past a short timeout: the runner pool must keep its backend
+        // rather than close it and reconnect for the finish writes.
+        await Bun.sleep(1500);
+        await store.finishInvocation(inv, "ok", 0);
+        await store.setJobLastRun(jobId, new Date().toISOString(), "ok");
+        await store.getPreviousFinishedStatus(jobId, inv);
+
+        expect(await backends()).toEqual(opened);
+      } finally {
+        await store.close();
+      }
+      try {
+        expect(await backends()).toEqual([]);
+      } finally {
+        await probe.end();
         await dropSchema(schema);
       }
     });

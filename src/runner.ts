@@ -22,6 +22,7 @@ import {
 } from "node:fs";
 import { extname, join, resolve } from "node:path";
 import {
+  RUNNER_POOL,
   tryOpenStore as tryOpenStoreImpl,
   type AlertLedgerStatus,
   type CronStore,
@@ -498,7 +499,8 @@ async function execOnce(
 // --- Ledger helpers (failure-safe) ---
 
 async function tryOpenStore(): Promise<CronStore | null> {
-  const store = await tryOpenStoreImpl(consumerRoot());
+  // One connection for the whole run (RUNNER_POOL), closed in main's finally.
+  const store = await tryOpenStoreImpl(consumerRoot(), { pool: RUNNER_POOL });
   if (!store) warn(`open ledger DB failed`);
   return store;
 }
