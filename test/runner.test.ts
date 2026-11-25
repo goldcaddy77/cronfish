@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
+  chmodSync,
   closeSync,
   existsSync,
   mkdirSync,
@@ -16,6 +17,7 @@ import {
   buildClaudeArgs,
   resolveEntrypoint,
   resolveStatus,
+  legacyLockHolder,
   tryAcquireJobLock,
 } from "../src/runner.ts";
 import { releaseFlock } from "../src/oneTime.ts";
@@ -124,6 +126,22 @@ describe("tryAcquireJobLock", () => {
     expect(lockIsFree(path)).toBe(true);
   });
 
+  test("a lock file this process cannot open throws, not 'held'", () => {
+    const path = join(dir, "runner.lock");
+    writeFileSync(path, "");
+    chmodSync(path, 0o200);
+    expect(() => tryAcquireJobLock(path)).toThrow();
+  });
+
+  test("a live legacy runner.pid counts as held; a dead one is cleared", () => {
+    writeFileSync(join(dir, "runner.pid"), String(process.ppid));
+    expect(legacyLockHolder(dir)).toBe(process.ppid);
+    writeFileSync(join(dir, "runner.pid"), String(Bun.spawnSync(["true"]).pid));
+    expect(legacyLockHolder(dir)).toBeNull();
+    expect(existsSync(join(dir, "runner.pid"))).toBe(false);
+    expect(legacyLockHolder(dir)).toBeNull();
+  });
+
   test("a holder killed with SIGKILL frees the lock at once", async () => {
     const path = join(dir, "runner.lock");
     const holder = spawnLockHolder(path);
@@ -137,6 +155,9 @@ describe("tryAcquireJobLock", () => {
 
   test("of many processes racing for the lock, exactly one gets it", async () => {
     const path = join(dir, "runner.lock");
+    // Start from a file a dead run left behind, the case a pid-file lock
+    // had to take over.
+    writeFileSync(path, String(Bun.spawnSync(["true"]).pid));
     const racers = Array.from({ length: 6 }, () => spawnLockHolder(path));
     try {
       const outcomes = await Promise.all(racers.map(firstLine));
@@ -275,6 +296,40 @@ export default async function run() {
     expect(lockIsFree(lockPath(root, "stale-ts"))).toBe(true);
   });
 
+  test("two runs of a skip job started together: exactly one runs", async () => {
+    const ran = join(root, "ran.txt");
+    const job = writeJob(
+      root,
+      "pair.ts",
+      `export const config = {
+  schedule: "manual",
+  enabled: true,
+  concurrency: "skip",
+  timeout: 30,
+};
+export default async function run() {
+  const fs = await import("node:fs");
+  fs.appendFileSync(${JSON.stringify(ran)}, "x");
+  await new Promise((r) => setTimeout(r, 3000));
+}
+`,
+    );
+    // A previous run's file, from a run that is long gone.
+    mkdirSync(join(root, ".cronfish", "locks", "pair-ts"), { recursive: true });
+    writeFileSync(lockPath(root, "pair-ts"), "12345");
+    const spawnOne = () =>
+      Bun.spawn(["bun", RUNNER, job], {
+        stdout: "ignore",
+        stderr: "ignore",
+        cwd: root,
+        env: { ...process.env, CRONFISH_CONSUMER_ROOT: root },
+      });
+    const procs = [spawnOne(), spawnOne()];
+    const codes = await Promise.all(procs.map((p) => p.exited));
+    expect(codes).toEqual([0, 0]);
+    expect(readFileSync(ran, "utf-8")).toBe("x");
+  }, 30_000);
+
   test("SIGTERM releases the lock", async () => {
     const job = writeJob(
       root,
@@ -302,11 +357,19 @@ export default async function run() {
     while (!existsSync(lp) && Date.now() < deadline) {
       await Bun.sleep(50);
     }
-    // Wait for the runner to hold it.
+    // The runner writes its pid only after it holds the flock, so wait for
+    // that before probing (a probe in between would take the lock itself).
     const held = Date.now() + 5000;
-    while (lockIsFree(lp) && Date.now() < held) await Bun.sleep(50);
+    const holds = () => {
+      try {
+        return readFileSync(lp, "utf-8") === String(proc.pid);
+      } catch {
+        return false;
+      }
+    };
+    while (!holds() && Date.now() < held) await Bun.sleep(50);
+    expect(holds()).toBe(true);
     expect(lockIsFree(lp)).toBe(false);
-    expect(readFileSync(lp, "utf-8")).toBe(String(proc.pid));
     proc.kill("SIGTERM");
     await proc.exited;
     expect(lockIsFree(lp)).toBe(true);

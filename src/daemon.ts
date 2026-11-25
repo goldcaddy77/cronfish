@@ -763,8 +763,8 @@ export function makeRunnerSpawn(consumerRoot: string): SpawnFn {
 // Two daemons on one consumer (a foreground debug run next to the launchd
 // one) would BOTH dispatch every due job. Startup refuses when (a) the
 // heartbeat row shows another live pid ticking recently, or (b) the exclusive
-// lock file is held by a live pid. Same atomic O_EXCL + stale-takeover
-// pattern as the runner's concurrency locks.
+// lock file is held by a live pid (atomic O_EXCL with a stale-takeover
+// read-back; see acquireDaemonLock).
 
 // A heartbeat this fresh from another pid proves a live daemon (1 Hz ticks
 // make anything past 10s a wedge or a dead process). Mirrors cli.ts's

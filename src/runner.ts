@@ -18,6 +18,7 @@ import {
   ftruncateSync,
   openSync,
   readFileSync,
+  rmSync,
   writeFileSync,
   writeSync,
 } from "node:fs";
@@ -137,9 +138,12 @@ function lockPath(slug: string): string {
 let heldLock: FlockHandle | null = null;
 
 // Take the flock on `path` (created if missing). Returns the handle, or null
-// when another process holds it.
+// when another process holds it. A lock file this process cannot open throws
+// rather than reading as "held": a skip-mode job would otherwise skip forever
+// with only a misleading "already running" line.
 export function tryAcquireJobLock(path: string): FlockHandle | null {
   writeFileSync(path, "", { flag: "a" });
+  closeSync(openSync(path, "r+"));
   const h = tryFlockExclusive(path);
   if (!h) return null;
   try {
@@ -151,9 +155,36 @@ export function tryAcquireJobLock(path: string): FlockHandle | null {
   return h;
 }
 
+// Runners before the flock lock held `runner.pid` (an O_EXCL pid file). While
+// one of those may still be running a job (the run that straddles an
+// upgrade), a live pid there also counts as held; a dead one is removed.
+export function legacyLockHolder(dir: string): number | null {
+  const legacy = join(dir, "runner.pid");
+  let pid: number;
+  try {
+    pid = parseInt(readFileSync(legacy, "utf-8").trim(), 10);
+  } catch {
+    return null;
+  }
+  if (!Number.isNaN(pid) && pid !== process.pid) {
+    try {
+      process.kill(pid, 0);
+      return pid;
+    } catch {}
+  }
+  try {
+    rmSync(legacy);
+  } catch {}
+  return null;
+}
+
 function tryAcquireLock(slug: string): boolean {
   const h = tryAcquireJobLock(lockPath(slug));
   if (!h) return false;
+  if (legacyLockHolder(locksJobDir(slug)) !== null) {
+    releaseFlock(h);
+    return false;
+  }
   heldLock = h;
   return true;
 }
