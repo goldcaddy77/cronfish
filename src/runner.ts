@@ -131,7 +131,10 @@ function warn(msg: string): void {
 // digits an older runner reads as a live pid and so skips; and a file holding
 // a bare pid was written by an older runner, which holds no flock, so a live
 // bare pid also counts as held. Only a run that straddles an upgrade ever
-// meets the other kind.
+// meets the other kind, and between the two kinds the guarantee is the older
+// runner's own: its create-then-write pid file has brief windows (a file seen
+// before its pid is written) in which two pid-file runners can both proceed,
+// and those same windows exist between a pid-file runner and a flock runner.
 
 const FLOCK_MARK = "flock";
 
@@ -175,8 +178,10 @@ export function tryAcquireJobLock(path: string): FlockHandle | null {
     return null;
   }
   try {
-    ftruncateSync(h.fd, 0);
-    writeSync(h.fd, `${process.pid}\n${FLOCK_MARK}\n`, 0);
+    // Overwrite in place, then trim: the file never reads empty while held.
+    const rec = `${process.pid}\n${FLOCK_MARK}\n`;
+    writeSync(h.fd, rec, 0);
+    ftruncateSync(h.fd, Buffer.byteLength(rec));
   } catch {
     // The pid is for humans and older runners; the flock is the lock.
   }

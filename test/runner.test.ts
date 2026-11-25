@@ -163,13 +163,22 @@ describe("tryAcquireJobLock", () => {
     releaseFlock(h!);
   });
 
-  test("an older pid-file runner reads a held lock as a live pid", () => {
-    // v0.23-style check: parseInt of the content, then a liveness probe.
+  test("an older pid-file runner sees a held lock as running", async () => {
     const path = join(dir, "runner.pid");
-    const h = tryAcquireJobLock(path)!;
-    expect(lockPid(path)).toBe(process.pid);
-    releaseFlock(h);
-  });
+    const holder = spawnLockHolder(path);
+    try {
+      expect(await firstLine(holder)).toBe("held");
+      // The pid-file runner's own check, verbatim: O_EXCL create fails, then
+      // parseInt of the content and a liveness probe decide.
+      expect(() => openSync(path, "wx")).toThrow();
+      const pid = parseInt(readFileSync(path, "utf-8").trim(), 10);
+      expect(pid).toBe(holder.pid);
+      expect(() => process.kill(pid, 0)).not.toThrow();
+    } finally {
+      holder.kill("SIGKILL");
+      await holder.exited;
+    }
+  }, 15_000);
 
   test("a holder killed with SIGKILL frees the lock at once", async () => {
     const path = join(dir, "runner.pid");
@@ -391,6 +400,24 @@ export default async function run() {
     expect(codes).toEqual([0, 0]);
     expect(readFileSync(ran, "utf-8")).toBe("x");
   }, 30_000);
+
+  test("a one-time job whose file cannot be opened fails loudly", () => {
+    const dirOT = join(root, "cron", "one-time");
+    mkdirSync(dirOT, { recursive: true });
+    const job = join(dirOT, "ro.ts");
+    const runAt = new Date(Date.now() + 60_000).toISOString();
+    writeFileSync(
+      job,
+      `export const config = { run_at: ${JSON.stringify(runAt)}, enabled: true };
+export default async function run() {}
+`,
+    );
+    chmodSync(job, 0o444);
+    const r = spawnRunner(root, job, { HOME: root });
+    // Not "lock held by another process", which would exit 0 silently.
+    expect(r.code).not.toBe(0);
+    expect(r.out + r.err).toContain("EACCES");
+  });
 
   test("SIGTERM releases the lock", async () => {
     const job = writeJob(
