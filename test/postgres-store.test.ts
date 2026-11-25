@@ -261,7 +261,7 @@ if (!PG_URL) {
         await probe.end();
         await dropSchema(schema);
       }
-    });
+    }, 15_000);
 
     test("an invalid schema name is rejected before any DDL runs", async () => {
       await expect(

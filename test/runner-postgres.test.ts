@@ -134,6 +134,7 @@ export default async function run() {
       } finally {
         await probe.end();
       }
-    });
+      // Spawns a real runner, like the runner.test.ts siblings.
+    }, 20_000);
   });
 }
