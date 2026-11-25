@@ -2,7 +2,7 @@
 // connection. Spawns the real runner on a consumer whose `.cronfish.json`
 // points at a test Postgres, has the job itself count the runner's backends
 // mid-run, then checks the ledger row landed and nothing was left open.
-// Gated on a reachable test Postgres, like test/postgres-store.test.ts.
+// Gated on a reachable test Postgres (resolvePgUrl), like the store tests.
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
@@ -14,6 +14,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { resolvePgUrl } from "./support/store-harness.ts";
 
 const RUNNER = new URL("../src/runner.ts", import.meta.url).pathname;
 
@@ -26,28 +27,7 @@ function newBunSql(url: string): BunSqlLike {
   return new SQL(url);
 }
 
-async function reachablePgUrl(): Promise<string | null> {
-  const explicit = process.env.CRONFISH_TEST_PG_URL;
-  const candidates = explicit
-    ? [explicit]
-    : [
-        "postgres://localhost:5432/postgres",
-        "postgres://localhost:5432/agent",
-      ];
-  for (const url of candidates) {
-    try {
-      const sql = newBunSql(url);
-      await sql.unsafe("SELECT 1");
-      await sql.end();
-      return url;
-    } catch {
-      /* next */
-    }
-  }
-  return null;
-}
-
-const PG_URL = await reachablePgUrl();
+const PG_URL = await resolvePgUrl();
 
 if (!PG_URL) {
   describe.skip("runner on a postgres store [no postgres]", () => {

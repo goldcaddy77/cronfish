@@ -375,17 +375,16 @@ function pgKit(sql: BunSqlLike, schema: string): StoreKit {
   };
 }
 
-// Resolve the test Postgres URL: explicit env var wins, else probe the two
-// common local defaults. Returns null (with a skip log) when none connect, so
-// the suite still passes without Postgres.
-async function resolvePgUrl(): Promise<string | null> {
+// Resolve the test Postgres URL: CRONFISH_TEST_PG_URL wins, else the stock
+// local default. Returns null when none connect, so the suite still passes
+// without Postgres. Point CRONFISH_TEST_PG_URL at a disposable server when the
+// local default holds data you care about: tests create and drop throwaway
+// `cronfish_test_*` schemas.
+export async function resolvePgUrl(): Promise<string | null> {
   const explicit = process.env.CRONFISH_TEST_PG_URL;
   const candidates = explicit
     ? [explicit]
-    : [
-        "postgres://localhost:5432/postgres",
-        "postgres://localhost:5432/agent",
-      ];
+    : ["postgres://localhost:5432/postgres"];
   for (const url of candidates) {
     try {
       const sql = newBunSql(url);

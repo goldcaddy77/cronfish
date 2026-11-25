@@ -12,6 +12,7 @@ import {
   poolOptions,
 } from "../src/store/postgres.ts";
 import { assertPgIdentifier } from "../src/store/postgres-queries.ts";
+import { resolvePgUrl } from "./support/store-harness.ts";
 
 interface BunSqlLike {
   unsafe(text: string, values?: unknown[]): Promise<Record<string, unknown>[]>;
@@ -22,28 +23,7 @@ function newBunSql(url: string): BunSqlLike {
   return new SQL(url);
 }
 
-async function reachablePgUrl(): Promise<string | null> {
-  const explicit = process.env.CRONFISH_TEST_PG_URL;
-  const candidates = explicit
-    ? [explicit]
-    : [
-        "postgres://localhost:5432/postgres",
-        "postgres://localhost:5432/agent",
-      ];
-  for (const url of candidates) {
-    try {
-      const sql = newBunSql(url);
-      await sql.unsafe("SELECT 1");
-      await sql.end();
-      return url;
-    } catch {
-      /* next */
-    }
-  }
-  return null;
-}
-
-const PG_URL = await reachablePgUrl();
+const PG_URL = await resolvePgUrl();
 
 // The injection guard is pure — validate it even without a live Postgres.
 describe("postgres identifier guard", () => {
@@ -252,12 +232,10 @@ if (!PG_URL) {
         await store.getPreviousFinishedStatus(jobId, inv);
 
         expect(await backends()).toEqual(opened);
-      } finally {
         await store.close();
-      }
-      try {
         expect(await backends()).toEqual([]);
       } finally {
+        await store.close();
         await probe.end();
         await dropSchema(schema);
       }
