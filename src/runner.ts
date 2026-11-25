@@ -133,31 +133,47 @@ let heldLockPath: string | null = null;
 // staging file first, which is then hard-linked into place: link() fails if
 // the lock exists, so the lock appears already holding a pid. Creating the
 // lock and then writing it left a window where a second runner read an empty
-// file, took it for corrupt, removed it and ran concurrently. `onVisible` is a
-// test seam that runs the instant the lock exists at `path`.
+// file, took it for corrupt, removed it and ran concurrently. A filesystem
+// without hard links falls back to create-then-write, which still excludes,
+// just with that narrow window. Test seams: `onVisible` runs the instant the
+// lock exists at `path`; `link` replaces linkSync.
+export interface PidLockSeams {
+  onVisible?: () => void;
+  link?: (from: string, to: string) => void;
+}
+
 export function tryAcquirePidLock(
   path: string,
-  onVisible?: () => void,
+  seams: PidLockSeams = {},
 ): boolean {
+  const link = seams.link ?? linkSync;
   const tmp = `${path}.${process.pid}.tmp`;
   writeFileSync(tmp, String(process.pid));
   try {
-    linkSync(tmp, path);
-    onVisible?.();
+    try {
+      link(tmp, path);
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code === "EEXIST") throw e;
+      // No hard links here: exclusive create, then write.
+      const fd = openSync(path, "wx");
+      writeSync(fd, String(process.pid));
+      closeSync(fd);
+    }
+    seams.onVisible?.();
     return true;
   } catch {
     if (!existsSync(path)) return false;
     const pid = parseInt(readFileSync(path, "utf-8").trim(), 10);
     if (Number.isNaN(pid)) {
       safeRm(path);
-      return tryAcquirePidLock(path, onVisible);
+      return tryAcquirePidLock(path, seams);
     }
     try {
       process.kill(pid, 0);
       return false;
     } catch {
       safeRm(path);
-      return tryAcquirePidLock(path, onVisible);
+      return tryAcquirePidLock(path, seams);
     }
   } finally {
     safeRm(tmp);

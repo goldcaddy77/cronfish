@@ -85,11 +85,13 @@ describe("tryAcquirePidLock", () => {
     const path = join(dir, "runner.pid");
     let seen: string | null = null;
     let rival: boolean | null = null;
-    const got = tryAcquirePidLock(path, () => {
-      // A second runner arriving right now must see a held lock, not an
-      // empty file it would take for corrupt and steal.
-      seen = readFileSync(path, "utf-8");
-      rival = tryAcquirePidLock(path);
+    const got = tryAcquirePidLock(path, {
+      onVisible: () => {
+        // A second runner arriving right now must see a held lock, not an
+        // empty file it would take for corrupt and steal.
+        seen = readFileSync(path, "utf-8");
+        rival = tryAcquirePidLock(path);
+      },
     });
     expect(got).toBe(true);
     expect(seen).toBe(String(process.pid));
@@ -104,6 +106,18 @@ describe("tryAcquirePidLock", () => {
     writeFileSync(path, String(dead));
     expect(tryAcquirePidLock(path)).toBe(true);
     expect(readFileSync(path, "utf-8")).toBe(String(process.pid));
+  });
+
+  test("falls back to create-then-write where hard links are unsupported", () => {
+    const path = join(dir, "runner.pid");
+    const noLinks = (): never => {
+      throw Object.assign(new Error("ENOTSUP"), { code: "ENOTSUP" });
+    };
+    expect(tryAcquirePidLock(path, { link: noLinks })).toBe(true);
+    expect(readFileSync(path, "utf-8")).toBe(String(process.pid));
+    // And it still excludes a second caller.
+    expect(tryAcquirePidLock(path, { link: noLinks })).toBe(false);
+    expect(readdirSync(dir)).toEqual(["runner.pid"]);
   });
 
   test("refuses a lock a live process holds", () => {

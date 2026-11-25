@@ -451,7 +451,7 @@ if (pgUrl) {
 } else {
   // One line so a run without Postgres is self-explanatory, not silently sqlite-only.
   console.log(
-    "[store-harness] Postgres not reachable (set CRONFISH_TEST_PG_URL) — skipping postgres backend tests.",
+    "[store-harness] CRONFISH_TEST_PG_URL not set; skipping postgres backend tests.",
   );
 }
 
