@@ -14,7 +14,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { resolvePgUrl } from "./support/store-harness.ts";
+import { resolvePgUrl, waitFor } from "./support/store-harness.ts";
 
 const RUNNER = new URL("../src/runner.ts", import.meta.url).pathname;
 
@@ -105,12 +105,18 @@ export default async function run() {
             WHERE j.slug = 'count-backends-ts'`,
         );
         expect(inv.map((r) => r.status)).toEqual(["ok"]);
-        // And nothing outlives the runner process.
-        const left = await probe.unsafe(
-          "SELECT pid FROM pg_stat_activity WHERE application_name = $1",
-          [schema],
+        // And nothing outlives the runner process. A backend leaves
+        // pg_stat_activity shortly after its client hangs up, so poll.
+        const gone = await waitFor(
+          async () =>
+            (
+              await probe.unsafe(
+                "SELECT pid FROM pg_stat_activity WHERE application_name = $1",
+                [schema],
+              )
+            ).length === 0,
         );
-        expect(left.length).toBe(0);
+        expect(gone).toBe(true);
       } finally {
         await probe.end();
       }

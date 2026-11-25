@@ -12,7 +12,7 @@ import {
   poolOptions,
 } from "../src/store/postgres.ts";
 import { assertPgIdentifier } from "../src/store/postgres-queries.ts";
-import { resolvePgUrl } from "./support/store-harness.ts";
+import { resolvePgUrl, waitFor } from "./support/store-harness.ts";
 
 interface BunSqlLike {
   unsafe(text: string, values?: unknown[]): Promise<Record<string, unknown>[]>;
@@ -233,7 +233,10 @@ if (!PG_URL) {
 
         expect(await backends()).toEqual(opened);
         await store.close();
-        expect(await backends()).toEqual([]);
+        // A backend leaves pg_stat_activity shortly after its client hangs up.
+        expect(await waitFor(async () => (await backends()).length === 0)).toBe(
+          true,
+        );
       } finally {
         await store.close();
         await probe.end();

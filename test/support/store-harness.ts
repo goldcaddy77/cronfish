@@ -375,27 +375,34 @@ function pgKit(sql: BunSqlLike, schema: string): StoreKit {
   };
 }
 
-// Resolve the test Postgres URL: CRONFISH_TEST_PG_URL wins, else the stock
-// local default. Returns null when none connect, so the suite still passes
-// without Postgres. Point CRONFISH_TEST_PG_URL at a disposable server when the
-// local default holds data you care about: tests create and drop throwaway
-// `cronfish_test_*` schemas.
+// The test Postgres URL, or null to skip the Postgres tests. Opt-in only:
+// set CRONFISH_TEST_PG_URL to a disposable database. The tests create and
+// drop throwaway `cronfish_test_*` schemas and spawn real runners against it,
+// so they never guess at whatever server happens to listen on localhost.
 export async function resolvePgUrl(): Promise<string | null> {
-  const explicit = process.env.CRONFISH_TEST_PG_URL;
-  const candidates = explicit
-    ? [explicit]
-    : ["postgres://localhost:5432/postgres"];
-  for (const url of candidates) {
-    try {
-      const sql = newBunSql(url);
-      await sql.unsafe("SELECT 1");
-      await sql.end();
-      return url;
-    } catch {
-      // try next candidate
-    }
+  const url = process.env.CRONFISH_TEST_PG_URL;
+  if (!url) return null;
+  try {
+    const sql = newBunSql(url);
+    await sql.unsafe("SELECT 1");
+    await sql.end();
+    return url;
+  } catch {
+    return null;
   }
-  return null;
+}
+
+// Poll `check` until it holds or `timeoutMs` passes. Returns the last result.
+export async function waitFor(
+  check: () => Promise<boolean>,
+  timeoutMs = 5000,
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (await check()) return true;
+    if (Date.now() >= deadline) return false;
+    await Bun.sleep(50);
+  }
 }
 
 // A per-run ephemeral schema so tests never pollute a real schema and parallel

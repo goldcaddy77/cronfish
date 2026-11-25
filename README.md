@@ -387,9 +387,10 @@ as a single job instead of many fast fires.
 
   `url_env` names an environment variable holding the connection URL (or pass `url` inline);
   `schema` defaults to `cron` and is created and migrated on first open. Connection use is kept
-  small on purpose: the daemon, CLI and dashboard each use a pool of at most 2 connections that
-  close after 20s idle, and each job run opens exactly one connection, holds it for the run, and
-  closes it when the run ends.
+  small on purpose: the daemon, CLI and dashboard each keep one pool of at most 2 connections
+  that close after 20s idle, and each job run opens exactly one connection, holds it for the whole
+  run (so each running job occupies one server connection), and closes it when the run ends.
+  Tests that need Postgres run only when `CRONFISH_TEST_PG_URL` points at a disposable database.
 
 ## Claude entrypoint — `.md` jobs
 
