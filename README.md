@@ -535,7 +535,7 @@ cronfish ui install --host 0.0.0.0
 cron/<slug>.{md,ts,sh}                              # job files (you write these)
 ~/Library/LaunchAgents/<prefix>.<slug>.plist        # launchd registration
 <consumer>/.cronfish/logs/<slug>/<id>.log           # per-run log
-<consumer>/.cronfish/locks/<slug>/runner.pid        # concurrency lock
+<consumer>/.cronfish/locks/<slug>/runner.lock       # concurrency lock (flock, freed on exit)
 <consumer>/.cronfish/db.sqlite                       # run ledger (history, metrics)
 ```
 

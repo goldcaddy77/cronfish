@@ -6,7 +6,7 @@
 // WorkingDirectory), so no shell pre-step is needed.
 //
 // Per-run log: <consumer>/.cronfish/logs/<slug>/<invocation-id>.log
-// Concurrency lock: <consumer>/.cronfish/locks/<slug>/runner.pid (atomic O_EXCL).
+// Concurrency lock: <consumer>/.cronfish/locks/<slug>/runner.lock (flock(2)).
 // Ledger DB: <consumer>/.cronfish/db.sqlite (failure-safe — DB errors warn
 // once and never block the run).
 
@@ -15,11 +15,9 @@ import {
   existsSync,
   mkdirSync,
   fstatSync,
-  linkSync,
+  ftruncateSync,
   openSync,
   readFileSync,
-  rmSync,
-  statSync,
   writeFileSync,
   writeSync,
 } from "node:fs";
@@ -118,116 +116,52 @@ function warn(msg: string): void {
   console.error(`[runner] WARN: ${msg}`);
 }
 
-// --- Concurrency lock (atomic create-or-fail) ---
+// --- Concurrency lock (flock) ---
+//
+// One lock file per job, held with flock(2) for the life of the run. The
+// kernel releases a flock when its holder exits, however it exits (SIGKILL
+// and crashes included), so there is never a stale lock to detect or take
+// over. That removes the races a pid-file lock has: two runners both taking
+// over the same stale lock, or a rival reading a lock before its pid is
+// written. The file is never removed (removing a flocked file lets a later
+// runner lock a fresh inode while another still holds the old one); its
+// content is only the holder's pid, for humans.
 
 function lockPath(slug: string): string {
-  return join(locksJobDir(slug), "runner.pid");
+  return join(locksJobDir(slug), "runner.lock");
 }
 
-// The concurrency lockfile this process created, or null. Set in the same
-// synchronous step that creates the file, so a signal handler (which only runs
-// between event-loop turns) always sees it in step with the file on disk, and
-// never removes a lock another runner holds.
-let heldLockPath: string | null = null;
+// The concurrency lock this process holds, or null. Set in the same
+// synchronous step that takes it, so a signal handler (which only runs
+// between event-loop turns) always sees it in step with the kernel.
+let heldLock: FlockHandle | null = null;
 
-// Take the pid lock at `path` for this process. The pid goes into a private
-// staging file first, which is then hard-linked into place: link() fails if
-// the lock exists, so the lock appears already holding a pid. Creating the
-// lock and then writing it left a window where a second runner read an empty
-// file, took it for corrupt, removed it and ran concurrently.
-//
-// A filesystem without hard links falls back to create-then-write. Its brief
-// empty window is covered by the rule below: a lock with no readable pid is
-// only taken over once it is older than LOCK_WRITE_GRACE_MS, so a holder that
-// has created the file but not yet written it is treated as holding it.
-//
-// Test seams: `onVisible` runs the instant the lock exists at `path`; `link`
-// replaces linkSync; `now` replaces Date.now.
-export interface PidLockSeams {
-  onVisible?: () => void;
-  link?: (from: string, to: string) => void;
-  now?: () => number;
-}
-
-export const LOCK_WRITE_GRACE_MS = 2000;
-
-export function tryAcquirePidLock(
-  path: string,
-  seams: PidLockSeams = {},
-  attempt = 0,
-): boolean {
-  // Each retry follows a lock that vanished or was taken over; a few is
-  // plenty, and the cap stops a filesystem that refuses every create from
-  // looping forever.
-  if (attempt > 3) return false;
-  const link = seams.link ?? linkSync;
-  const now = seams.now ?? Date.now;
-  const tmp = `${path}.${process.pid}.tmp`;
-  writeFileSync(tmp, String(process.pid));
+// Take the flock on `path` (created if missing). Returns the handle, or null
+// when another process holds it.
+export function tryAcquireJobLock(path: string): FlockHandle | null {
+  writeFileSync(path, "", { flag: "a" });
+  const h = tryFlockExclusive(path);
+  if (!h) return null;
   try {
-    try {
-      link(tmp, path);
-    } catch (e) {
-      if ((e as NodeJS.ErrnoException).code === "EEXIST") throw e;
-      // No hard links here: exclusive create, then write.
-      const fd = openSync(path, "wx");
-      try {
-        writeSync(fd, String(process.pid));
-      } catch (we) {
-        closeSync(fd);
-        safeRm(path);
-        throw we;
-      }
-      closeSync(fd);
-    }
-    seams.onVisible?.();
-    return true;
+    ftruncateSync(h.fd, 0);
+    writeSync(h.fd, String(process.pid), 0);
   } catch {
-    let text: string;
-    let mtimeMs: number;
-    try {
-      text = readFileSync(path, "utf-8");
-      mtimeMs = statSync(path).mtimeMs;
-    } catch {
-      // The lock went away between our attempt and this read: try again.
-      return tryAcquirePidLock(path, seams, attempt + 1);
-    }
-    const pid = parseInt(text.trim(), 10);
-    if (Number.isNaN(pid)) {
-      // Possibly a holder mid-write (create-then-write fallback): held.
-      if (now() - mtimeMs < LOCK_WRITE_GRACE_MS) return false;
-      safeRm(path);
-      return tryAcquirePidLock(path, seams, attempt + 1);
-    }
-    try {
-      process.kill(pid, 0);
-      return false;
-    } catch {
-      safeRm(path);
-      return tryAcquirePidLock(path, seams, attempt + 1);
-    }
-  } finally {
-    safeRm(tmp);
+    // The pid is a courtesy; the flock is the lock.
   }
+  return h;
 }
 
 function tryAcquireLock(slug: string): boolean {
-  const path = lockPath(slug);
-  if (!tryAcquirePidLock(path)) return false;
-  heldLockPath = path;
+  const h = tryAcquireJobLock(lockPath(slug));
+  if (!h) return false;
+  heldLock = h;
   return true;
 }
 
 function releaseLock(): void {
-  if (heldLockPath === null) return;
-  safeRm(heldLockPath);
-  heldLockPath = null;
-}
-
-function safeRm(path: string): void {
-  try {
-    rmSync(path);
-  } catch {}
+  if (heldLock === null) return;
+  releaseFlock(heldLock);
+  heldLock = null;
 }
 
 async function waitForLock(
@@ -847,15 +781,14 @@ async function main(): Promise<void> {
   // the lifetime of this process; release is implicit on exit.
   let oneTimeLock: FlockHandle | null = null;
 
-  // Install lock-release signal handlers BEFORE any lock is taken. There is
-  // real setup between taking a lock and registering the full `cleanup`
-  // handler (lock wait, DB open, log open), and a SIGTERM with no handler
-  // installed kills the process by default disposition: nothing runs, and the
-  // concurrency lockfile is orphaned (unlike the flock, the OS does not reclaim
-  // it on exit). Installing first closes that window entirely; the handler
-  // only releases what this process actually holds (heldLockPath, oneTimeLock),
-  // so a SIGTERM while still queued for the lock leaves the holder's lock
-  // alone. Superseded by `cleanup` once the invocation state exists.
+  // Install signal handlers BEFORE any lock is taken, so a SIGTERM anywhere in
+  // the setup between taking a lock and registering the full `cleanup`
+  // handler (lock wait, DB open, log open) releases locks explicitly and exits
+  // 143/130. Both locks are flocks, which the kernel also frees on any exit,
+  // so this is belt and braces rather than the only release path. The handler
+  // only releases what this process actually holds (heldLock, oneTimeLock),
+  // so a SIGTERM while still queued leaves the holder's lock alone.
+  // Superseded by `cleanup` once the invocation state exists.
   let releasing = false;
   const earlyCleanup = (sig: NodeJS.Signals): void => {
     if (releasing) return;
