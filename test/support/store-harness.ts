@@ -379,17 +379,23 @@ function pgKit(sql: BunSqlLike, schema: string): StoreKit {
 // set CRONFISH_TEST_PG_URL to a disposable database. The tests create and
 // drop throwaway `cronfish_test_*` schemas and spawn real runners against it,
 // so they never guess at whatever server happens to listen on localhost.
-export async function resolvePgUrl(): Promise<string | null> {
-  const url = process.env.CRONFISH_TEST_PG_URL;
+// A URL that is set but unreachable throws: a typo or a stopped server must
+// fail the run, not pass it green with the Postgres tests skipped.
+export async function resolvePgUrl(
+  url: string | undefined = process.env.CRONFISH_TEST_PG_URL,
+): Promise<string | null> {
   if (!url) return null;
+  const sql = newBunSql(url);
   try {
-    const sql = newBunSql(url);
     await sql.unsafe("SELECT 1");
-    await sql.end();
-    return url;
-  } catch {
-    return null;
+  } catch (e) {
+    throw new Error(
+      `CRONFISH_TEST_PG_URL is set but unreachable: ${(e as Error).message}`,
+    );
+  } finally {
+    await sql.end().catch(() => {});
   }
+  return url;
 }
 
 // Poll `check` until it holds or `timeoutMs` passes. Returns the last result.

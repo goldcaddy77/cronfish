@@ -43,6 +43,19 @@ describe("postgres identifier guard", () => {
   });
 });
 
+// The test database is opt-in, and a configured one must be reachable.
+describe("test postgres resolution", () => {
+  test("no CRONFISH_TEST_PG_URL means no Postgres tests", async () => {
+    expect(await resolvePgUrl("")).toBeNull();
+  });
+
+  test("a set but unreachable URL fails loudly", async () => {
+    await expect(
+      resolvePgUrl("postgres://127.0.0.1:1/postgres"),
+    ).rejects.toThrow("CRONFISH_TEST_PG_URL is set but unreachable");
+  });
+});
+
 // The pool bound is pure too: defaults are small, callers can override.
 describe("postgres pool options", () => {
   test("defaults are a small pool with an idle timeout", () => {
