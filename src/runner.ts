@@ -6,7 +6,7 @@
 // WorkingDirectory), so no shell pre-step is needed.
 //
 // Per-run log: <consumer>/.cronfish/logs/<slug>/<invocation-id>.log
-// Concurrency lock: <consumer>/.cronfish/locks/<slug>/runner.lock (flock(2)).
+// Concurrency lock: <consumer>/.cronfish/locks/<slug>/runner.pid (flock(2)).
 // Ledger DB: <consumer>/.cronfish/db.sqlite (failure-safe — DB errors warn
 // once and never block the run).
 
@@ -18,7 +18,6 @@ import {
   ftruncateSync,
   openSync,
   readFileSync,
-  rmSync,
   writeFileSync,
   writeSync,
 } from "node:fs";
@@ -125,11 +124,19 @@ function warn(msg: string): void {
 // over. That removes the races a pid-file lock has: two runners both taking
 // over the same stale lock, or a rival reading a lock before its pid is
 // written. The file is never removed (removing a flocked file lets a later
-// runner lock a fresh inode while another still holds the old one); its
-// content is only the holder's pid, for humans.
+// runner lock a fresh inode while another still holds the old one).
+//
+// Compatibility with runners from before the flock (an O_EXCL pid file at the
+// same path): a flock holder writes "<pid>\n<FLOCK_MARK>\n", whose leading
+// digits an older runner reads as a live pid and so skips; and a file holding
+// a bare pid was written by an older runner, which holds no flock, so a live
+// bare pid also counts as held. Only a run that straddles an upgrade ever
+// meets the other kind.
+
+const FLOCK_MARK = "flock";
 
 function lockPath(slug: string): string {
-  return join(locksJobDir(slug), "runner.lock");
+  return join(locksJobDir(slug), "runner.pid");
 }
 
 // The concurrency lock this process holds, or null. Set in the same
@@ -137,8 +144,21 @@ function lockPath(slug: string): string {
 // between event-loop turns) always sees it in step with the kernel.
 let heldLock: FlockHandle | null = null;
 
-// Take the flock on `path` (created if missing). Returns the handle, or null
-// when another process holds it. A lock file this process cannot open throws
+// The live pid an older, pid-file runner holds this lock under, or null.
+function pidFileHolder(content: string): number | null {
+  if (!/^\d+$/.test(content.trim())) return null;
+  const pid = parseInt(content.trim(), 10);
+  if (pid <= 0 || pid === process.pid) return null;
+  try {
+    process.kill(pid, 0);
+    return pid;
+  } catch {
+    return null;
+  }
+}
+
+// Take the lock on `path` (created if missing). Returns the handle, or null
+// when another runner holds it. A lock file this process cannot open throws
 // rather than reading as "held": a skip-mode job would otherwise skip forever
 // with only a misleading "already running" line.
 export function tryAcquireJobLock(path: string): FlockHandle | null {
@@ -146,45 +166,26 @@ export function tryAcquireJobLock(path: string): FlockHandle | null {
   closeSync(openSync(path, "r+"));
   const h = tryFlockExclusive(path);
   if (!h) return null;
+  let content = "";
   try {
-    ftruncateSync(h.fd, 0);
-    writeSync(h.fd, String(process.pid), 0);
-  } catch {
-    // The pid is a courtesy; the flock is the lock.
-  }
-  return h;
-}
-
-// Runners before the flock lock held `runner.pid` (an O_EXCL pid file). While
-// one of those may still be running a job (the run that straddles an
-// upgrade), a live pid there also counts as held; a dead one is removed.
-export function legacyLockHolder(dir: string): number | null {
-  const legacy = join(dir, "runner.pid");
-  let pid: number;
-  try {
-    pid = parseInt(readFileSync(legacy, "utf-8").trim(), 10);
-  } catch {
+    content = readFileSync(path, "utf-8");
+  } catch {}
+  if (pidFileHolder(content) !== null) {
+    releaseFlock(h);
     return null;
   }
-  if (!Number.isNaN(pid) && pid !== process.pid) {
-    try {
-      process.kill(pid, 0);
-      return pid;
-    } catch {}
-  }
   try {
-    rmSync(legacy);
-  } catch {}
-  return null;
+    ftruncateSync(h.fd, 0);
+    writeSync(h.fd, `${process.pid}\n${FLOCK_MARK}\n`, 0);
+  } catch {
+    // The pid is for humans and older runners; the flock is the lock.
+  }
+  return h;
 }
 
 function tryAcquireLock(slug: string): boolean {
   const h = tryAcquireJobLock(lockPath(slug));
   if (!h) return false;
-  if (legacyLockHolder(locksJobDir(slug)) !== null) {
-    releaseFlock(h);
-    return false;
-  }
   heldLock = h;
   return true;
 }
@@ -838,6 +839,8 @@ async function main(): Promise<void> {
       );
       process.exit(0);
     }
+    // An unopenable job file must fail loudly, not read as "held elsewhere".
+    closeSync(openSync(abs, "r+"));
     oneTimeLock = tryFlockExclusive(abs);
     if (!oneTimeLock) {
       console.log(

@@ -17,7 +17,6 @@ import {
   buildClaudeArgs,
   resolveEntrypoint,
   resolveStatus,
-  legacyLockHolder,
   tryAcquireJobLock,
 } from "../src/runner.ts";
 import { releaseFlock } from "../src/oneTime.ts";
@@ -72,7 +71,12 @@ function latestLog(root: string, slug: string): string {
 }
 
 function lockPath(root: string, slug: string): string {
-  return join(root, ".cronfish", "locks", slug, "runner.lock");
+  return join(root, ".cronfish", "locks", slug, "runner.pid");
+}
+
+// The pid a lock file names (its leading digits, as any runner reads it).
+function lockPid(path: string): number {
+  return parseInt(readFileSync(path, "utf-8"), 10);
 }
 
 // Is the job lock at `path` free right now? Takes and drops it.
@@ -117,33 +121,58 @@ describe("tryAcquireJobLock", () => {
   });
 
   test("excludes a second holder until released, and records the pid", () => {
-    const path = join(dir, "runner.lock");
+    const path = join(dir, "runner.pid");
     const h = tryAcquireJobLock(path);
     expect(h).not.toBeNull();
-    expect(readFileSync(path, "utf-8")).toBe(String(process.pid));
+    expect(lockPid(path)).toBe(process.pid);
     expect(tryAcquireJobLock(path)).toBeNull();
     releaseFlock(h!);
     expect(lockIsFree(path)).toBe(true);
   });
 
   test("a lock file this process cannot open throws, not 'held'", () => {
-    const path = join(dir, "runner.lock");
+    const path = join(dir, "runner.pid");
     writeFileSync(path, "");
     chmodSync(path, 0o200);
     expect(() => tryAcquireJobLock(path)).toThrow();
   });
 
-  test("a live legacy runner.pid counts as held; a dead one is cleared", () => {
-    writeFileSync(join(dir, "runner.pid"), String(process.ppid));
-    expect(legacyLockHolder(dir)).toBe(process.ppid);
-    writeFileSync(join(dir, "runner.pid"), String(Bun.spawnSync(["true"]).pid));
-    expect(legacyLockHolder(dir)).toBeNull();
-    expect(existsSync(join(dir, "runner.pid"))).toBe(false);
-    expect(legacyLockHolder(dir)).toBeNull();
+  test("a live bare pid from an older pid-file runner counts as held", () => {
+    const path = join(dir, "runner.pid");
+    writeFileSync(path, String(process.ppid));
+    expect(tryAcquireJobLock(path)).toBeNull();
+    expect(readFileSync(path, "utf-8")).toBe(String(process.ppid));
+  });
+
+  test("a dead bare pid is simply overwritten", () => {
+    const path = join(dir, "runner.pid");
+    writeFileSync(path, String(Bun.spawnSync(["true"]).pid));
+    const h = tryAcquireJobLock(path);
+    expect(h).not.toBeNull();
+    expect(lockPid(path)).toBe(process.pid);
+    releaseFlock(h!);
+  });
+
+  test("a flock runner's record is not mistaken for a pid-file holder", () => {
+    // Left by a flock runner that has since exited, naming a pid that is now
+    // some unrelated live process: the flock, not the content, decides.
+    const path = join(dir, "runner.pid");
+    writeFileSync(path, `${process.ppid}\nflock\n`);
+    const h = tryAcquireJobLock(path);
+    expect(h).not.toBeNull();
+    releaseFlock(h!);
+  });
+
+  test("an older pid-file runner reads a held lock as a live pid", () => {
+    // v0.23-style check: parseInt of the content, then a liveness probe.
+    const path = join(dir, "runner.pid");
+    const h = tryAcquireJobLock(path)!;
+    expect(lockPid(path)).toBe(process.pid);
+    releaseFlock(h);
   });
 
   test("a holder killed with SIGKILL frees the lock at once", async () => {
-    const path = join(dir, "runner.lock");
+    const path = join(dir, "runner.pid");
     const holder = spawnLockHolder(path);
     expect(await firstLine(holder)).toBe("held");
     expect(lockIsFree(path)).toBe(false);
@@ -154,7 +183,7 @@ describe("tryAcquireJobLock", () => {
   }, 15_000);
 
   test("of many processes racing for the lock, exactly one gets it", async () => {
-    const path = join(dir, "runner.lock");
+    const path = join(dir, "runner.pid");
     // Start from a file a dead run left behind, the case a pid-file lock
     // had to take over.
     writeFileSync(path, String(Bun.spawnSync(["true"]).pid));
@@ -261,10 +290,38 @@ export default async function run() {
       expect(r.out + r.err).toContain("concurrency=skip");
       expect(existsSync(sentinel)).toBe(false);
       // The runner did not claim it.
-      expect(readFileSync(lp, "utf-8")).toBe(String(process.pid));
+      expect(lockPid(lp)).toBe(process.pid);
     } finally {
       releaseFlock(held);
     }
+  });
+
+  test("a skip job yields to a live run of an older pid-file runner", () => {
+    const sentinel = join(root, "ran.txt");
+    const job = writeJob(
+      root,
+      "legacy.ts",
+      `export const config = {
+  schedule: "manual",
+  enabled: true,
+  concurrency: "skip",
+  timeout: 5,
+};
+export default async function run() {
+  const fs = await import("node:fs");
+  fs.writeFileSync(${JSON.stringify(sentinel)}, "ran");
+}
+`,
+    );
+    // An older runner's lock: a bare live pid and no flock.
+    const lp = lockPath(root, "legacy-ts");
+    mkdirSync(join(root, ".cronfish", "locks", "legacy-ts"), { recursive: true });
+    writeFileSync(lp, String(process.ppid));
+    const r = spawnRunner(root, job);
+    expect(r.code).toBe(0);
+    expect(r.out + r.err).toContain("concurrency=skip");
+    expect(existsSync(sentinel)).toBe(false);
+    expect(readFileSync(lp, "utf-8")).toBe(String(process.ppid));
   });
 
   test("a lock file left by an old run does not block the job", () => {
@@ -288,7 +345,11 @@ export default async function run() {
     mkdirSync(join(root, ".cronfish", "locks", "stale-ts"), {
       recursive: true,
     });
-    writeFileSync(lockPath(root, "stale-ts"), "12345", "utf-8");
+    writeFileSync(
+      lockPath(root, "stale-ts"),
+      String(Bun.spawnSync(["true"]).pid),
+      "utf-8",
+    );
     const r = spawnRunner(root, job);
     expect(r.code).toBe(0);
     expect(existsSync(sentinel)).toBe(true);
@@ -314,9 +375,10 @@ export default async function run() {
 }
 `,
     );
-    // A previous run's file, from a run that is long gone.
+    // A smoke test (process start-up is far slower than any lock window):
+    // from a previous run's file, two simultaneous runs still yield one.
     mkdirSync(join(root, ".cronfish", "locks", "pair-ts"), { recursive: true });
-    writeFileSync(lockPath(root, "pair-ts"), "12345");
+    writeFileSync(lockPath(root, "pair-ts"), String(Bun.spawnSync(["true"]).pid));
     const spawnOne = () =>
       Bun.spawn(["bun", RUNNER, job], {
         stdout: "ignore",
@@ -362,7 +424,7 @@ export default async function run() {
     const held = Date.now() + 5000;
     const holds = () => {
       try {
-        return readFileSync(lp, "utf-8") === String(proc.pid);
+        return lockPid(lp) === proc.pid;
       } catch {
         return false;
       }
@@ -408,7 +470,7 @@ export default async function run() {}
       expect(code).toBe(143);
       // Still ours: the queued runner neither took nor disturbed it.
       expect(lockIsFree(lp)).toBe(false);
-      expect(readFileSync(lp, "utf-8")).toBe(String(process.pid));
+      expect(lockPid(lp)).toBe(process.pid);
     } finally {
       releaseFlock(held);
     }
