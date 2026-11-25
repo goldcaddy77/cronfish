@@ -223,9 +223,15 @@ export default async function run() {
       await Bun.sleep(50);
     }
     expect(existsSync(lp)).toBe(true);
+    // The lock is never visible without its owner's pid in it.
+    expect(readFileSync(lp, "utf-8")).toBe(String(proc.pid));
     proc.kill("SIGTERM");
     await proc.exited;
     expect(existsSync(lp)).toBe(false);
+    // No staging file is left beside it.
+    expect(readdirSync(join(root, ".cronfish", "locks", "long-ts"))).toEqual(
+      [],
+    );
   }, 15_000);
 
   test("SIGTERM while queued for the lock leaves the holder's lock alone", async () => {

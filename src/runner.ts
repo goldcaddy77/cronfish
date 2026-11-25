@@ -15,9 +15,11 @@ import {
   existsSync,
   mkdirSync,
   fstatSync,
+  linkSync,
   openSync,
   readFileSync,
   rmSync,
+  writeFileSync,
   writeSync,
 } from "node:fs";
 import { extname, join, resolve } from "node:path";
@@ -129,11 +131,15 @@ let heldLockPath: string | null = null;
 
 function tryAcquireLock(slug: string): boolean {
   const path = lockPath(slug);
+  // Write the pid to a private file, then hard-link it into place: link()
+  // fails if the lock exists, and a lock that does appear already holds a pid.
+  // Creating the lock and then writing it left a window where a second runner
+  // read an empty file, took it for corrupt, removed it and ran concurrently.
+  const tmp = `${path}.${process.pid}.tmp`;
+  writeFileSync(tmp, String(process.pid));
   try {
-    const fd = openSync(path, "wx");
+    linkSync(tmp, path);
     heldLockPath = path;
-    writeSync(fd, String(process.pid));
-    closeSync(fd);
     return true;
   } catch {
     if (!existsSync(path)) return false;
@@ -149,6 +155,8 @@ function tryAcquireLock(slug: string): boolean {
       safeRm(path);
       return tryAcquireLock(slug);
     }
+  } finally {
+    safeRm(tmp);
   }
 }
 
