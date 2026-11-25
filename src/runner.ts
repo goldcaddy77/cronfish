@@ -178,10 +178,8 @@ export function tryAcquireJobLock(path: string): FlockHandle | null {
     return null;
   }
   try {
-    // Overwrite in place, then trim: the file never reads empty while held.
-    const rec = `${process.pid}\n${FLOCK_MARK}\n`;
-    writeSync(h.fd, rec, 0);
-    ftruncateSync(h.fd, Buffer.byteLength(rec));
+    ftruncateSync(h.fd, 0);
+    writeSync(h.fd, `${process.pid}\n${FLOCK_MARK}\n`, 0);
   } catch {
     // The pid is for humans and older runners; the flock is the lock.
   }
