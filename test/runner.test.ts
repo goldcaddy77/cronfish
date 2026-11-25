@@ -228,6 +228,39 @@ export default async function run() {
     expect(existsSync(lp)).toBe(false);
   }, 15_000);
 
+  test("SIGTERM while queued for the lock leaves the holder's lock alone", async () => {
+    const job = writeJob(
+      root,
+      "queued.ts",
+      `export const config = {
+  schedule: "manual",
+  enabled: true,
+  concurrency: "queue",
+  timeout: 60,
+};
+export default async function run() {}
+`,
+    );
+    // Another live process (this test runner) holds the lock.
+    const lp = lockPath(root, "queued-ts");
+    mkdirSync(join(root, ".cronfish", "locks", "queued-ts"), {
+      recursive: true,
+    });
+    writeFileSync(lp, String(process.pid));
+    const proc = Bun.spawn(["bun", RUNNER, job], {
+      stdout: "ignore",
+      stderr: "ignore",
+      cwd: root,
+      env: { ...process.env, CRONFISH_CONSUMER_ROOT: root },
+    });
+    // Let the runner reach the lock wait, then stop it there.
+    await Bun.sleep(1500);
+    proc.kill("SIGTERM");
+    const code = await proc.exited;
+    expect(code).toBe(143);
+    expect(readFileSync(lp, "utf-8")).toBe(String(process.pid));
+  }, 15_000);
+
   test("daemon env: links the run request, records scheduled_for, stamps last_run", async () => {
     const job = writeJob(
       root,

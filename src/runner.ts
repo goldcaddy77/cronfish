@@ -121,10 +121,17 @@ function lockPath(slug: string): string {
   return join(locksJobDir(slug), "runner.pid");
 }
 
+// The concurrency lockfile this process created, or null. Set in the same
+// synchronous step that creates the file, so a signal handler (which only runs
+// between event-loop turns) always sees it in step with the file on disk, and
+// never removes a lock another runner holds.
+let heldLockPath: string | null = null;
+
 function tryAcquireLock(slug: string): boolean {
   const path = lockPath(slug);
   try {
     const fd = openSync(path, "wx");
+    heldLockPath = path;
     writeSync(fd, String(process.pid));
     closeSync(fd);
     return true;
@@ -145,8 +152,10 @@ function tryAcquireLock(slug: string): boolean {
   }
 }
 
-function releaseLock(slug: string): void {
-  safeRm(lockPath(slug));
+function releaseLock(): void {
+  if (heldLockPath === null) return;
+  safeRm(heldLockPath);
+  heldLockPath = null;
 }
 
 function safeRm(path: string): void {
@@ -771,6 +780,27 @@ async function main(): Promise<void> {
   // unsleep / crash recovery can't double-fire the job. Lock is held for
   // the lifetime of this process; release is implicit on exit.
   let oneTimeLock: FlockHandle | null = null;
+
+  // Install lock-release signal handlers BEFORE any lock is taken. There is
+  // real setup between taking a lock and registering the full `cleanup`
+  // handler (lock wait, DB open, log open), and a SIGTERM with no handler
+  // installed kills the process by default disposition: nothing runs, and the
+  // concurrency lockfile is orphaned (unlike the flock, the OS does not reclaim
+  // it on exit). Installing first closes that window entirely; the handler
+  // only releases what this process actually holds (heldLockPath, oneTimeLock),
+  // so a SIGTERM while still queued for the lock leaves the holder's lock
+  // alone. Superseded by `cleanup` once the invocation state exists.
+  let releasing = false;
+  const earlyCleanup = (sig: NodeJS.Signals): void => {
+    if (releasing) return;
+    releasing = true;
+    releaseLock();
+    if (oneTimeLock) releaseFlock(oneTimeLock);
+    process.exit(sig === "SIGTERM" ? 143 : 130);
+  };
+  process.on("SIGTERM", earlyCleanup);
+  process.on("SIGINT", earlyCleanup);
+
   if (job.oneTime) {
     if (job.executedAt) {
       console.log(
@@ -840,23 +870,6 @@ async function main(): Promise<void> {
     }
   }
 
-  // Install lock-release signal handlers the instant a lock exists. There is
-  // real setup below (DB init, log open) before the full `cleanup` handler is
-  // registered, and a SIGTERM in that window would otherwise kill the process
-  // by default disposition — no handler runs, and the concurrency lockfile is
-  // orphaned (unlike the flock, it is not reclaimed by the OS on exit). This
-  // minimal handler is superseded by `cleanup` once the invocation state exists.
-  let releasing = false;
-  const earlyCleanup = (sig: NodeJS.Signals): void => {
-    if (releasing) return;
-    releasing = true;
-    if (job.concurrency) releaseLock(job.slug);
-    if (oneTimeLock) releaseFlock(oneTimeLock);
-    process.exit(sig === "SIGTERM" ? 143 : 130);
-  };
-  process.on("SIGTERM", earlyCleanup);
-  process.on("SIGINT", earlyCleanup);
-
   const store = await tryOpenStore();
 
   // Open the log file BEFORE we know the invocation id (we need a real
@@ -916,7 +929,7 @@ async function main(): Promise<void> {
       "crashed",
       sig === "SIGTERM" ? 143 : 130,
     );
-    if (job.concurrency) releaseLock(job.slug);
+    releaseLock();
     if (oneTimeLock) releaseFlock(oneTimeLock);
     process.exit(sig === "SIGTERM" ? 143 : 130);
   };
@@ -976,7 +989,7 @@ async function main(): Promise<void> {
       if (oneTimeLock) releaseFlock(oneTimeLock);
     }
     closeSync(fd);
-    if (job.concurrency) releaseLock(job.slug);
+    releaseLock();
     await tryFinishInvocation(
       store,
       invocationId,
